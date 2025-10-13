@@ -1,0 +1,7 @@
+/node_modules
+/dist
+/coverage
+/db
+.env
+GEMINI.md
+CLAUDE.md

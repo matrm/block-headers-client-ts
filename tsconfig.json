@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"moduleResolution": "NodeNext",
+		"target": "ES2024",
+		"module": "NodeNext",
+		"outDir": "./dist",
+		"declaration": true,
+		"sourceMap": true,
+		"strict": true
+	},
+	"include": [
+		"src/**/*"
+	],
+	"exclude": [
+		"./node_modules"
+	]
+}
