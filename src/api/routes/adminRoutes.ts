@@ -9,7 +9,7 @@ import config from '../config.js';
 export const createAdminRoutes = (client: BlockHeadersClient) => {
 	const router = Router();
 
-	router.get('/start', adminRateLimit, restrictToAdmins, async (req: Request, res: Response, next: NextFunction) => {
+	router.get('/admin/start', adminRateLimit, restrictToAdmins, async (req: Request, res: Response, next: NextFunction) => {
 		try {
 			const timeBeforeMs = performance.now();
 			await client.start();
@@ -36,7 +36,7 @@ export const createAdminRoutes = (client: BlockHeadersClient) => {
 		}
 	});
 
-	router.get('/stop', adminRateLimit, restrictToAdmins, async (req: Request, res: Response, next: NextFunction) => {
+	router.get('/admin/stop', adminRateLimit, restrictToAdmins, async (req: Request, res: Response, next: NextFunction) => {
 		try {
 			await client.stop();
 			console.log('Stopped.');
