@@ -9,7 +9,7 @@ export const restrictToAdmins = (req: Request, res: Response, next: NextFunction
 		return next();
 	}
 
-	const apiKey = req.headers['x-api-key'] as string | undefined;
+	const apiKey = req.headers['x-admin-api-key'] as string | undefined;
 	if (!apiKey || !config.ADMIN_API_KEYS.includes(apiKey)) {
 		res.status(403).json({ error: 'Admin access required' });
 		return;
