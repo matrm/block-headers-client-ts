@@ -98,12 +98,12 @@ npm run start-nobuild
 
 The server will be running at `http://localhost:3000` but is not syncing to the longest chain yet.
 
-2. Send a GET request to `/admin/start` to start the client, syncing to the longest chain. Requires an admin API key or BYPASS_ADMIN_AUTH set to true.
+2. Send a GET request to `/admin/start` to start the client, syncing to the longest chain. Requires admin authentication.
 ```
 http://localhost:3000/admin/start
 ```
 
-3. Send a GET request to `/admin/stop` or press ctrl+c to stop the client when done using. Sending the request requires an admin API key or BYPASS_ADMIN_AUTH set to true.
+3. Send a GET request to `/admin/stop` or press ctrl+c to stop the client when done using. Sending the request requires admin authentication.
 ```
 http://localhost:3000/admin/stop
 ```
@@ -112,8 +112,17 @@ http://localhost:3000/admin/stop
 
 -   `GET /header/:id`: Get a block header by height or hex hash. `:id` can be a block height (e.g., `400000`) or a block hash (e.g., `000000000000000004ec466ce4732fe6f1ed1cddc2ed4b328fff5224276e3f6f`). Use `tip` to get the latest header.
 -   `GET /peers/connected`: Get the list of connected peers.
--   `GET /admin/start`: Start the client (requires an admin API key or BYPASS_ADMIN_AUTH set to true).
--   `GET /admin/stop`: Stop the client (requires an admin API key or BYPASS_ADMIN_AUTH set to true).
+-   `GET /admin/start`: Start the client (requires admin authentication).
+-   `GET /admin/stop`: Stop the client (requires admin authentication).
+
+#### Admin Authentication
+
+Requests to admin endpoints require an API key. The key should be included in the `x-admin-api-key` header. This requirement can be disabled by setting `BYPASS_ADMIN_AUTH=true` in the `.env` file.
+
+Example using `curl`:
+```
+curl -H "x-admin-api-key: your-admin-api-key" http://localhost:3000/admin/start
+```
 
 ### WebSockets
 
