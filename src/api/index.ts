@@ -8,6 +8,8 @@ import { getMemoryUsageString } from '../utils/util.js';
 import config from './config.js';
 import { createWebSocketServer } from './websockets.js';
 
+import { startClient } from './helpers.js';
+
 async function main() {
 	config.CONSOLE_DEBUG_LOG && console.log('Memory usage before loading client:');
 	config.CONSOLE_DEBUG_LOG && console.log(getMemoryUsageString());
@@ -48,6 +50,11 @@ async function main() {
 	server.listen(config.PORT, () => {
 		console.log(`Server listening at http://localhost:${config.PORT}`);
 	});
+
+	if (config.AUTO_START) {
+		console.log('AUTO_START is true, starting client...');
+		await startClient(client);
+	}
 
 	const shutdown = async () => {
 		console.log('Closing WebSocket server...');

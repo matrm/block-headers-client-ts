@@ -25,6 +25,7 @@ const config = Object.freeze({
 	CONSOLE_DEBUG_LOG: process.env.CONSOLE_DEBUG_LOG === 'true',
 	CHAIN: process.env.CHAIN as Chain || 'bsv' as Chain,
 	DATABASE_PATH: process.env.DATABASE_PATH || DEFAULT_DATABASE_PATH,
+	AUTO_START: process.env.AUTO_START ? process.env.AUTO_START === 'true' : false,
 	SEED_NODES: Object.freeze(parseSeedNodes(process.env.SEED_NODES)),
 	BYPASS_ADMIN_AUTH: process.env.BYPASS_ADMIN_AUTH === 'true',
 	ADMIN_API_KEYS: Object.freeze(process.env.ADMIN_API_KEYS ? JSON.parse(process.env.ADMIN_API_KEYS) : []),
@@ -35,6 +36,7 @@ if (config.CONSOLE_DEBUG_LOG) {
 	console.log('DEBUG_LOG:', config.CONSOLE_DEBUG_LOG);
 	console.log('CHAIN:', config.CHAIN);
 	console.log('DATABASE_PATH:', config.DATABASE_PATH);
+	console.log('AUTO_START:', config.AUTO_START);
 	console.log('SEED_NODES:', config.SEED_NODES);
 	console.log('BYPASS_ADMIN_AUTH:', config.BYPASS_ADMIN_AUTH);
 	console.log('Number of ADMIN_API_KEYS:', config.ADMIN_API_KEYS.length);

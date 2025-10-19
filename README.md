@@ -80,6 +80,7 @@ PORT=3000
 CONSOLE_DEBUG_LOG=false
 CHAIN=bsv
 DATABASE_PATH=./db
+AUTO_START=true
 SEED_NODES=[{ "ip": "192.168.0.1", "port": 8333 }, { "ip": "192.168.0.2", "port": 8333 }]
 BYPASS_ADMIN_AUTH=true
 ADMIN_API_KEYS=["your-admin-api-key"]
@@ -98,7 +99,7 @@ npm run start-nobuild
 
 The server will be running at `http://localhost:3000` but is not syncing to the longest chain yet.
 
-2. Send a GET request to `/admin/start` to start the client, syncing to the longest chain. Requires admin authentication.
+2. If you have `AUTO_START` set to `false` in your `.env` file, you can send a GET request to `/admin/start` to start the client, syncing to the longest chain. Requires admin authentication. If `AUTO_START` is set to `true`, the client will start syncing automatically.
 ```
 http://localhost:3000/admin/start
 ```
