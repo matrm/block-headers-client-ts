@@ -76,14 +76,14 @@ npm install
 ```
 3. Create a `.env` file in the root of the project with the following content (all are optional):
 ```
-PORT=3000
-CONSOLE_DEBUG_LOG=false
 CHAIN=bsv
 DATABASE_PATH=./db
+PORT=3000
 AUTO_START=true
-SEED_NODES=[{ "ip": "192.168.0.1", "port": 8333 }, { "ip": "192.168.0.2", "port": 8333 }]
 BYPASS_ADMIN_AUTH=true
 ADMIN_API_KEYS=["your-admin-api-key"]
+SEED_NODES=[{ "ip": "192.168.0.1", "port": 8333 }, { "ip": "192.168.0.2", "port": 8333 }]
+CONSOLE_DEBUG_LOG=false
 ```
 4. Build:
 ```
