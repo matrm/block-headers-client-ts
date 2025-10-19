@@ -33,7 +33,7 @@ const config = Object.freeze({
 
 if (config.CONSOLE_DEBUG_LOG) {
 	console.log('PORT:', config.PORT);
-	console.log('DEBUG_LOG:', config.CONSOLE_DEBUG_LOG);
+	console.log('CONSOLE_DEBUG_LOG:', config.CONSOLE_DEBUG_LOG);
 	console.log('CHAIN:', config.CHAIN);
 	console.log('DATABASE_PATH:', config.DATABASE_PATH);
 	console.log('AUTO_START:', config.AUTO_START);
