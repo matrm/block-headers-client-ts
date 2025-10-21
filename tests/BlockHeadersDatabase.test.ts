@@ -114,7 +114,7 @@ describe('BlockHeadersDatabase', () => {
 
 		await mkdir(databasePath, { recursive: true });
 
-		db = await createDbWithRetries(() => BlockHeadersDatabase.fromGenesis({ databasePath, invalidBlocks: getInvalidBlocks(chain) }));
+		db = await createDbWithRetries(() => BlockHeadersDatabase.fromGenesis({ databasePath, invalidBlocks: Array.from(getInvalidBlocks(chain)) }));
 	});
 
 	afterEach(async () => {
