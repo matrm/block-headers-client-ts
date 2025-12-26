@@ -298,7 +298,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 
 			this._connectionMonitor.updateLastKnownConnectionTime();
 
-			this._buffer = Buffer.concat([this._buffer, data]);
+			this._buffer = Buffer.concat([this._buffer, typeof data === 'string' ? Buffer.from(data) : data]);
 			const { messages, remaining, errors } = parseMessages(this._buffer, this._magic);
 			this._buffer = remaining;
 
