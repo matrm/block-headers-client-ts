@@ -4,7 +4,7 @@ import { ConnectionMonitor, DEFAULT_timeoutMs, DEFAULT_intervalMs } from '../src
 describe('ConnectionMonitor', () => {
 	beforeEach(() => {
 		vi.useFakeTimers();
-		vi.spyOn(global, 'fetch');
+		vi.spyOn(global, 'fetch').mockImplementation(async () => ({ ok: true } as Response));
 	});
 
 	afterEach(() => {
@@ -54,7 +54,6 @@ describe('ConnectionMonitor', () => {
 	test('should update last known connection time on successful fetch', async () => {
 		const monitor = new ConnectionMonitor();
 		const abortController = new AbortController();
-		(fetch as any).mockResolvedValue({ ok: true });
 
 		const timeBefore = monitor.getTimeSinceLastKnownConnectionMs();
 		await monitor.start(abortController.signal);
@@ -112,7 +111,7 @@ describe('ConnectionMonitor', () => {
 			const monitor = new ConnectionMonitor();
 			const abortController = new AbortController();
 			await monitor.start(abortController.signal);
-			(fetch as any).mockClear();
+			(fetch as any).mockRejectedValue(new Error('Persistent network error'));
 
 			const cheapCheck = monitor.connectedToInternetCheapAsync(new AbortController().signal);
 
@@ -142,7 +141,7 @@ describe('ConnectionMonitor', () => {
 	describe('connectedToInternetExpensiveAsync', () => {
 		test('should resolve true on successful fetch', async () => {
 			const monitor = new ConnectionMonitor();
-			(fetch as any).mockResolvedValue({ ok: true });
+
 			await expect(monitor.connectedToInternetExpensiveAsync(new AbortController().signal)).resolves.toBe(true);
 		});
 
