@@ -1,7 +1,7 @@
 {
   "name": "block-headers-client",
   "private": false,
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "A typescript bitcoin sv block headers client",
   "type": "module",
   "exports": {
