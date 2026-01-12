@@ -33,7 +33,8 @@
   "author": "matrm <matrm@gmx.com>",
   "license": "SEE LICENSE IN LICENSE.txt",
   "dependencies": {
-    "level": "^10.0.0"
+    "level": "^10.0.0",
+    "red-black-map": "^1.0.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

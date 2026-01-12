@@ -2,7 +2,7 @@ import { Level } from 'level';
 
 import { IpPort } from './types.js';
 import { assert, ipPortToString, stringToIpPort } from './utils/util.js';
-import { RedBlackTree } from './utils/RedBlackTree.js';
+import { RedBlackMap, CompareNumbers } from 'red-black-map';
 
 const MAX_recentPingTimes_LENGTH = 10;
 const MAX_recentUnintentionalDisconnectTimesMs_LENGTH = 10;
@@ -347,9 +347,9 @@ export class NodesDatabase {
 
 	// Data structures for quick access.
 	// Key is seen time (for sorting by recency), Value is Set of IpPortStrings.
-	private _seenTimeToIpPortStringSet: RedBlackTree<number, Set<string>> = new RedBlackTree<number, Set<string>>((a, b) => a - b);
+	private _seenTimeToIpPortStringSet: RedBlackMap<number, Set<string>> = new RedBlackMap<number, Set<string>>(CompareNumbers);
 	// Key is rating (for sorting by rating), Value is Set of IpPortStrings.
-	private _ratingToIpPortStringSet: RedBlackTree<number, Set<string>> = new RedBlackTree<number, Set<string>>((a, b) => a - b);
+	private _ratingToIpPortStringSet: RedBlackMap<number, Set<string>> = new RedBlackMap<number, Set<string>>(CompareNumbers);
 	// Key is IpPortString, Value is rating.
 	private _ipPortStringToRating: Map<string, number> = new Map();
 	// Key is IpPortString, Value is NodeConnectionMetrics.

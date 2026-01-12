@@ -10,7 +10,7 @@ import { IpPort, ProgressCallback } from './types.js';
 import { Chain, getInvalidBlocks } from './chainProtocol.js';
 import { ipPortToString, unixTime3Decimal, combineAbortControllers, abortableSleepMsNoThrow, stringToIpPort, assert, stringifyWithTabs } from './utils/util.js';
 import { ConnectionMonitor } from './ConnectionMonitor.js';
-import { RedBlackTree } from './utils/RedBlackTree.js';
+import { RedBlackMap, CompareNumbers } from 'red-black-map';
 
 const MAX_SAVED_NODES = 4000;
 const RECENT_UNINTENTIONAL_DISCONNECT_TIME_THRESHOLD_MS = 1000;
@@ -1140,7 +1140,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	 * @returns An array of connected node's IP, port, and rating.
 	 */
 	getPeersInfoConnected = (): { ip: string, port: number, rating: number }[] => {
-		const ratingToNode = new RedBlackTree<number, IpPort>((a, b) => a - b);
+		const ratingToNode = new RedBlackMap<number, IpPort>(CompareNumbers);
 		const timeMs = Date.now();
 		this._nodeConnectionsConnected.forEach((nodeConnection) => {
 			const ipPort = nodeConnection.getIpPort();
