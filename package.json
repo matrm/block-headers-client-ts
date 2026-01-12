@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "!dist/api",
     "README.md",
     "LICENSE.txt"
   ],
