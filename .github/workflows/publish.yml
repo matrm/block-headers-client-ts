@@ -10,8 +10,8 @@ jobs:
     strategy:
       matrix:
         node-version:
-          - '20.6.0' # From "engines" in package.json
           - 'lts/*'
+          - 'latest'
     steps:
       - name: Checkout
         uses: actions/checkout@v6

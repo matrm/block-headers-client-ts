@@ -22,9 +22,6 @@
     "start-nobuild": "node --env-file=.env dist/api/index.js",
     "start-build": "npm run build && npm run start-nobuild"
   },
-  "engines": {
-    "node": ">=20.6.0"
-  },
   "keywords": [
     "bitcoin",
     "bsv",
