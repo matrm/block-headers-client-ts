@@ -184,11 +184,10 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				await this._connectionMonitor[Symbol.asyncDispose]();
 				this._enableConsoleDebugLog && console.log('Stopped connection monitor.');
 
-				// These are commented out because quick calls to stop() and start() were causing errors.
-				// await this._nodesDatabase[Symbol.asyncDispose]();
-				// this._enableConsoleDebugLog && console.log('Disposed nodes database.');
-				// await this._blockHeadersDatabase[Symbol.asyncDispose]();
-				// this._enableConsoleDebugLog && console.log('Disposed block headers database.');
+				await this._nodesDatabase[Symbol.asyncDispose]();
+				this._enableConsoleDebugLog && console.log('Disposed nodes database.');
+				await this._blockHeadersDatabase[Symbol.asyncDispose]();
+				this._enableConsoleDebugLog && console.log('Disposed block headers database.');
 
 				this._enableConsoleDebugLog && console.log('BlockHeadersClient stop() end.');
 			})
@@ -1076,12 +1075,17 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		priorityIpPort?: IpPort;
 		progressCallback?: ProgressCallback;
 	} = {}): Promise<void> => {
+		// Wait for an in-progress stop() to complete.
+		// This must be OUTSIDE the _connectToNodesQueue chain to avoid
+		// a circular promise dependency with stop()'s await of _connectToNodesQueue.
+		if (this._stopQueue) {
+			await this._stopQueue;
+		}
 		// Limit queue size to 1.
 		if (this._numConnectToNodesQueues < 1) {
 			this._connectToNodesQueue = this._connectToNodesQueue
 				.then(async () => {
 					this._numConnectToNodesQueues++;
-					await this._stopQueue;
 					if (this._abortController.signal.aborted) {
 						this._abortController = new AbortController();
 					}
