@@ -5,6 +5,7 @@ import { errorHandler } from './middleware/errorHandlers.js';
 import { createHeaderRoutes } from './routes/headerRoutes.js';
 import { createPeerRoutes } from './routes/peerRoutes.js';
 import { createAdminRoutes } from './routes/adminRoutes.js';
+import { createDashboardRoutes } from './routes/dashboardRoutes.js';
 
 export const createApp = (client: BlockHeadersClient) => {
 	const app = express();
@@ -15,6 +16,7 @@ export const createApp = (client: BlockHeadersClient) => {
 	app.use('/', createHeaderRoutes(client));
 	app.use('/', createPeerRoutes(client));
 	app.use('/', createAdminRoutes(client));
+	app.use('/', createDashboardRoutes());
 
 	app.use(errorHandler);
 

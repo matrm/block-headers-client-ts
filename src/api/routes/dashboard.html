@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+	--bg: #0f1117;
+	--surface: #1a1d27;
+	--surface-hover: #222533;
+	--border: #2a2d3a;
+	--text: #e1e4ed;
+	--text-muted: #8890a4;
+	--accent: #6c8cff;
+	--accent-hover: #8ba3ff;
+	--green: #4ade80;
+	--red: #f87171;
+	--yellow: #facc15;
+	--orange: #fb923c;
+	--radius: 8px;
+	--radius-sm: 5px;
+	--shadow: 0 1px 3px rgba(0,0,0,.3);
+}
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; line-height: 1.5; }
+.container { max-width: 1100px; margin: 0 auto; padding: 24px 20px; }
+header { position: relative; display: flex; justify-content: center; align-items: center; padding: 4px 0; margin-bottom: 12px; }
+header h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em; }
+.header-right { position: absolute; right: 0; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 20px; font-size: .8rem; font-weight: 600; }
+.badge .dot { width: 8px; height: 8px; border-radius: 50%; }
+.badge.running, .badge.ws-connected { background: rgba(74,222,128,.12); color: var(--green); }
+.badge.running .dot, .badge.ws-connected .dot { background: var(--green); }
+.badge.stopped, .badge.ws-disconnected { background: rgba(248,113,113,.12); color: var(--red); }
+.badge.stopped .dot, .badge.ws-disconnected .dot { background: var(--red); }
+.controls { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }
+.btn { display: inline-flex; align-items: center; gap: 6px; padding: 10px 20px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font-size: .875rem; font-weight: 500; cursor: pointer; transition: all .15s; font-family: inherit; }
+.btn:hover { background: var(--surface-hover); border-color: #3a3e4f; }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover:not(:disabled) { background: var(--accent-hover); }
+.btn.danger { background: transparent; border-color: var(--red); color: var(--red); }
+.btn.danger:hover:not(:disabled) { background: rgba(248,113,113,.1); }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
+@media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow); }
+.card h2 { font-size: .95rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 16px; }
+.card-row { display: flex; justify-content: space-between; padding: 7px 0; font-size: .85rem; border-bottom: 1px solid rgba(255,255,255,.04); }
+.card-row:last-child { border-bottom: none; }
+.card-row .label { color: var(--text-muted); }
+.card-row .value { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: .8rem; word-break: break-all; text-align: right; max-width: 65%; }
+table { width: 100%; font-size: .85rem; border-collapse: collapse; }
+th { text-align: left; color: var(--text-muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
+td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,.04); font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: .8rem; }
+.peer-rating { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.peer-rating.high { background: var(--green); }
+.peer-rating.mid { background: var(--orange); }
+.peer-rating.low { background: var(--red); }
+.lookup { margin-bottom: 24px; }
+.lookup form { display: flex; gap: 10px; }
+.lookup input { flex: 1; padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: .85rem; outline: none; transition: border-color .15s; }
+.lookup input:focus { border-color: var(--accent); }
+.lookup-results { margin-top: 16px; }
+.lookup-error { color: var(--red); font-size: .85rem; margin-top: 12px; }
+.toast { position: fixed; top: 18px; left: 50%; transform: translateX(-50%); padding: 12px 20px; border-radius: var(--radius-sm); font-size: .85rem; font-weight: 500; z-index: 999; animation: toastIn .25s ease; box-shadow: 0 4px 12px rgba(0,0,0,.4); }
+.toast.success { background: #14532d; color: #86efac; border: 1px solid #166534; }
+.toast.error { background: #7f1d1d; color: #fca5a5; border: 1px solid #991b1b; }
+@keyframes toastIn { from { opacity: 0; transform: translateX(-50%) translateY(-8px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
+.empty { color: var(--text-muted); font-size: .85rem; text-align: center; padding: 20px 0; }
+.auto-refresh-label { display: flex; align-items: center; gap: 5px; cursor: pointer; font-size: .8rem; color: var(--text-muted); user-select: none; }
+.auto-refresh-label input { accent-color: var(--accent); cursor: pointer; }
+.api-key-group { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 16px; }
+.api-key-input { padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: .8rem; outline: none; width: 180px; transition: border-color .15s; }
+.api-key-input:focus { border-color: var(--accent); }
+.api-key-input.invalid { border-color: var(--red); }
+.api-key-label { font-size: .8rem; color: var(--text-muted); }
+.admin-only { display: none; }
+.admin-only.visible { display: contents; }
+</style>
+</head>
+<body>
+<div class="container">
+	<header>
+		<h1>Dashboard</h1>
+		<div class="header-right">
+			<div id="status-badge" class="badge stopped" title="Client is not connected to any nodes and is not syncing block headers"><span class="dot"></span>Stopped</div>
+			<div id="ws-badge" class="badge ws-disconnected" title="WebSocket disconnected. Reconnects every 5 seconds."><span class="dot"></span>Disconnected from client</div>
+		</div>
+	</header>
+
+	<div class="controls">
+		<span class="admin-only" id="admin-controls">
+			<button id="btn-start" class="btn primary" onclick="startClient()" title="Connect to Bitcoin nodes and begin syncing block headers">&#9654; Start Client</button>
+			<button id="btn-stop" class="btn danger" onclick="stopClient()" disabled title="Disconnect from all nodes and stop syncing">&#9632; Stop Client</button>
+		</span>
+		<button id="btn-refresh-peers" class="btn" onclick="refreshPeers()" title="Reload the list of connected peers and their ratings">&#8635; Refresh Peers</button>
+		<label class="auto-refresh-label" title="Refresh the peers list every 30 seconds">
+			<input type="checkbox" id="auto-refresh-checkbox" checked onchange="toggleAutoRefresh()"> Auto-refresh peers
+		</label>
+	</div>
+
+	<div class="grid">
+		<div class="card">
+			<h2>Chain Info</h2>
+			<div id="chain-info"><div class="empty">Waiting for data...</div></div>
+		</div>
+		<div class="card">
+			<h2>Connected Peers <span id="peer-count" style="font-weight:400;font-size:.75rem;color:var(--text-muted);"></span></h2>
+			<div id="peers-table"><div class="empty">No connected peers</div></div>
+		</div>
+	</div>
+
+	<div class="card lookup">
+		<h2>Lookup Header</h2>
+		<form onsubmit="lookupHeader(event)">
+			<input id="lookup-input" type="text" placeholder="Block hash (hex), block height (number), or 'tip'" autocomplete="off">
+			<button type="submit" class="btn primary">Search</button>
+		</form>
+		<div id="lookup-results" class="lookup-results"></div>
+		<div id="lookup-error" class="lookup-error"></div>
+	</div>
+
+	<div id="api-key-group" class="api-key-group">
+		<input id="api-key-input" class="api-key-input" type="password" placeholder="API key" autocomplete="off">
+		<span id="api-key-status" class="api-key-label"></span>
+	</div>
+</div>
+
+<script>
+const BYPASS_ADMIN_AUTH = __BYPASS_ADMIN_AUTH__;
+
+let ws = null;
+let wsReconnectTimer = null;
+let lastWsMsgTime = null;
+let lastPeersRefreshTime = null;
+let clientStartedAt = null;
+let peersRefreshInterval = null;
+let adminVerified = BYPASS_ADMIN_AUTH;
+let verifyDebounceTimer = null;
+
+function timeAgo(ms) {
+	if (!ms) return 'never';
+	const ago = Math.round((Date.now() - ms) / 1000);
+	if (ago < 60) return ago + 's ago';
+	if (ago < 3600) return Math.round(ago / 60) + 'm ago';
+	return Math.round(ago / 3600) + 'h ago';
+}
+
+function duration(ms) {
+	if (!ms) return '';
+	const secs = Math.round((Date.now() - ms) / 1000);
+	if (secs < 60) return secs + 's';
+	if (secs < 3600) return Math.round(secs / 60) + 'm';
+	return Math.round(secs / 3600) + 'h';
+}
+
+function getApiKey() {
+	return document.getElementById('api-key-input').value.trim();
+}
+
+function getApiHeaders() {
+	const headers = { 'Content-Type': 'application/json' };
+	const key = getApiKey();
+	if (key) headers['x-admin-api-key'] = key;
+	return headers;
+}
+
+async function apiFetch(url, options) {
+	options = options || {};
+	const res = await fetch(url, Object.assign({}, options, { headers: Object.assign(getApiHeaders(), options.headers || {}) }));
+	if (!res.ok) {
+		var text = await res.text();
+		var msg = res.statusText;
+		try { var j = JSON.parse(text); msg = j.error || msg; } catch (e) {}
+		throw new Error(msg);
+	}
+	if (res.status === 204) return null;
+	return res.json();
+}
+
+function initAdminUI() {
+	if (BYPASS_ADMIN_AUTH) {
+		document.getElementById('api-key-group').style.display = 'none';
+		showAdminControls();
+	} else {
+		document.getElementById('api-key-group').style.display = '';
+		document.getElementById('api-key-input').addEventListener('input', onApiKeyInput);
+	}
+}
+
+function onApiKeyInput() {
+	clearTimeout(verifyDebounceTimer);
+	var input = document.getElementById('api-key-input');
+	var statusEl = document.getElementById('api-key-status');
+	var key = input.value.trim();
+
+	if (!key) {
+		adminVerified = false;
+		hideAdminControls();
+		statusEl.textContent = '';
+		input.classList.remove('invalid');
+		return;
+	}
+
+	verifyDebounceTimer = setTimeout(async function () {
+		try {
+			var headers = { 'x-admin-api-key': key };
+			var res = await fetch('/verify', { headers: headers });
+			if (res.ok) {
+				adminVerified = true;
+				showAdminControls();
+				statusEl.textContent = 'admin';
+				statusEl.style.color = 'var(--green)';
+				input.classList.remove('invalid');
+			} else {
+				adminVerified = false;
+				hideAdminControls();
+				statusEl.textContent = 'invalid';
+				statusEl.style.color = 'var(--red)';
+				input.classList.add('invalid');
+			}
+		} catch (e) {
+			adminVerified = false;
+			hideAdminControls();
+			statusEl.textContent = 'error';
+			statusEl.style.color = 'var(--red)';
+			input.classList.add('invalid');
+		}
+	}, 300);
+}
+
+function showAdminControls() {
+	document.getElementById('admin-controls').classList.add('visible');
+}
+
+function hideAdminControls() {
+	document.getElementById('admin-controls').classList.remove('visible');
+}
+
+function connectWs() {
+	if (ws) { ws.close(); ws = null; }
+	var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+	ws = new WebSocket(proto + '//' + location.host);
+
+	ws.onopen = function () {
+		var badge = document.getElementById('ws-badge');
+		badge.className = 'badge ws-connected';
+		badge.innerHTML = '<span class="dot"></span>Connected to client';
+		ws.send(JSON.stringify({ type: 'subscribe', channel: 'new_chain_tip' }));
+		if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+	};
+
+	ws.onclose = function () {
+		var badge = document.getElementById('ws-badge');
+		badge.className = 'badge ws-disconnected';
+		badge.innerHTML = '<span class="dot"></span>Reconnecting to client...';
+		wsReconnectTimer = setTimeout(connectWs, 5000);
+	};
+
+	ws.onmessage = function (event) {
+		try {
+			var msg = JSON.parse(event.data);
+			if (msg.type === 'new_chain_tip' && msg.data) {
+				lastWsMsgTime = Date.now();
+				renderChainInfo(msg.data);
+				var badge = document.getElementById('status-badge');
+				badge.className = 'badge running';
+				badge.innerHTML = '<span class="dot"></span>Running';
+				dispatchStatusUpdate();
+			}
+		} catch (e) {}
+	};
+}
+
+function showToast(message, type) {
+	var toast = document.createElement('div');
+	toast.className = 'toast ' + type;
+	toast.textContent = message;
+	document.body.appendChild(toast);
+	setTimeout(function () { toast.remove(); }, 3000);
+}
+
+async function refresh() {
+	try {
+		var results = await Promise.all([
+			apiFetch('/header/tip'),
+			apiFetch('/peers/connected')
+		]);
+		renderChainInfo(results[0]);
+		renderPeers(results[1]);
+		updateStatus(results[1]);
+	} catch (err) {
+		showToast('Refresh failed: ' + err.message, 'error');
+	}
+}
+
+function renderChainInfo(tip) {
+	var el = document.getElementById('chain-info');
+	if (!tip) { el.innerHTML = '<div class="empty">No data</div>'; return; }
+	el.innerHTML =
+		'<div class="card-row"><span class="label">Height</span><span class="value">' + tip.height + '</span></div>' +
+		'<div class="card-row"><span class="label">Hash</span><span class="value">' + tip.hashHex + '</span></div>' +
+		'<div class="card-row"><span class="label">Previous Hash</span><span class="value">' + tip.prevHashHex + '</span></div>' +
+		'<div class="card-row"><span class="label">Merkle Root</span><span class="value">' + tip.merkleRootHex + '</span></div>' +
+		'<div class="card-row"><span class="label">Timestamp</span><span class="value">' + formatTimestamp(tip.timestamp) + '</span></div>' +
+		'<div class="card-row"><span class="label">Bits</span><span class="value">' + tip.bitsHex + '</span></div>' +
+		'<div class="card-row"><span class="label">Nonce</span><span class="value">' + tip.nonce + '</span></div>' +
+		'<div class="card-row"><span class="label">Work</span><span class="value">' + tip.workHex + '</span></div>' +
+		'<div class="card-row"><span class="label">Work Total</span><span class="value">' + tip.workTotalHex + '</span></div>';
+}
+
+function renderPeers(peers) {
+	var el = document.getElementById('peers-table');
+	var countEl = document.getElementById('peer-count');
+	if (!peers || !peers.length) {
+		el.innerHTML = '<div class="empty">No connected peers</div>';
+		countEl.textContent = '';
+		return;
+	}
+	countEl.textContent = '(' + peers.length + ')';
+	var html = '<table><thead><tr><th>IP</th><th>Port</th><th>Rating</th></tr></thead><tbody>';
+	for (var i = 0; i < peers.length; i++) {
+		var p = peers[i];
+		var ratingClass = p.rating >= 0.7 ? 'high' : p.rating >= 0.3 ? 'mid' : 'low';
+		var ratingLabel = p.rating >= 0.7 ? 'Good' : p.rating >= 0.3 ? 'Average' : 'Poor';
+		html += '<tr><td>' + p.ip + '</td><td>' + p.port + '</td><td><span class="peer-rating ' + ratingClass + '" title="' + ratingLabel + ' rating (' + p.rating.toFixed(3) + ')"></span>' + p.rating.toFixed(3) + '</td></tr>';
+	}
+	html += '</tbody></table>';
+	el.innerHTML = html;
+}
+
+function updateStatus(peers) {
+	var badge = document.getElementById('status-badge');
+	var btnStart = document.getElementById('btn-start');
+	var btnStop = document.getElementById('btn-stop');
+	if (peers && peers.length > 0) {
+		badge.className = 'badge running';
+		badge.innerHTML = '<span class="dot"></span>Running';
+		if (adminVerified) {
+			btnStart.disabled = true;
+			btnStop.disabled = false;
+		}
+	} else {
+		badge.className = 'badge stopped';
+		badge.innerHTML = '<span class="dot"></span>Stopped';
+		btnStart.disabled = false;
+		btnStop.disabled = true;
+	}
+}
+
+function dispatchStatusUpdate() {
+	var badge = document.getElementById('status-badge');
+	if (badge.classList.contains('running') && adminVerified) {
+		document.getElementById('btn-stop').disabled = false;
+		document.getElementById('btn-start').disabled = true;
+	}
+}
+
+async function startClient() {
+	var btn = document.getElementById('btn-start');
+	btn.disabled = true;
+	btn.textContent = 'Starting...';
+	try {
+		await apiFetch('/admin/start');
+		clientStartedAt = Date.now();
+		updateStartBtnTitle();
+		showToast('Client started', 'success');
+		btn.textContent = '\u25B6 Start Client';
+		setTimeout(refreshPeers, 1500);
+	} catch (err) {
+		showToast('Start failed: ' + err.message, 'error');
+		btn.disabled = false;
+		btn.textContent = '\u25B6 Start Client';
+	}
+}
+
+async function stopClient() {
+	var btn = document.getElementById('btn-stop');
+	btn.disabled = true;
+	btn.textContent = 'Stopping...';
+	try {
+		await apiFetch('/admin/stop');
+		showToast('Client stopped', 'success');
+		clientStartedAt = null;
+		updateStartBtnTitle();
+		btn.textContent = '\u25A0 Stop Client';
+		var badge = document.getElementById('status-badge');
+		badge.className = 'badge stopped';
+		badge.innerHTML = '<span class="dot"></span>Stopped';
+		document.getElementById('btn-start').disabled = false;
+		document.getElementById('btn-stop').disabled = true;
+		document.getElementById('peers-table').innerHTML = '<div class="empty">No connected peers</div>';
+		document.getElementById('peer-count').textContent = '';
+	} catch (err) {
+		showToast('Stop failed: ' + err.message, 'error');
+		btn.disabled = false;
+		btn.textContent = '\u25A0 Stop Client';
+	}
+}
+
+async function lookupHeader(event) {
+	event.preventDefault();
+	var input = document.getElementById('lookup-input').value.trim();
+	var resultsEl = document.getElementById('lookup-results');
+	var errorEl = document.getElementById('lookup-error');
+	resultsEl.innerHTML = '';
+	errorEl.textContent = '';
+	if (!input) return;
+	try {
+		var header = await apiFetch('/header/' + encodeURIComponent(input));
+		resultsEl.innerHTML =
+			'<div class="card-row"><span class="label">Height</span><span class="value">' + header.height + '</span></div>' +
+			'<div class="card-row"><span class="label">Hash</span><span class="value">' + header.hashHex + '</span></div>' +
+			'<div class="card-row"><span class="label">Previous Hash</span><span class="value">' + header.prevHashHex + '</span></div>' +
+			'<div class="card-row"><span class="label">Merkle Root</span><span class="value">' + header.merkleRootHex + '</span></div>' +
+			'<div class="card-row"><span class="label">Timestamp</span><span class="value">' + formatTimestamp(header.timestamp) + '</span></div>' +
+			'<div class="card-row"><span class="label">Bits</span><span class="value">' + header.bitsHex + '</span></div>' +
+			'<div class="card-row"><span class="label">Nonce</span><span class="value">' + header.nonce + '</span></div>' +
+			'<div class="card-row"><span class="label">Work</span><span class="value">' + header.workHex + '</span></div>' +
+			'<div class="card-row"><span class="label">Work Total</span><span class="value">' + header.workTotalHex + '</span></div>';
+	} catch (err) {
+		errorEl.textContent = 'Not found or invalid lookup';
+	}
+}
+
+async function refreshPeers() {
+	try {
+		var peers = await apiFetch('/peers/connected');
+		renderPeers(peers);
+		updateStatus(peers);
+		lastPeersRefreshTime = Date.now();
+	} catch (e) {}
+	updateRefreshPeersTitle();
+}
+
+function updateRefreshPeersTitle() {
+	var btn = document.getElementById('btn-refresh-peers');
+	btn.title = 'Reload the list of connected peers and their ratings (last refreshed ' + timeAgo(lastPeersRefreshTime) + ')';
+}
+
+function toggleAutoRefresh() {
+	var checked = document.getElementById('auto-refresh-checkbox').checked;
+	if (checked) {
+		refreshPeers();
+		peersRefreshInterval = setInterval(refreshPeers, 30000);
+	} else if (peersRefreshInterval) {
+		clearInterval(peersRefreshInterval);
+		peersRefreshInterval = null;
+	}
+}
+
+function updateStartBtnTitle() {
+	var btn = document.getElementById('btn-start');
+	if (clientStartedAt) {
+		btn.title = 'Connect to Bitcoin nodes and begin syncing block headers (running since ' + new Date(clientStartedAt).toLocaleString(undefined, { timeZoneName: 'short' }) + ')';
+	} else {
+		btn.title = 'Connect to Bitcoin nodes and begin syncing block headers';
+	}
+}
+
+function formatTimestamp(unixTs) {
+	return unixTs + ' (' + new Date(unixTs * 1000).toLocaleString(undefined, { timeZoneName: 'short' }) + ')';
+}
+
+function updateStatusBadgeTitle() {
+	var badge = document.getElementById('status-badge');
+	if (badge.classList.contains('running')) {
+		var dur = duration(clientStartedAt);
+		badge.title = 'Client is connected to nodes and syncing block headers' + (dur ? ' (running for ' + dur + ')' : '');
+	} else {
+		badge.title = 'Client is not connected to any nodes and is not syncing block headers';
+	}
+}
+
+function updateWsTitle() {
+	var badge = document.getElementById('ws-badge');
+	if (badge.classList.contains('ws-connected')) {
+		var lastMsg = lastWsMsgTime ? ' Last msg ' + timeAgo(lastWsMsgTime) + '.' : '';
+		badge.title = 'WebSocket connected. Chain tip updates appear in real time.' + lastMsg;
+	} else {
+		badge.title = 'WebSocket disconnected. Reconnects every 5 seconds.';
+	}
+}
+
+document.getElementById('btn-refresh-peers').addEventListener('mouseenter', updateRefreshPeersTitle);
+document.getElementById('btn-start').addEventListener('mouseenter', updateStartBtnTitle);
+document.getElementById('ws-badge').addEventListener('mouseenter', updateWsTitle);
+document.getElementById('status-badge').addEventListener('mouseenter', updateStatusBadgeTitle);
+
+initAdminUI();
+connectWs();
+refresh();
+toggleAutoRefresh();
+</script>
+</body>
+</html>

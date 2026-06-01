@@ -27,5 +27,9 @@ export const createAdminRoutes = (client: BlockHeadersClient) => {
 		}
 	});
 
+	router.get('/verify', adminRateLimit, restrictToAdmins, (req: Request, res: Response) => {
+		res.sendStatus(200);
+	});
+
 	return router;
 };
