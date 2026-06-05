@@ -362,9 +362,13 @@ export class NodesDatabase {
 	private _timeOfLastRatingsUpdateMs: number = 0;
 	private _latestMetricsUpdateTimeMs: number = 0;
 
-	private constructor({ databasePath }: {
+	private readonly _enableConsoleDebugLog: boolean;
+
+	private constructor({ databasePath, enableConsoleDebugLog }: {
 		databasePath: string;
+		enableConsoleDebugLog?: boolean;
 	}) {
+		this._enableConsoleDebugLog = !!enableConsoleDebugLog;
 		this._levelDbMetrics = new Level(databasePath + '/metrics', {
 			keyEncoding: 'json', // Key is IpPort.
 			valueEncoding: 'json' // Value is NodeConnectionMetrics.
@@ -378,13 +382,14 @@ export class NodesDatabase {
 	 * @param options.timeMs - The current time in milliseconds.
 	 * @returns A new NodesDatabase instance.
 	 */
-	static create = async ({ databasePath, timeMs }: {
+	static create = async ({ databasePath, timeMs, enableConsoleDebugLog }: {
 		databasePath: string;
 		timeMs?: number;
+		enableConsoleDebugLog?: boolean;
 	}): Promise<NodesDatabase> => {
 		timeMs = timeMs ?? Date.now();
 
-		const db = new NodesDatabase({ databasePath });
+		const db = new NodesDatabase({ databasePath, enableConsoleDebugLog });
 
 		await db._levelDbMetrics.open();
 
@@ -437,6 +442,8 @@ export class NodesDatabase {
 		// Save to database.
 		this._metricsSaveQueue = this._metricsSaveQueue.then(async () => {
 			await this._levelDbMetrics.clear();
+		}).catch((error) => {
+			console.error('LevelDB metrics clear failed:', error);
 		});
 		return this._metricsSaveQueue;
 	}
@@ -520,6 +527,8 @@ export class NodesDatabase {
 		}
 		this._metricsSaveQueue = this._metricsSaveQueue.then(async () => {
 			await this._levelDbMetrics.batch(batch);
+		}).catch((error) => {
+			console.error('LevelDB clearOld batch failed:', error);
 		});
 		return this._metricsSaveQueue;
 	}
@@ -603,6 +612,8 @@ export class NodesDatabase {
 		}
 		this._metricsSaveQueue = this._metricsSaveQueue.then(async () => {
 			await this._levelDbMetrics.batch(batch);
+		}).catch((error) => {
+			console.error('LevelDB clearBlacklisted batch failed:', error);
 		});
 		return this._metricsSaveQueue;
 	}
@@ -812,6 +823,8 @@ export class NodesDatabase {
 		}
 		this._metricsSaveQueue = this._metricsSaveQueue.then(async () => {
 			await this._levelDbMetrics.batch(batch);
+		}).catch((error) => {
+			console.error('LevelDB save metrics batch failed:', error);
 		});
 		return this._metricsSaveQueue;
 	}
@@ -854,6 +867,8 @@ export class NodesDatabase {
 		// Delete from database (metrics database only).
 		this._metricsSaveQueue = this._metricsSaveQueue.then(async () => {
 			await this._levelDbMetrics.del(ipPort);
+		}).catch((error) => {
+			console.error('LevelDB delete metrics failed:', error);
 		});
 		return this._metricsSaveQueue;
 	}

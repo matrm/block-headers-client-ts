@@ -56,7 +56,9 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 		timeout: NodeJS.Timeout;
 	} | null = null;
 	private _syncingHeaders: boolean = false;
+	private _syncHeadersChain = Promise.resolve();
 	private _syncHeadersQueue = Promise.resolve();
+	private _numSyncHeadersQueued = 0;
 
 	constructor({ ip, port, chain, blockHeadersDatabase, connectionMonitor, enableConsoleDebugLog, defaultTimeoutMs, defaultGetAddrTimeoutMs }: {
 		ip: string;
@@ -753,24 +755,43 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 	syncHeaders = async ({ signal }: {
 		signal?: AbortSignal;
 	} = {}): Promise<void> => {
-		if (this._syncingHeaders) {
+		if (this._numSyncHeadersQueued >= 2) {
+			// Already have 1 running + 1 queued. The 1 queued item prevents a race
+			// condition where a block is found while the last chunk of headers is
+			// still being downloaded. Capping the queue at 2 prevents unnecessary
+			// additional queued calls since they provide no benefit and only waste
+			// network I/O.
 			return this._syncHeadersQueue;
 		}
-		this._syncHeadersQueue = this._syncHeadersQueue
-			.then(async () => {
-				assert(!this._syncingHeaders);
-				this._syncingHeaders = true;
+		this._numSyncHeadersQueued++;
+		// Chain on the sequencing gate which never rejects, so a failed sync
+		// does not skip the next queued item. _syncHeadersQueue is the shared
+		// outcome and may reject, propagating the error to every caller.
+		this._syncHeadersQueue = this._syncHeadersChain.then(async () => {
+			assert(!this._syncingHeaders);
+			this._syncingHeaders = true;
+			try {
 				await this._syncHeaders(signal);
-			})
-			.catch((error) => {
-				// Reset this node's tip hash so it doesn't get considered for being out of sync on
-				// the next syncHeaders call since the previous one (this one) failed.
+			} catch (error) {
 				this._tipHashHex = this._startingTipHashHex;
 				throw error;
-			})
-			.finally(() => {
+			} finally {
 				this._syncingHeaders = false;
-			});
+				this._numSyncHeadersQueued--;
+				if (this._numSyncHeadersQueued === 0) {
+					this._syncHeadersChain = Promise.resolve();
+					this._syncHeadersQueue = Promise.resolve();
+				}
+			}
+		});
+		// If 3 calls to this method start at the same time:
+		// - Call 1: runs _syncHeaders immediately.
+		// - Call 2: chains on _syncHeadersChain, runs follow-up _syncHeaders after call 1.
+		// - Call 3: depth-limited, returns call 2's _syncHeadersQueue promise.
+		// Calls 3..N all share call 2's outcome (success or error), never call 1's.
+		// _syncHeadersChain catches _syncHeadersQueue so the gate never rejects;
+		// a failed sync does not skip the next queued call.
+		this._syncHeadersChain = this._syncHeadersQueue.catch(() => { });
 		return this._syncHeadersQueue;
 	}
 }

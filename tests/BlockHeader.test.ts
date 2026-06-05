@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { expect, test, describe } from 'vitest';
 import { BlockHeaderMutable } from '../src/BlockHeader.js';
 

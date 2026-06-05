@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { mkdir } from 'node:fs/promises';
 
 import { expect, test, describe, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
@@ -104,13 +105,48 @@ expect(headersAfterReorg2.at(-3)?.hashHex).toBe(headersBeforeReorg.at(-1)?.hashH
 // headersBeforeReorg ends with hash: 000000008d9dc510f23c2657fc4f67bea30078cc05a90eb89e84cc475c080805
 // headersReorg ends with hash: 2b14928f3d59cb1e4185f38f54ad9b9af627432c9f1f055f33d60340aa145565
 
+// Helper to create a minimal valid block header buffer for testing.
+// prevHashHex is the display-format hash of the parent header.
+function createHeaderBuffer(prevHashHex: string, nonce: number, bitsHex: string = 'ffff001d'): Buffer {
+	const buf = Buffer.alloc(80);
+	buf.writeUInt32LE(1, 0);
+	Buffer.from(prevHashHex, 'hex').reverse().copy(buf, 4);
+	const merkleBuf = Buffer.alloc(32);
+	merkleBuf.writeUInt32LE(nonce, 0);
+	merkleBuf.writeUInt32LE(nonce + 1, 4);
+	merkleBuf.writeUInt32LE(nonce + 2, 8);
+	merkleBuf.reverse();
+	merkleBuf.copy(buf, 36);
+	buf.writeUInt32LE(1000000000 + nonce, 68);
+	Buffer.from(bitsHex, 'hex').copy(buf, 72);
+	buf.writeUInt32LE(nonce, 76);
+	return buf;
+}
+
+// Create a BlockHeaderMutable with skipProofOfWorkCheck = true.
+function createHeader(prevHashHex: string, nonce: number, bitsHex: string = 'ffff001d'): BlockHeaderMutable {
+	return BlockHeaderMutable.fromBuffer(createHeaderBuffer(prevHashHex, nonce, bitsHex), true);
+}
+
+// Build a linear chain of headers on top of an existing parent hash.
+function buildChain(parentHashHex: string, count: number, startNonce: number, bitsHex?: string): BlockHeaderMutable[] {
+	const headers: BlockHeaderMutable[] = [];
+	let prev = parentHashHex;
+	for (let i = 0; i < count; i++) {
+		const h = createHeader(prev, startNonce + i, bitsHex);
+		headers.push(h);
+		prev = h.hashHex;
+	}
+	return headers;
+}
+
 // --- Tests for BlockHeadersDatabase ---
 describe('BlockHeadersDatabase', () => {
 	let db: BlockHeadersDatabase;
 	let databasePath: string;
 
 	beforeEach(async (context) => {
-		databasePath = getRandomHexString(16);
+		databasePath = `tests/db/headers-${getRandomHexString(16)}`;
 
 		await mkdir(databasePath, { recursive: true });
 
@@ -571,4 +607,144 @@ describe('BlockHeadersDatabase', () => {
 		expect(db.getHeaderTip().height).toBe(1);
 		expect(db.getHeaderTip().workTotal).toBe(genesisHeader.work + headersBeforeReorg[0].work);
 	})
+
+	describe('chain tip emit invariant', () => {
+		// The _syncHeaders loop emits new_chain_tip with headers.at(-1).hashHex.
+		// This describe proves that when nAdded > 0, the last header in every
+		// batch is always the new chain tip (a linear peer batch always has
+		// the maximum workTotal at its tail).
+
+		test('normal extension: last header in batch IS the new chain tip', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const batch = buildChain(genesisHashHex, 5, 100);
+			const result = db.addHeaders(batch);
+
+			expect(result.headersAddedToLongestChain.length).toBeGreaterThan(0);
+			expect(db.getHeaderTip().hashHex).toBe(batch.at(-1)!.hashHex);
+			expect(result.headersAddedToLongestChain.map(h => h.hashHex))
+				.toContain(batch.at(-1)!.hashHex);
+		});
+
+		test('reorg where fork wins: fork batch last header IS new chain tip', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const mainChain = buildChain(genesisHashHex, 3, 100);
+			db.addHeaders(mainChain);
+
+			const forkParent = mainChain[0].hashHex;
+			const forkChain = buildChain(forkParent, 4, 200);
+
+			const result = db.addHeaders(forkChain);
+
+			expect(result.headersAddedToLongestChain.length).toBeGreaterThan(0);
+			expect(db.getHeaderTip().hashHex).toBe(forkChain.at(-1)!.hashHex);
+			expect(result.headersAddedToLongestChain.map(h => h.hashHex))
+				.toContain(forkChain.at(-1)!.hashHex);
+		});
+
+		test('orphan fork (less work): nAdded = 0, emit would not fire', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const mainChain = buildChain(genesisHashHex, 5, 100);
+			db.addHeaders(mainChain);
+
+			const forkParent = mainChain[0].hashHex;
+			const forkChain = buildChain(forkParent, 2, 200);
+
+			const result = db.addHeaders(forkChain);
+
+			expect(result.headersAddedToLongestChain.length).toBe(0);
+			expect(db.getHeaderTip().hashHex).toBe(mainChain.at(-1)!.hashHex);
+		});
+
+		test('reorg by extension: extending an existing fork past main chain', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const mainChain = buildChain(genesisHashHex, 5, 100);
+			db.addHeaders(mainChain);
+			const mainTipBefore = db.getHeaderTip().hashHex;
+
+			const forkParent = mainChain[1].hashHex;
+			const forkPart1 = buildChain(forkParent, 2, 200);
+			const result1 = db.addHeaders(forkPart1);
+			expect(result1.headersAddedToLongestChain.length).toBe(0);
+			expect(db.getHeaderTip().hashHex).toBe(mainTipBefore);
+
+			const forkPart2 = buildChain(forkPart1.at(-1)!.hashHex, 2, 300);
+			const result2 = db.addHeaders(forkPart2);
+
+			expect(result2.headersAddedToLongestChain.length).toBeGreaterThan(0);
+			expect(db.getHeaderTip().hashHex).toBe(forkPart2.at(-1)!.hashHex);
+			expect(result2.headersAddedToLongestChain.map(h => h.hashHex))
+				.toContain(forkPart2.at(-1)!.hashHex);
+		});
+
+		test('concurrent extension: batch extending a side branch that now wins', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const mainChain = buildChain(genesisHashHex, 5, 100);
+			db.addHeaders(mainChain);
+
+			const forkParentA = mainChain[2].hashHex;
+			const forkA = buildChain(forkParentA, 2, 200);
+			const resultA = db.addHeaders(forkA);
+			expect(resultA.headersAddedToLongestChain.length).toBe(0);
+
+			const forkExt = buildChain(forkA.at(-1)!.hashHex, 2, 300);
+			const resultB = db.addHeaders(forkExt);
+
+			expect(resultB.headersAddedToLongestChain.length).toBeGreaterThan(0);
+			expect(db.getHeaderTip().hashHex).toBe(forkExt.at(-1)!.hashHex);
+			expect(resultB.headersAddedToLongestChain.map(h => h.hashHex))
+				.toContain(forkExt.at(-1)!.hashHex);
+		});
+
+		test('single-header batch: when nAdded > 0 it IS the chain tip', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const batch1 = buildChain(genesisHashHex, 1, 100);
+			const result1 = db.addHeaders(batch1);
+			expect(result1.headersAddedToLongestChain.length).toBe(1);
+			expect(db.getHeaderTip().hashHex).toBe(batch1[0].hashHex);
+
+			const batch2 = buildChain(batch1[0].hashHex, 1, 101);
+			const result2 = db.addHeaders(batch2);
+			expect(result2.headersAddedToLongestChain.length).toBe(1);
+			expect(db.getHeaderTip().hashHex).toBe(batch2[0].hashHex);
+		});
+
+		test('duplicate batch: all headers already known, nAdded = 0', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const batch = buildChain(genesisHashHex, 3, 100);
+			db.addHeaders(batch);
+
+			const result = db.addHeaders(batch);
+			expect(result.headersAddedToLongestChain.length).toBe(0);
+			expect(db.getHeaderTip().hashHex).toBe(batch.at(-1)!.hashHex);
+		});
+
+		test('extensive: for any batch where nAdded > 0, last header is chain tip', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const mainChain = buildChain(genesisHashHex, 5, 100);
+			db.addHeaders(mainChain);
+
+			const fork1 = buildChain(mainChain[1].hashHex, 2, 200);
+			db.addHeaders(fork1);
+			const fork2 = buildChain(mainChain[2].hashHex, 3, 300);
+			db.addHeaders(fork2);
+			const fork3 = buildChain(mainChain[0].hashHex, 2, 400);
+			db.addHeaders(fork3);
+
+			const testCases: { description: string; batch: BlockHeaderMutable[] }[] = [
+				{ description: 'Extend fork1 past main chain', batch: buildChain(fork1.at(-1)!.hashHex, 4, 500) },
+				{ description: 'Extend main chain further', batch: buildChain(mainChain.at(-1)!.hashHex, 5, 600) },
+				{ description: 'Extend fork2 to be longest', batch: buildChain(fork2.at(-1)!.hashHex, 5, 700) },
+				{ description: 'Extend fork3 by a lot', batch: buildChain(fork3.at(-1)!.hashHex, 8, 800) },
+			];
+
+			for (const { batch } of testCases) {
+				const result = db.addHeaders(batch);
+				if (result.headersAddedToLongestChain.length > 0) {
+					expect(db.getHeaderTip().hashHex).toBe(batch.at(-1)!.hashHex);
+					expect(result.headersAddedToLongestChain.map(h => h.hashHex))
+						.toContain(batch.at(-1)!.hashHex);
+				}
+			}
+		});
+	});
 });

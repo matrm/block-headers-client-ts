@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { expect, test, describe, vi, beforeEach, afterAll, afterEach } from 'vitest';
 import {
 	assert,

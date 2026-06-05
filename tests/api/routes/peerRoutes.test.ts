@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createApp } from '../../../src/api/express.js';
 import { BlockHeadersClient } from '../../../src/BlockHeadersClient.js';

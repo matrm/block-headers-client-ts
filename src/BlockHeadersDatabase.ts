@@ -45,8 +45,9 @@ export class BlockHeadersDatabase {
 	private _levelDbHeadersSaveQueue: Promise<void> = Promise.resolve();
 	private _addHeadersChangesLevelDbSaveQueue: AddHeadersChanges[] = [];
 	private _lastTimeChainTipExtendedMs: number | undefined;
+	private readonly _enableConsoleDebugLog: boolean;
 
-	private constructor({ databasePath, invalidBlocks, headers, headersTree, headersTreeLeafHashes, sortedHeaders, sortedHeadersIndex }: {
+	private constructor({ databasePath, invalidBlocks, headers, headersTree, headersTreeLeafHashes, sortedHeaders, sortedHeadersIndex, enableConsoleDebugLog }: {
 		databasePath: string;
 		invalidBlocks: Set<string>;
 		headers?: Map<string, BlockHeaderMutable>;
@@ -54,7 +55,9 @@ export class BlockHeadersDatabase {
 		headersTreeLeafHashes?: Set<string>;
 		sortedHeaders?: BlockHeaderMutable[];
 		sortedHeadersIndex?: Map<string, number>;
+		enableConsoleDebugLog?: boolean;
 	}) {
+		this._enableConsoleDebugLog = !!enableConsoleDebugLog;
 		const genesisHeader = BlockHeaderMutable.fromHex(BITCOIN_GENESIS_HEADER_HEX);
 		genesisHeader.setHeight(0);
 		genesisHeader.setWorkTotal(genesisHeader.work);
@@ -84,11 +87,12 @@ export class BlockHeadersDatabase {
 	 * @param options.invalidBlocks - An array of invalid block hashes.
 	 * @returns A new BlockHeadersDatabase instance.
 	 */
-	static fromGenesis = ({ databasePath, invalidBlocks }: {
+	static fromGenesis = ({ databasePath, invalidBlocks, enableConsoleDebugLog }: {
 		databasePath: string;
 		invalidBlocks: string[];
+		enableConsoleDebugLog?: boolean;
 	}): BlockHeadersDatabase => {
-		return new BlockHeadersDatabase({ databasePath, invalidBlocks: new Set(invalidBlocks) });
+		return new BlockHeadersDatabase({ databasePath, invalidBlocks: new Set(invalidBlocks), enableConsoleDebugLog });
 	}
 
 	/**
@@ -104,7 +108,7 @@ export class BlockHeadersDatabase {
 		invalidBlocks: string[];
 		enableConsoleDebugLog?: boolean;
 	}): Promise<BlockHeadersDatabase> => {
-		const blockHeadersDatabase = new BlockHeadersDatabase({ databasePath, invalidBlocks: new Set(invalidBlocks) });
+		const blockHeadersDatabase = new BlockHeadersDatabase({ databasePath, invalidBlocks: new Set(invalidBlocks), enableConsoleDebugLog });
 
 		const startTimeMs = performance.now();
 		const headersMap = new Map<number, BlockHeaderMutable>();

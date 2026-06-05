@@ -15,9 +15,9 @@
   ],
   "scripts": {
     "build": "rimraf dist && rimraf docs && tsc",
-    "test": "vitest --exclude=tests/BlockHeadersClient.test.ts --no-watch",
-    "test:coverage": "vitest --exclude=tests/BlockHeadersClient.test.ts --no-watch --coverage",
-    "test:connections": "vitest run tests/BlockHeadersClient.test.ts --passWithNoTests --sequence.concurrent=false --no-watch",
+    "test": "vitest --exclude=tests/BlockHeadersClient.spec.ts --no-watch",
+    "test:coverage": "vitest --exclude=tests/BlockHeadersClient.spec.ts --no-watch --coverage",
+    "test:connections": "vitest run tests/BlockHeadersClient.spec.ts --passWithNoTests --sequence.concurrent=false --no-watch",
     "prepublishOnly": "npm run build",
     "start-nobuild": "node --env-file=.env dist/api/index.js",
     "start-build": "npm run build && npm run start-nobuild"

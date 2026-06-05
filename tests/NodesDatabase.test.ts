@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { mkdir } from 'node:fs/promises';
 
 import { expect, test, describe, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
@@ -318,7 +319,7 @@ describe('NodesDatabase', () => {
 	]);
 
 	beforeEach(async (context) => {
-		databasePath = getRandomHexString(16);
+		databasePath = `tests/db/nodes-${getRandomHexString(16)}`;
 
 		await mkdir(databasePath, { recursive: true });
 
@@ -760,6 +761,92 @@ describe('NodesDatabase', () => {
 
 			// Check the total number of nodes.
 			expect(db.getNumNodes()).toBe(3);
+		});
+	});
+
+	describe('_metricsSaveQueue failure recovery', () => {
+		// Mocks internal LevelDB methods to throw, then verifies that the
+		// queue swallows errors so subsequent operations still chain and execute.
+
+		test('after a batch write failure, the next operation chains successfully', async () => {
+			const timeMs = Date.now();
+			await db.addSeen({ ip: '1.2.3.4', port: 8333 }, timeMs);
+			await db.addSeen({ ip: '5.6.7.8', port: 8333 }, timeMs + 1);
+			expect(db.getNumNodes()).toBe(2);
+
+			// Wait for the save queue to drain (addSeen chains writes).
+			await (db as any)._metricsSaveQueue;
+
+			let callCount = 0;
+			(db as any)._levelDbMetrics.batch = async () => {
+				callCount++;
+				throw new Error('Simulated LevelDB batch failure');
+			};
+
+			await db.clearOld({ amount: 1 });
+			expect(callCount).toBe(1);
+
+			// Fix the batch mock so the next operation can recover.
+			(db as any)._levelDbMetrics.batch = async () => {
+				callCount++;
+			};
+
+			await db.addSeen({ ip: '9.10.11.12', port: 8333 }, timeMs + 2);
+			await (db as any)._metricsSaveQueue;
+			await db.clearOld({ amount: 1 });
+
+			expect(callCount).toBe(3);
+		});
+
+		test('after a del failure, queue resolves and next del succeeds', async () => {
+			const timeMs = Date.now();
+			await db.addSeen({ ip: '1.2.3.4', port: 8333 }, timeMs);
+			await db.addLastConnectAndTestTimeMs({ ip: '1.2.3.4', port: 8333 }, timeMs + 100);
+
+			await (db as any)._metricsSaveQueue;
+
+			let callCount = 0;
+			(db as any)._levelDbMetrics.del = async () => {
+				callCount++;
+				throw new Error('Simulated LevelDB del failure');
+			};
+
+			await (db as any)._deleteMetrics({ ip: '1.2.3.4', port: 8333 });
+			expect(callCount).toBe(1);
+
+			(db as any)._levelDbMetrics.del = async () => {
+				callCount++;
+			};
+
+			await db.addSeen({ ip: '5.6.7.8', port: 8333 }, timeMs + 1);
+			await db.addLastConnectAndTestTimeMs({ ip: '5.6.7.8', port: 8333 }, timeMs + 200);
+			await (db as any)._metricsSaveQueue;
+			await (db as any)._deleteMetrics({ ip: '5.6.7.8', port: 8333 });
+
+			expect(callCount).toBe(2);
+		});
+
+		test('concurrent operations: second batch still executes when first fails', async () => {
+			const timeMs = Date.now();
+			await db.addSeen({ ip: '1.2.3.4', port: 8333 }, timeMs);
+			await db.addSeen({ ip: '5.6.7.8', port: 8333 }, timeMs + 1);
+			await (db as any)._metricsSaveQueue;
+
+			let batchCallCount = 0;
+			(db as any)._levelDbMetrics.batch = async () => {
+				batchCallCount++;
+				if (batchCallCount === 1) {
+					throw new Error('Simulated first batch failure');
+				}
+			};
+
+			const p1 = db.clearOld({ amount: 1 });
+			const p2 = db.addSeen({ ip: '9.10.11.12', port: 8333 }, timeMs + 2);
+
+			await Promise.allSettled([p1, p2]);
+
+			// Both batches should execute since the queue swallows errors via .catch.
+			expect(batchCallCount).toBe(2);
 		});
 	});
 });

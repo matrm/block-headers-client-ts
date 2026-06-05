@@ -41,10 +41,9 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	private readonly _activeNodeConnectionTests: Map<string, NodeConnection> = new Map();
 	private readonly _nodeEventTimes_disconnect_unintentional_after_connect: Map<string, number> = new Map();
 	private readonly _seedNodes: readonly IpPort[] = [];
-	private _numConnectToNodesQueues: number = 0;
 	private _abortController = new AbortController();
 	private _stopQueue: Promise<void> | null = null;
-	private _connectToNodesQueue: Promise<void> = Promise.resolve();
+	private _startQueue: Promise<void> | null = null;
 	private _nodeConnectionsHealthMonitorQueue: Promise<void> | null = null;
 	private readonly _connectionMonitor: ConnectionMonitor;
 	private _addedSeedNodesFromExternalAPI: boolean = false;
@@ -106,7 +105,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			enableConsoleDebugLog
 		});
 		const timeMs = Date.now();
-		const nodesDatabase = await NodesDatabase.create({ databasePath: databasePathNodes, timeMs });
+		const nodesDatabase = await NodesDatabase.create({ databasePath: databasePathNodes, timeMs, enableConsoleDebugLog });
 
 		if (enableConsoleDebugLog && nodesDatabase.getNumNodes() > 0) {
 			const numNodes = nodesDatabase.getNumNodes();
@@ -167,8 +166,12 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 
 				this._abortController.abort();
 
-				await this._connectToNodesQueue;
-				this._enableConsoleDebugLog && console.log('Flushed _connectToNodesQueue.');
+				if (this._startQueue) {
+					await this._startQueue.catch((error) => {
+						this._enableConsoleDebugLog && console.log('stop() continuing despite _startQueue failure:', error.message);
+					});
+					this._enableConsoleDebugLog && console.log('Flushed _startQueue.');
+				}
 
 				if (this._nodeConnectionsHealthMonitorQueue) {
 					this._enableConsoleDebugLog && console.log('Flushing _nodeConnectionsHealthMonitorQueue.');
@@ -870,6 +873,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	// - Frees up resources by clearing the oldest (by seen time) nodes from database if there are too many.
 	// - Frees up resources by pruning header branches in the block headers database.
 	private _launchNodeConnectionsHealthMonitor = async (clientStopSignal: AbortSignal): Promise<void> => {
+		// This method never rejects; all internal errors are caught and logged.
 		if (this._nodeConnectionsHealthMonitorQueue) {
 			return this._nodeConnectionsHealthMonitorQueue;
 		}
@@ -907,6 +911,8 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 					// 		abortController.abort();// Abort all ongoing operations.
 					// 	}
 					// }
+				}).catch((error) => {
+					this._enableConsoleDebugLog && console.log('Node connections health monitor: Failed to create connected node:', error.message);
 				});
 
 				// Clear the nodes with the oldest last seen time if there are too many.
@@ -947,8 +953,12 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 
 				this._enableConsoleDebugLog && console.log(`Node connections health monitor: Sleeping for ${MIN_TIME_BETWEEN_MS}ms...`);
 				await abortableSleepMsNoThrow(MIN_TIME_BETWEEN_MS, clientStopSignal);
+			}).catch((error) => {
+				// All code in the above .then() block should catch and log its own errors, so this catch() is just a safety net.
+				this._enableConsoleDebugLog && console.log('Node connections health monitor: Iteration failed:', error.message);
 			});
 		}
+		this._nodeConnectionsHealthMonitorQueue = null;
 	}
 
 	private _connectToNodes = async ({ priorityIpPort, progressCallback, clientStopSignal }: {
@@ -964,7 +974,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		if (!this._addedSeedNodesFromExternalAPI && this._nodesDatabase.getNumNodesNonBlacklisted({ timeMs: Date.now() }) < NUM_WORKERS) {
 			this._addedSeedNodesFromExternalAPI = true;
 			await this._addSeedNodesFromExternalApi().catch((error) => {
-				this._enableConsoleDebugLog && console.error('Failed to add seed nodes from external API:', error.message);
+				console.error('Failed to add seed nodes from external API:', error.message);
 			});
 		}
 		const timeMs = Date.now();// After the await statement.
@@ -1076,34 +1086,34 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		progressCallback?: ProgressCallback;
 	} = {}): Promise<void> => {
 		// Wait for an in-progress stop() to complete.
-		// This must be OUTSIDE the _connectToNodesQueue chain to avoid
-		// a circular promise dependency with stop()'s await of _connectToNodesQueue.
+		// This must be OUTSIDE the _startQueue chain to avoid
+		// a circular promise dependency with stop()'s await of _startQueue.
 		if (this._stopQueue) {
 			await this._stopQueue;
 		}
-		// Limit queue size to 1.
-		if (this._numConnectToNodesQueues < 1) {
-			this._connectToNodesQueue = this._connectToNodesQueue
-				.then(async () => {
-					this._numConnectToNodesQueues++;
-					if (this._abortController.signal.aborted) {
-						this._abortController = new AbortController();
-					}
-					const abortController = this._abortController;
-					this._enableConsoleDebugLog && console.log(unixTime3Decimal(), '- Starting connection monitor and opening databases.');
-					await this._connectionMonitor.start(abortController.signal);
-					await this._nodesDatabase.open();
-					await this._blockHeadersDatabase.open();
-					await this._connectToNodes({ ...options, clientStopSignal: abortController.signal });
-					this._launchNodeConnectionsHealthMonitor(abortController.signal);
-				})
-				.finally(() => {
-					this._numConnectToNodesQueues--;
-				});
-		} else if (this._enableConsoleDebugLog) {
-			console.log('_connectToNodes is already running.');
+
+		if (this._startQueue) {
+			this._enableConsoleDebugLog && console.log('_start is already running.');
+			return this._startQueue;
 		}
-		return this._connectToNodesQueue;
+
+		this._startQueue = (async () => {
+			if (this._abortController.signal.aborted) {
+				this._abortController = new AbortController();
+			}
+			const abortController = this._abortController;
+			this._enableConsoleDebugLog && console.log(unixTime3Decimal(), '- Starting connection monitor and opening databases.');
+			await this._connectionMonitor.start(abortController.signal);
+			await this._nodesDatabase.open();
+			await this._blockHeadersDatabase.open();
+			await this._connectToNodes({ ...options, clientStopSignal: abortController.signal });
+			this._launchNodeConnectionsHealthMonitor(abortController.signal);
+		})()
+			.finally(() => {
+				this._startQueue = null;
+			});
+
+		return this._startQueue;
 	}
 
 	/**

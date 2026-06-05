@@ -8,7 +8,8 @@ export const createHeaderRoutes = (client: BlockHeadersClient) => {
 	const router = Router();
 
 	router.get('/header/:id', publicRateLimit, (req: Request, res: Response) => {
-		const id = req.params.id.trim();
+		const rawId = req.params.id;
+		const id = (Array.isArray(rawId) ? rawId[0] : rawId).trim();
 
 		if (id === 'tip') {
 			const tip = client.getHeaderTip();

@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 import http from 'http';
 

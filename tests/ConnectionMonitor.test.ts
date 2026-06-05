@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { expect, test, describe, beforeEach, afterEach, vi } from 'vitest';
 import { ConnectionMonitor, DEFAULT_timeoutMs, DEFAULT_intervalMs } from '../src/ConnectionMonitor.js';
 

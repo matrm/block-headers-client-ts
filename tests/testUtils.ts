@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { rm } from 'node:fs/promises';
 
 export const removeDirectoryWithRetries = async (dbPath: string) => {
