@@ -95,7 +95,7 @@ td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,.04); font-fam
 			<button id="btn-stop" class="btn danger" onclick="stopClient()" disabled title="Disconnect from all nodes and stop syncing">&#9632; Stop Client</button>
 		</span>
 		<button id="btn-refresh-peers" class="btn" onclick="refreshPeers()" title="Reload the list of connected peers and their ratings">&#8635; Refresh Peers</button>
-		<label class="auto-refresh-label" title="Refresh the peers list every 30 seconds">
+		<label class="auto-refresh-label" title="Refresh the peers list when new WebSocket messages arrive">
 			<input type="checkbox" id="auto-refresh-checkbox" checked onchange="toggleAutoRefresh()"> Auto-refresh peers
 		</label>
 	</div>
@@ -135,7 +135,7 @@ let wsReconnectTimer = null;
 let lastWsMsgTime = null;
 let lastPeersRefreshTime = null;
 let clientStartedAt = null;
-let peersRefreshInterval = null;
+let autoRefreshEnabled = true;
 let adminVerified = BYPASS_ADMIN_AUTH;
 let verifyDebounceTimer = null;
 
@@ -249,6 +249,7 @@ function connectWs() {
 		badge.innerHTML = '<span class="dot"></span>Connected to client';
 		ws.send(JSON.stringify({ type: 'subscribe', channel: 'new_chain_tip' }));
 		if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+		if (autoRefreshEnabled) { refreshPeers(); }
 	};
 
 	ws.onclose = function () {
@@ -270,6 +271,10 @@ function connectWs() {
 				dispatchStatusUpdate();
 			}
 		} catch (e) {}
+
+		// Eventually a peers specific websocket message may be implemented. For now
+		// we just refresh the peers list on any message if auto-refresh is enabled.
+		if (autoRefreshEnabled) { refreshPeers(); }
 	};
 }
 
@@ -367,7 +372,7 @@ async function startClient() {
 		updateStartBtnTitle();
 		showToast('Client started', 'success');
 		btn.textContent = '\u25B6 Start Client';
-		setTimeout(refreshPeers, 1500);
+		refreshPeers();
 	} catch (err) {
 		showToast('Start failed: ' + err.message, 'error');
 		btn.disabled = false;
@@ -440,13 +445,9 @@ function updateRefreshPeersTitle() {
 }
 
 function toggleAutoRefresh() {
-	var checked = document.getElementById('auto-refresh-checkbox').checked;
-	if (checked) {
+	autoRefreshEnabled = document.getElementById('auto-refresh-checkbox').checked;
+	if (autoRefreshEnabled) {
 		refreshPeers();
-		peersRefreshInterval = setInterval(refreshPeers, 30000);
-	} else if (peersRefreshInterval) {
-		clearInterval(peersRefreshInterval);
-		peersRefreshInterval = null;
 	}
 }
 
