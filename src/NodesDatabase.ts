@@ -618,6 +618,76 @@ export class NodesDatabase {
 		return this._metricsSaveQueue;
 	}
 
+	/**
+	 * Deletes all nodes from the database except those in the excluded map.
+	 * @param options - Options for deleting nodes.
+	 * @param options.excludedIpPortStringsMap - A map of IP port strings to exclude from deletion.
+	 */
+	async deleteNodes({ excludedIpPortStringsMap }: {
+		excludedIpPortStringsMap?: Map<string, any>;
+	} = {}): Promise<void> {
+		excludedIpPortStringsMap = excludedIpPortStringsMap || new Map();
+		const ipPortStringsToDelete: string[] = [];
+
+		// Iterate over all nodes, excluding those in the exclusion map.
+		for (const [ipPortString] of this._ipPortStringToMetrics) {
+			if (excludedIpPortStringsMap.has(ipPortString)) continue;
+			ipPortStringsToDelete.push(ipPortString);
+		}
+
+		if (!ipPortStringsToDelete.length) return;
+
+		// Remove from in-memory data structures.
+		ipPortStringsToDelete.forEach((ipPortString) => {
+			// Remove from seen time set.
+			const metrics = this._ipPortStringToMetrics.get(ipPortString)!;
+			const seenTime = metrics.lastSeenTimeMs;
+			const seenSet = this._seenTimeToIpPortStringSet.get(seenTime);
+			if (seenSet) {
+				seenSet.delete(ipPortString);
+				if (seenSet.size === 0) {
+					this._seenTimeToIpPortStringSet.delete(seenTime);
+				}
+			}
+			this._ipPortStringToMetrics.delete(ipPortString);
+
+			// Remove from rating set.
+			const rating = this._ipPortStringToRating.get(ipPortString)!;
+			const ratingSet = this._ratingToIpPortStringSet.get(rating);
+			if (ratingSet) {
+				ratingSet.delete(ipPortString);
+				if (ratingSet.size === 0) {
+					this._ratingToIpPortStringSet.delete(rating);
+				}
+			}
+			this._ipPortStringToRating.delete(ipPortString);
+
+			// Remove from non-blacklisted set if it exists there.
+			this._nonBlacklistedIpPortStrings.delete(ipPortString);
+		});
+
+		// Update this._latestMetricsUpdateTimeMs.
+		this._latestMetricsUpdateTimeMs = 0;
+		this._ipPortStringToMetrics.forEach((metrics) => {
+			this._latestMetricsUpdateTimeMs = Math.max(this._latestMetricsUpdateTimeMs, getHighestMetricsTime(metrics));
+		});
+
+		// Save to database.
+		const batch: any[] = [];
+		for (const ipPortString of ipPortStringsToDelete) {
+			batch.push({
+				type: 'del' as const,
+				key: stringToIpPort(ipPortString)
+			});
+		}
+		this._metricsSaveQueue = this._metricsSaveQueue.then(async () => {
+			await this._levelDbMetrics.batch(batch);
+		}).catch((error) => {
+			console.error('LevelDB deleteNodes batch failed:', error);
+		});
+		return this._metricsSaveQueue;
+	}
+
 	// Faster single-node version of this._buildRatingsMapsFromMetrics().
 	private _recalculateNodeRating(ipPortString: string, timeMs: number): void {
 		// Get metrics for the node; exit if none exist.

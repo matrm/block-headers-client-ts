@@ -1,14 +1,14 @@
 /// <reference types="node" />
 import { mkdir } from 'node:fs/promises';
 
-import { expect, test, describe, beforeEach, afterEach } from 'vitest';
+import { expect, test, describe, beforeEach, afterEach, vi } from 'vitest';
 import { removeDirectoryWithRetries, createDbWithRetries } from './testUtils';
 
 import { BlockHeadersClient } from '../src/BlockHeadersClient';
 import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase';
 import { NodesDatabase } from '../src/NodesDatabase';
 import { Chain, getInvalidBlocks } from '../src/chainProtocol';
-import { getRandomHexString } from '../src/utils/util';
+import { getRandomHexString, ipPortToString } from '../src/utils/util';
 
 const chain: Chain = 'bsv';
 
@@ -233,6 +233,61 @@ describe('BlockHeadersClient queue recovery', () => {
 			await (client as any)._launchNodeConnectionsHealthMonitor(abort.signal);
 
 			expect((client as any)._nodeConnectionsHealthMonitorQueue).toBeNull();
+		});
+	});
+
+	describe('stuck detection', () => {
+		test('when no progress has been made for the timeout, failed connection attempts purge non-connected nodes and re-add seeds', async () => {
+			const clientAny = client as any;
+			const fakeNode = { ip: '1.2.3.4', port: 8333 };
+			await nodesDb.addSeen(fakeNode, Date.now());
+
+			// Pretend the internet is up so the stuck path is reached instead of the offline sleep path.
+			clientAny._connectionMonitor.connectedToInternetCheapAsync = vi.fn().mockResolvedValue(true);
+
+			const deleteNodesSpy = vi.spyOn(nodesDb, 'deleteNodes');
+			const addSeedEnvSpy = vi.spyOn(clientAny, '_addSeedNodesFromEnvAndHardcoded').mockImplementation(() => { });
+			const addSeedApiSpy = vi.spyOn(clientAny, '_addSeedNodesFromExternalApi').mockResolvedValue(new Set<string>());
+
+			const createFakeConnection = (ipPort: { ip: string, port: number }) => ({
+				getIpPort: () => ipPort,
+				getIpPortString: () => ipPortToString(ipPort),
+				connect: vi.fn().mockRejectedValue(new Error('simulated connect failure')),
+				ping: vi.fn(),
+				onValidChain: vi.fn(),
+				syncHeaders: vi.fn(),
+				getAddr: vi.fn(),
+				removeAllListeners: vi.fn(),
+				on: vi.fn(),
+				[Symbol.dispose]: vi.fn(),
+			});
+
+			clientAny._createNodeConnection = vi.fn().mockImplementation((ipPort: { ip: string, port: number }) => {
+				const connection = createFakeConnection(ipPort);
+				clientAny._nodeConnections.set(ipPortToString(ipPort), connection);
+				return connection;
+			});
+
+			// Make the progress timer stale enough to satisfy the timeout for NUM_WORKERS workers.
+			clientAny._lastConnectionProgressTime = performance.now() - 100000;
+
+			const abort = new AbortController();
+			await clientAny._createConnectedNodeConnection({
+				prioritizeRating: true,
+				numTopNodesToRandomlySelect: 1,
+				alwaysGetAddr: false,
+				workerId: 'stuck-detection-test',
+				numWorkers: 16,
+				signal: abort.signal,
+				clientStopSignal: abort.signal,
+				maxNumAttempts: 2,
+			});
+
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(1);
+			expect(deleteNodesSpy).toHaveBeenCalledWith({ excludedIpPortStringsMap: clientAny._nodeConnections });
+			expect(addSeedEnvSpy).toHaveBeenCalledTimes(1);
+			expect(addSeedApiSpy).toHaveBeenCalledTimes(1);
+			expect(clientAny._seedReAddPromise).toBeNull();
 		});
 	});
 });

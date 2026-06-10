@@ -764,6 +764,140 @@ describe('NodesDatabase', () => {
 		});
 	});
 
+	describe('deleteNodes', () => {
+		test('should delete all nodes except those in the exclusion map', async () => {
+			const [node1, node2, node3, node4, node5] = ipPorts;
+			await db.addSeen(node1, Date.now() - 50);
+			await db.addSeen(node2, Date.now() - 40);
+			await db.addSeen(node3, Date.now() - 30);
+			await db.addSeen(node4, Date.now() - 20);
+			await db.addSeen(node5, Date.now() - 10);
+
+			expect(db.getNumNodes()).toBe(5);
+
+			const excludedIpPortStringsMap = new Map<string, any>([
+				[ipPortToString(node2), {}],
+				[ipPortToString(node4), {}],
+			]);
+
+			await db.deleteNodes({ excludedIpPortStringsMap });
+
+			expect(db.getNumNodes()).toBe(2);
+			expect(db.has(node1)).toBe(false);
+			expect(db.has(node2)).toBe(true);
+			expect(db.has(node3)).toBe(false);
+			expect(db.has(node4)).toBe(true);
+			expect(db.has(node5)).toBe(false);
+		});
+
+		test('should delete all nodes when exclusion map is empty', async () => {
+			const [node1, node2, node3] = ipPorts;
+			await db.addSeen(node1, Date.now() - 30);
+			await db.addSeen(node2, Date.now() - 20);
+			await db.addSeen(node3, Date.now() - 10);
+
+			expect(db.getNumNodes()).toBe(3);
+
+			await db.deleteNodes({});
+
+			expect(db.getNumNodes()).toBe(0);
+			expect(db.has(node1)).toBe(false);
+			expect(db.has(node2)).toBe(false);
+			expect(db.has(node3)).toBe(false);
+		});
+
+		test('should delete all nodes when no options are passed', async () => {
+			const [node1, node2] = ipPorts;
+			await db.addSeen(node1, Date.now() - 20);
+			await db.addSeen(node2, Date.now() - 10);
+
+			expect(db.getNumNodes()).toBe(2);
+
+			await db.deleteNodes();
+
+			expect(db.getNumNodes()).toBe(0);
+		});
+
+		test('should not fail when called on an empty database', async () => {
+			expect(db.getNumNodes()).toBe(0);
+			await expect(db.deleteNodes()).resolves.toBeUndefined();
+			expect(db.getNumNodes()).toBe(0);
+		});
+
+		test('should not fail when all nodes are excluded', async () => {
+			const [node1, node2] = ipPorts;
+			await db.addSeen(node1, Date.now() - 20);
+			await db.addSeen(node2, Date.now() - 10);
+
+			const excludedIpPortStringsMap = new Map<string, any>([
+				[ipPortToString(node1), {}],
+				[ipPortToString(node2), {}],
+			]);
+
+			expect(db.getNumNodes()).toBe(2);
+
+			await db.deleteNodes({ excludedIpPortStringsMap });
+
+			expect(db.getNumNodes()).toBe(2);
+			expect(db.has(node1)).toBe(true);
+			expect(db.has(node2)).toBe(true);
+		});
+
+		test('should remove deleted nodes from the non-blacklisted set', async () => {
+			const timeMs = Date.now();
+			const [node1, node2, node3] = ipPorts;
+
+			// Add two nodes with good metrics (non-blacklisted).
+			for (const node of [node1, node2]) {
+				await db.addPingTimeMs(node, timeMs, 50);
+				await db.addLastConnectTimeMs(node, timeMs);
+			}
+
+			// Add one node with bad metrics (blacklisted).
+			await db.addLastInvalidChainDetectedTimeMs(node3, timeMs);
+
+			expect(db.isBlacklisted(node1, timeMs)).toBe(false);
+			expect(db.isBlacklisted(node2, timeMs)).toBe(false);
+			expect(db.isBlacklisted(node3, timeMs)).toBe(true);
+
+			// Exclude node1, blacklisted node3 should be deleted along with node2.
+			const excludedIpPortStringsMap = new Map<string, any>([
+				[ipPortToString(node1), {}],
+			]);
+
+			await db.deleteNodes({ excludedIpPortStringsMap });
+
+			expect(db.getNumNodes()).toBe(1);
+			expect(db.has(node1)).toBe(true);
+			expect(db.has(node2)).toBe(false);
+			expect(db.has(node3)).toBe(false);
+		});
+
+		test('should update _latestMetricsUpdateTimeMs after deletion', async () => {
+			const [node1, node2] = ipPorts;
+			const timeMs1 = Date.now() - 1000;
+			const timeMs2 = Date.now();
+
+			await db.addSeen(node1, timeMs1);
+			await db.addSeen(node2, timeMs2);
+
+			expect(db.getNumNodes()).toBe(2);
+
+			// Delete the node with the higher metrics time, keeping only node1.
+			const excludedIpPortStringsMap = new Map<string, any>([
+				[ipPortToString(node1), {}],
+			]);
+			await db.deleteNodes({ excludedIpPortStringsMap });
+
+			expect(db.getNumNodes()).toBe(1);
+			expect(db.has(node1)).toBe(true);
+
+			// The remaining node has lastSeenTimeMs = timeMs1, so
+			// _latestMetricsUpdateTimeMs must be recalculated down to timeMs1.
+			expect((db as any)._latestMetricsUpdateTimeMs).toBe(timeMs1);
+		});
+	});
+
 	describe('_metricsSaveQueue failure recovery', () => {
 		// Mocks internal LevelDB methods to throw, then verifies that the
 		// queue swallows errors so subsequent operations still chain and execute.

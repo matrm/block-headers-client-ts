@@ -16,6 +16,20 @@ const MAX_SAVED_NODES = 4000;
 const RECENT_UNINTENTIONAL_DISCONNECT_TIME_THRESHOLD_MS = 1000;
 const TARGET_NUM_CONNECTIONS = 8;
 const NUM_WORKERS = 2 * TARGET_NUM_CONNECTIONS;
+// Stuck-detection timeout follows a power decay curve: the more workers, the less time each
+// failure window gets before resetting node metrics. 1 worker → ~500s, 16 workers → ~60s,
+// asymptotically approaching 40s as the number of workers approaches infinity.
+//
+// The minimum effective timeout (40s at high worker counts) is intentionally generous to
+// avoid spurious deletions. A worker inside a getAddr() call will have
+// _nodesCurrentlyRunningGetAddr > 0, which blocks the detection because getAddr() can take
+// several minutes per call. Slow connect(), ping(), onValidChain(), or syncHeaders() calls
+// do not block detection.
+// The timer is also reset on successful connection, getAddr start, stuck-detection purge,
+// internet-down detection, and startup, so normal activity keeps the timeout from triggering.
+const METRICS_RESET_TIMEOUT_BASE_MS = 40000;
+const METRICS_RESET_TIMEOUT_AMPLITUDE_MS = 460000;
+const METRICS_RESET_TIMEOUT_EXPONENT = Math.log(23) / Math.log(16);
 const SEED_NODES_HARDCODED = Object.freeze(Array.from(new Set<string>([
 	{ ip: '47.186.181.232', port: 8333 },
 	{ ip: '13.57.104.213', port: 8333 },
@@ -36,8 +50,15 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	private readonly _chain: Chain;
 	private readonly _nodesDatabase: NodesDatabase;
 	private readonly _blockHeadersDatabase: BlockHeadersDatabase;
-	private readonly _nodeConnections: Map<string, NodeConnection> = new Map();// Including nodes that are disonnected or with pending connections.
-	private readonly _nodeConnectionsConnected: Map<string, NodeConnection> = new Map();// Only including nodes that have passed the tests in this._connectNode(). Not including nodes with pending connections.
+	// Tracks all nodes that have a live NodeConnection object, regardless of
+	// connection-test outcome. Entries are added in _createNodeConnection and
+	// removed on disconnect/out_of_sync/invalid_blocks callbacks (registered
+	// in _setupNodeConnectionCallbacks). NodeConnection emits one of those
+	// events on almost every failure path, so stale entries do not accumulate.
+	private readonly _nodeConnections: Map<string, NodeConnection> = new Map();
+	// Only including nodes that have passed the tests in this._connectNode().
+	// Not including nodes with pending connections.
+	private readonly _nodeConnectionsConnected: Map<string, NodeConnection> = new Map();
 	private readonly _activeNodeConnectionTests: Map<string, NodeConnection> = new Map();
 	private readonly _nodeEventTimes_disconnect_unintentional_after_connect: Map<string, number> = new Map();
 	private readonly _seedNodes: readonly IpPort[] = [];
@@ -49,7 +70,24 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	private _addedSeedNodesFromExternalAPI: boolean = false;
 	private _addedSeedNodesFromEnvAndHardcoded: boolean = false;
 	private _nodesSyncingHeaders: Set<string> = new Set();
-
+	// Timestamp (performance.now()) of the most recent sign of progress.
+	// Reset on successful connection, getAddr start, stuck-detection purge,
+	// internet-down detection, and whenever workers begin connecting to nodes.
+	// The stuck-detection logic in _createConnectedNodeConnection compares elapsed time
+	// against this to decide when to delete non-connected nodes from the database.
+	private _lastConnectionProgressTime: number = 0;
+	// Shared promise that workers await when the database is temporarily empty after
+	// a stuck-detection node deletion. Workers see this promise and wait for seed
+	// re-addition to complete instead of exiting with "no more nodes available".
+	private _seedReAddPromise: Promise<void> | null = null;
+	// Counts workers currently inside a getAddr() call. A worker in getAddr
+	// blocks stuck detection to avoid deleting the node database just because
+	// getAddr is sometimes slow (sometimes taking several minutes per call).
+	// We block getAddr calls from triggering stuck detection instead of other
+	// parts of the stuck detection because not all connection tests run getAddr
+	// and it is the last part of a connection test so the tested node is most likely
+	// going to pass the test successfully.
+	private _nodesCurrentlyRunningGetAddr: number = 0;
 	private constructor({ chain, nodesDatabase, blockHeadersDatabase, seedNodes, enableConsoleDebugLog }: {
 		chain: Chain;
 		nodesDatabase: NodesDatabase;
@@ -173,6 +211,14 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 					this._enableConsoleDebugLog && console.log('Flushed _startQueue.');
 				}
 
+				if (this._seedReAddPromise) {
+					this._enableConsoleDebugLog && console.log('Flushing seed re-add promise.');
+					await this._seedReAddPromise.catch((error) => {
+						this._enableConsoleDebugLog && console.log('stop() continuing despite seed re-add failure:', error.message);
+					});
+					this._seedReAddPromise = null;
+				}
+
 				if (this._nodeConnectionsHealthMonitorQueue) {
 					this._enableConsoleDebugLog && console.log('Flushing _nodeConnectionsHealthMonitorQueue.');
 					await this._nodeConnectionsHealthMonitorQueue;
@@ -251,9 +297,21 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		return nodeConnection;
 	}
 
-	private _addSeedNodesFromExternalApi = async (): Promise<Set<string>> => {
+	private _addSeedNodesFromExternalApi = async (signal?: AbortSignal): Promise<Set<string>> => {
 		const addToThis: Set<string> = new Set();
-		const peers = await fetch('https://api.whatsonchain.com/v1/bsv/main/peer/info').then((response) => response.json());
+
+		const timeoutController = new AbortController();
+		const timeoutId = setTimeout(() => timeoutController.abort(), 10000);
+		const combinedSignal = signal ? combineAbortControllers(signal, timeoutController.signal).signal : timeoutController.signal;
+
+		const peers = await fetch('https://api.whatsonchain.com/v1/bsv/main/peer/info', {
+			signal: combinedSignal
+		}).then((response) => {
+			if (!response.ok) throw new Error(`HTTP ${response.status} fetching seed nodes from external API`);
+			return response.json();
+		}).finally(() => {
+			clearTimeout(timeoutId);
+		});
 		const timeMs = Date.now();
 		const additionalIpPorts: IpPort[] = peers
 			.map((peer: any) => {
@@ -293,6 +351,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		this._nodesDatabase.addSeenBatch(Array.from(addToThis).map(stringToIpPort), timeMs).catch((error) => {
 			console.error('Failed to add seen nodes to database that were fetched from an external API:', error);
 		});
+		this._addedSeedNodesFromExternalAPI = true;
 		return addToThis;
 	}
 
@@ -301,6 +360,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		seedNodesNotAddedYet.length && this._nodesDatabase.addSeenBatch(seedNodesNotAddedYet, Date.now()).catch((error) => {
 			console.error('Failed to add seen nodes to database that were in .env or hardcoded:', error);
 		});
+		this._addedSeedNodesFromEnvAndHardcoded = true;
 		this._enableConsoleDebugLog && seedNodesNotAddedYet.length && console.log(`Added ${seedNodesNotAddedYet.length} seed nodes from .env or hardcoded.`);
 	}
 
@@ -358,14 +418,21 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			console.error('Nodes database error when addLastConnectAndTestTimeMs', nodeConnection.getIpPort(), ':', error);
 		});
 
-		const requestMoreNodes = alwaysGetAddr || this._nodesDatabase.getNumNodes() < NUM_WORKERS;// Can be adjusted as necessary or always true.
+		const requestMoreNodes = alwaysGetAddr || this._nodesDatabase.getNumNodes() < NUM_WORKERS;
 		if (requestMoreNodes) {
 			this._enableConsoleDebugLog && console.log(`Worker ${workerId} - About to get peers from node:`, nodeConnection.getIpPort(), numAttempts, 'attempts.');
-			const connectedIpPorts = await nodeConnection.getAddr({ signal });
-			this._enableConsoleDebugLog && console.log(`Worker ${workerId} - Saw ${connectedIpPorts.length} peers from node:`, nodeConnection.getIpPort(), numAttempts, 'attempts.');
-			this._nodesDatabase.addSeenBatch(connectedIpPorts, Date.now()).catch((error: Error) => {
-				console.error('Nodes database error when adding seen batch:', error);
-			});
+			// Not all node connection tests need to call getAddr, so we update the timer both before and after.
+			this._lastConnectionProgressTime = performance.now();
+			this._nodesCurrentlyRunningGetAddr++;
+			try {
+				const connectedIpPorts = await nodeConnection.getAddr({ signal });
+				this._enableConsoleDebugLog && console.log(`Worker ${workerId} - Saw ${connectedIpPorts.length} peers from node:`, nodeConnection.getIpPort(), numAttempts, 'attempts.');
+				this._nodesDatabase.addSeenBatch(connectedIpPorts, Date.now()).catch((error: Error) => {
+					console.error('Nodes database error when adding seen batch:', error);
+				});
+			} finally {
+				this._nodesCurrentlyRunningGetAddr--;
+			}
 			if (signal.aborted) throw new Error('Aborted after getAddr');
 		}
 
@@ -373,6 +440,8 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		// this._nodeConnectionsConnected before they pass the tests in this function. So instead it is added after
 		// passing the tests here.
 		this._nodeConnectionsConnected.set(nodeConnection.getIpPortString(), nodeConnection);
+		// Reset the stuck-detection timer since we just successfully connected to a node.
+		this._lastConnectionProgressTime = performance.now();
 	}
 
 	private _createConnectedNodeConnection = async ({
@@ -383,11 +452,12 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		progressCallback,
 		workerId,
 		numWorkers,
-		signal,
-		clientStopSignal,
+		signal,// Aborts when this worker should stop (target reached, or stop() called).
+		clientStopSignal,// Aborts only when stop() is called.
 		maxNumAttempts,
 		stopAfterFirstConnection,
-		onTargetReached
+		onTargetReached,
+		disableStuckDetection
 	}: {
 		priorityIpPort?: IpPort;
 		prioritizeRating: boolean;
@@ -401,6 +471,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		maxNumAttempts: number;
 		stopAfterFirstConnection?: boolean;
 		onTargetReached?: (workerId: number | string) => void;// Callback to check and abort other workers if target is reached.
+		disableStuckDetection?: boolean;// Set to true to prevent the stuck-detection node-deletion logic from firing from this worker.
 	}): Promise<void> => {
 		if (priorityIpPort && this._nodeConnections.has(ipPortToString(priorityIpPort))) {
 			// Prevents a race condition.
@@ -419,6 +490,15 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			if (signal.aborted) {
 				this._enableConsoleDebugLog && console.log(`Worker ${workerId} - Aborted from signal.`);
 				return;
+			}
+
+			// If a stuck-detection deletion cleared the database and seeds are being
+			// re-added, await the shared promise before calling getNextNode otherwise
+			// seed nodes may not be available.
+			if (this._seedReAddPromise) {
+				this._enableConsoleDebugLog && console.log(`Worker ${workerId} - Awaiting seed re-add before node selection.`);
+				await this._seedReAddPromise;
+				if (signal.aborted) return;
 			}
 
 			const timeMs = Date.now();
@@ -459,7 +539,10 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				this._enableConsoleDebugLog && console.log(`Worker ${workerId} - this._nodeConnections.size:`, this._nodeConnections.size);
 				this._enableConsoleDebugLog && console.log(`Worker ${workerId} - this._nodeConnectionsConnected.size:`, this._nodeConnectionsConnected.size);
 
-				// Do not call _destroyNodeConnection here because it will prevent the connection metrics from being updated in the database.
+				// Do not call _destroyNodeConnection here; it would dispose the socket
+				// (removing its error/close listeners) before those listeners can emit
+				// the disconnect / out_of_sync / invalid_blocks events that drive the
+				// database metric updates in _setupNodeConnectionCallbacks.
 
 				let aborted = false;
 				const connectedToInternetAndNotAborted = await this._connectionMonitor.connectedToInternetCheapAsync(signal).catch(() => {
@@ -474,9 +557,92 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 					return;
 				}
 
+				// If no new node has connected within the per-worker timeout and we are
+				// still under TARGET_NUM_CONNECTIONS, delete all non-connected nodes from the
+				// database so falsely-blacklisted nodes can be retried as fresh entries. Then
+				// launch an async seed re-add via a shared promise. The triggering worker does
+				// NOT await the seed re-add here; it falls through to continue, loops back,
+				// and awaits the shared promise on the "no more nodes available" path
+				// alongside all other workers.
+				//
+				// The check is skipped when:
+				//  - disableStuckDetection is true (e.g. health monitor)
+				//  - another worker is inside a getAddr() call (can take several minutes)
+				//  - a seed re-add is already in progress (_seedReAddPromise !== null)
+				//
+				// The timer is reset by _lastConnectionProgressTime, which is updated
+				// on successful connection, getAddr start, stuck-detection purge,
+				// internet-down detection, and whenever workers begin connecting to nodes.
+				// Combined with _nodesCurrentlyRunningGetAddr > 0 blocking, the effectiveTimeout
+				// can safely be tens of seconds.
+				const effectiveTimeoutMs = METRICS_RESET_TIMEOUT_BASE_MS + Math.floor(METRICS_RESET_TIMEOUT_AMPLITUDE_MS / Math.pow(numWorkers, METRICS_RESET_TIMEOUT_EXPONENT));
+				if (
+					connectedToInternetAndNotAborted &&
+					this._nodeConnectionsConnected.size < TARGET_NUM_CONNECTIONS &&
+					performance.now() - this._lastConnectionProgressTime > effectiveTimeoutMs &&
+					!this._seedReAddPromise &&
+					!disableStuckDetection &&
+					this._nodesCurrentlyRunningGetAddr === 0
+				) {
+					this._lastConnectionProgressTime = performance.now();
+					this._enableConsoleDebugLog && console.log(`No new connections in ${(effectiveTimeoutMs / 1000).toFixed(0)}s. Deleting nodes and re-adding seeds.`);
+					// Use _nodeConnections as the exclusion map instead of _nodeConnectionsConnected
+					// to avoid removing nodes that are currently running callbacks which may leave
+					// the node in a corrupted state if removed from the database.
+					this._nodesDatabase.deleteNodes({ excludedIpPortStringsMap: this._nodeConnections });
+					this._addedSeedNodesFromExternalAPI = false;
+					this._addedSeedNodesFromEnvAndHardcoded = false;
+					assert(this._seedReAddPromise === null);
+					this._seedReAddPromise = (async () => {
+						this._addSeedNodesFromEnvAndHardcoded();
+						await this._addSeedNodesFromExternalApi(clientStopSignal).catch((error: Error) => {
+							console.error('Failed to add seed nodes after node deletion:', error);
+						});
+
+						// Run getAddr on the currently connected nodes to fill up the database again.
+						// Race the getAddr calls and abort the rest after the first one completes.
+						const raceAbortController = new AbortController();
+						const combinedSignal = combineAbortControllers(clientStopSignal, raceAbortController.signal).signal;
+						const getAddrPromises: Array<Promise<void>> = [];
+						for (const connectedNodeConnection of this._nodeConnectionsConnected.values()) {
+							const getAddrPromise = connectedNodeConnection.getAddr({ signal: combinedSignal })
+								.then((connectedIpPorts: IpPort[]) => {
+									raceAbortController.abort();
+									this._nodesDatabase.addSeenBatch(connectedIpPorts, Date.now()).catch((error: Error) => {
+										console.error('Nodes database error when adding seen batch:', error);
+									});
+								})
+								.catch((error: Error) => {
+									if (!combinedSignal.aborted) {
+										this._enableConsoleDebugLog && console.log('Failed to getAddr from node when re-filling database:', connectedNodeConnection.getIpPort(), error);
+									}
+								});
+							getAddrPromises.push(getAddrPromise);
+						}
+						await Promise.all(getAddrPromises);
+						// getAddr can take a long time to complete, so we update this again to
+						// prevent another stuck-detection purge from being triggered too soon after.
+						// This code is locked behind this._seedReAddPromise, so we do not need to
+						// modify the this._nodesCurrentlyRunningGetAddr counter to prevent this if
+						// statement from being triggered by another worker.
+						this._lastConnectionProgressTime = performance.now();
+					})().finally(() => {
+						// We use a .finally() in case future devs make changes that forget to handle
+						// errors when re-adding seeds. If we do not want that protection then this
+						// null assignment could be at the inner end of the async function it is chained to.
+						this._seedReAddPromise = null;
+					});
+				}
+
 				if (!connectedToInternetAndNotAborted) {
 					this._enableConsoleDebugLog && console.log(`Worker ${workerId} - Not connected to the internet. Progress: (${this._nodeConnectionsConnected.size}/${Math.min(TARGET_NUM_CONNECTIONS, numWorkers)}).`);
+
 					await abortableSleepMsNoThrow(1000, signal);
+
+					// No internet: reset the stuck-detection timer so a prolonged
+					// outage does not produce a stale timestamp that triggers an
+					// immediate database purge the moment connectivity returns.
+					this._lastConnectionProgressTime = performance.now();
 				}
 
 				continue;
@@ -728,8 +894,8 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			const nodesAfter = new Set(nodesBefore);
 
 			// When creating a node connection, it only gets added to this._nodeConnectionsConnected if the
-			// connection is both successfully made and successfully tested. this_createConnectedNodeConnection()
-			// doesn't destroy the node connection if the connection is not completely tested and relys on this callback.
+			// connection is both successfully made and successfully tested. _createConnectedNodeConnection()
+			// doesn't destroy the node connection if the connection is not completely tested and relies on this callback.
 			const wasConnectedAndTested = this._nodeConnectionsConnected.has(ipPortString);
 			// Remove this node from this._nodeConnectionsConnected so connected counters are accurate while this function
 			// is waiting for promises to resolve.
@@ -811,7 +977,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 
 			if (!wasConnectedAndTested) {
 				// When creating a node connection, it only gets added to this._nodeConnectionsConnected if the
-				// connection is both successfully made and successfully tested. this_createConnectedNodeConnection()
+				// connection is both successfully made and successfully tested. _createConnectedNodeConnection()
 				// doesn't destroy the node connection if the connection is not completely tested and relies on this callback.
 				this._enableConsoleDebugLog && console.log('Node', ipPort, 'was removed from or never added to this._nodeConnectionsConnected from outside disconnect_unintentional_after_connect callback.');
 				this._destroyNodeConnection(nodeConnection);
@@ -905,6 +1071,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 					clientStopSignal,
 					maxNumAttempts: 100,
 					stopAfterFirstConnection: true,
+					disableStuckDetection: true,
 					// onTargetReached: () => {
 					// 	if (this._nodeConnectionsConnected.size >= TARGET_NUM_CONNECTIONS) {
 					// 		this._enableConsoleDebugLog && console.log('Target connections reached, aborting all pending attempts.');
@@ -972,14 +1139,13 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		}
 
 		if (!this._addedSeedNodesFromExternalAPI && this._nodesDatabase.getNumNodesNonBlacklisted({ timeMs: Date.now() }) < NUM_WORKERS) {
-			this._addedSeedNodesFromExternalAPI = true;
-			await this._addSeedNodesFromExternalApi().catch((error) => {
+			await this._addSeedNodesFromExternalApi(clientStopSignal).catch((error) => {
 				console.error('Failed to add seed nodes from external API:', error.message);
 			});
+			if (clientStopSignal.aborted) return;
 		}
 		const timeMs = Date.now();// After the await statement.
 		if (!this._addedSeedNodesFromEnvAndHardcoded && this._nodesDatabase.getNumNodesNonBlacklisted({ timeMs }) < NUM_WORKERS) {
-			this._addedSeedNodesFromEnvAndHardcoded = true;
 			this._addSeedNodesFromEnvAndHardcoded();
 		}
 
@@ -1002,6 +1168,9 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			}
 		}
 		this._enableConsoleDebugLog && console.log("#".repeat(50));
+
+		// Initialize the stuck-detection timer at the moment workers begin connecting.
+		this._lastConnectionProgressTime = performance.now();
 
 		const timeBeforeMs = performance.now();
 		// For aborting when finished connecting to nodes.
