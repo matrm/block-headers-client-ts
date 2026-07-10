@@ -53,10 +53,23 @@ header h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em; }
 table { width: 100%; font-size: .85rem; border-collapse: collapse; }
 th { text-align: left; color: var(--text-muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
 td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,.04); font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: .8rem; }
+td:first-child, th:first-child { padding-left: 4px; padding-right: 4px; }
 .peer-rating { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
 .peer-rating.high { background: var(--green); }
 .peer-rating.mid { background: var(--orange); }
 .peer-rating.low { background: var(--red); }
+.peer-row { cursor: pointer; transition: background .1s; }
+.peer-row:hover { background: var(--surface-hover); }
+.peer-row .expand-arrow { display: inline-block; width: 14px; font-size: .7rem; text-align: center; transition: transform .15s; }
+.peer-row.expanded .expand-arrow { transform: rotate(90deg); }
+.peer-details { display: none; background: rgba(0,0,0,.15); }
+.peer-details.expanded { display: table-row; }
+.peer-details td { padding: 4px 10px 8px 34px; font-family: inherit; font-size: .78rem; color: var(--text-muted); line-height: 1.6; }
+.peer-details .metric-label { color: var(--text-muted); }
+.peer-details .metric-value { color: var(--text); }
+.peer-details .metric-section { margin-bottom: 6px; }
+.peer-details .metric-section-title { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); margin-bottom: 2px; }
+.peer-details .metric-row { line-height: 1.6; }
 .lookup { margin-bottom: 24px; }
 .lookup form { display: flex; gap: 10px; }
 .lookup input { flex: 1; padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: .85rem; outline: none; transition: border-color .15s; }
@@ -144,7 +157,8 @@ function timeAgo(ms) {
 	const ago = Math.round((Date.now() - ms) / 1000);
 	if (ago < 60) return ago + 's ago';
 	if (ago < 3600) return Math.round(ago / 60) + 'm ago';
-	return Math.round(ago / 3600) + 'h ago';
+	if (ago < 86400) return Math.round(ago / 3600) + 'h ago';
+	return Math.round(ago / 86400) + 'd ago';
 }
 
 function duration(ms) {
@@ -160,7 +174,7 @@ function getApiKey() {
 }
 
 function getApiHeaders() {
-	const headers = { 'Content-Type': 'application/json' };
+	const headers = { 'Content-Type': 'application/json', 'x-dashboard-apis': 'true' };
 	const key = getApiKey();
 	if (key) headers['x-admin-api-key'] = key;
 	return headers;
@@ -170,9 +184,9 @@ async function apiFetch(url, options) {
 	options = options || {};
 	const res = await fetch(url, Object.assign({}, options, { headers: Object.assign(getApiHeaders(), options.headers || {}) }));
 	if (!res.ok) {
-		var text = await res.text();
-		var msg = res.statusText;
-		try { var j = JSON.parse(text); msg = j.error || msg; } catch (e) {}
+		const text = await res.text();
+		let msg = res.statusText;
+		try { const j = JSON.parse(text); msg = j.error || msg; } catch (e) {}
 		throw new Error(msg);
 	}
 	if (res.status === 204) return null;
@@ -191,9 +205,9 @@ function initAdminUI() {
 
 function onApiKeyInput() {
 	clearTimeout(verifyDebounceTimer);
-	var input = document.getElementById('api-key-input');
-	var statusEl = document.getElementById('api-key-status');
-	var key = input.value.trim();
+	const input = document.getElementById('api-key-input');
+	const statusEl = document.getElementById('api-key-status');
+	const key = input.value.trim();
 
 	if (!key) {
 		adminVerified = false;
@@ -205,11 +219,12 @@ function onApiKeyInput() {
 
 	verifyDebounceTimer = setTimeout(async function () {
 		try {
-			var headers = { 'x-admin-api-key': key };
-			var res = await fetch('/verify', { headers: headers });
+			const headers = { 'x-admin-api-key': key };
+			const res = await fetch('/verify', { headers: headers });
 			if (res.ok) {
 				adminVerified = true;
 				showAdminControls();
+				if (autoRefreshEnabled) { refreshPeers(); }
 				statusEl.textContent = 'admin';
 				statusEl.style.color = 'var(--green)';
 				input.classList.remove('invalid');
@@ -240,11 +255,11 @@ function hideAdminControls() {
 
 function connectWs() {
 	if (ws) { ws.close(); ws = null; }
-	var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+	const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 	ws = new WebSocket(proto + '//' + location.host);
 
 	ws.onopen = function () {
-		var badge = document.getElementById('ws-badge');
+		const badge = document.getElementById('ws-badge');
 		badge.className = 'badge ws-connected';
 		badge.innerHTML = '<span class="dot"></span>Connected to client';
 		ws.send(JSON.stringify({ type: 'subscribe', channel: 'new_chain_tip' }));
@@ -253,7 +268,7 @@ function connectWs() {
 	};
 
 	ws.onclose = function () {
-		var badge = document.getElementById('ws-badge');
+		const badge = document.getElementById('ws-badge');
 		badge.className = 'badge ws-disconnected';
 		badge.innerHTML = '<span class="dot"></span>Reconnecting to client...';
 		wsReconnectTimer = setTimeout(connectWs, 5000);
@@ -261,11 +276,11 @@ function connectWs() {
 
 	ws.onmessage = function (event) {
 		try {
-			var msg = JSON.parse(event.data);
+			const msg = JSON.parse(event.data);
 			if (msg.type === 'new_chain_tip' && msg.data) {
 				lastWsMsgTime = Date.now();
 				renderChainInfo(msg.data);
-				var badge = document.getElementById('status-badge');
+				const badge = document.getElementById('status-badge');
 				badge.className = 'badge running';
 				badge.innerHTML = '<span class="dot"></span>Running';
 				dispatchStatusUpdate();
@@ -279,7 +294,7 @@ function connectWs() {
 }
 
 function showToast(message, type) {
-	var toast = document.createElement('div');
+	const toast = document.createElement('div');
 	toast.className = 'toast ' + type;
 	toast.textContent = message;
 	document.body.appendChild(toast);
@@ -288,7 +303,7 @@ function showToast(message, type) {
 
 async function refresh() {
 	try {
-		var results = await Promise.all([
+		const results = await Promise.all([
 			apiFetch('/header/tip'),
 			apiFetch('/peers/connected')
 		]);
@@ -301,7 +316,7 @@ async function refresh() {
 }
 
 function renderChainInfo(tip) {
-	var el = document.getElementById('chain-info');
+	const el = document.getElementById('chain-info');
 	if (!tip) { el.innerHTML = '<div class="empty">No data</div>'; return; }
 	el.innerHTML =
 		'<div class="card-row"><span class="label">Height</span><span class="value">' + tip.height + '</span></div>' +
@@ -316,29 +331,107 @@ function renderChainInfo(tip) {
 }
 
 function renderPeers(peers) {
-	var el = document.getElementById('peers-table');
-	var countEl = document.getElementById('peer-count');
+	const el = document.getElementById('peers-table');
+	const countEl = document.getElementById('peer-count');
 	if (!peers || !peers.length) {
 		el.innerHTML = '<div class="empty">No connected peers</div>';
 		countEl.textContent = '';
 		return;
 	}
 	countEl.textContent = '(' + peers.length + ')';
-	var html = '<table><thead><tr><th>IP</th><th>Port</th><th>Rating</th></tr></thead><tbody>';
-	for (var i = 0; i < peers.length; i++) {
-		var p = peers[i];
-		var ratingClass = p.rating >= 0.7 ? 'high' : p.rating >= 0.3 ? 'mid' : 'low';
-		var ratingLabel = p.rating >= 0.7 ? 'Good' : p.rating >= 0.3 ? 'Average' : 'Poor';
-		html += '<tr><td>' + p.ip + '</td><td>' + p.port + '</td><td><span class="peer-rating ' + ratingClass + '" title="' + ratingLabel + ' rating (' + p.rating.toFixed(3) + ')"></span>' + p.rating.toFixed(3) + '</td></tr>';
+	const stored = el.querySelector('table') ? getExpandedPeers(el) : {};
+	let html = '<table><thead><tr><th></th><th>IP</th><th>Port</th><th>Rating</th></tr></thead><tbody>';
+	for (let i = 0; i < peers.length; i++) {
+		const p = peers[i];
+		const ratingClass = p.rating >= 0.7 ? 'high' : p.rating >= 0.3 ? 'mid' : 'low';
+		const rowId = p.ip + ':' + p.port;
+		const expanded = stored[rowId] || false;
+		const hasMetrics = !!p.metrics;
+		html += '<tr class="peer-row' + (expanded && hasMetrics ? ' expanded' : '') + '" ' + (hasMetrics ? 'onclick="togglePeerRow(this)"' : '') + ' data-row-id="' + rowId + '"><td><span class="expand-arrow">' + (hasMetrics ? '&#9656;' : '&#8203;') + '</span></td><td>' + p.ip + '</td><td>' + p.port + '</td><td><span class="peer-rating ' + ratingClass + '"></span>' + (p.rating != null ? p.rating.toFixed(3) : '-') + '</td></tr>';
+		if (hasMetrics) {
+			html += '<tr class="peer-details' + (expanded ? ' expanded' : '') + '" data-row-id="' + rowId + '"><td colspan="4">' + renderPeerMetrics(p.metrics) + '</td></tr>';
+		}
 	}
 	html += '</tbody></table>';
 	el.innerHTML = html;
+	refreshTimeAgoInContainer(el);
+}
+
+function getExpandedPeers(el) {
+	const result = {};
+	const rows = el.querySelectorAll('.peer-row.expanded');
+	for (let i = 0; i < rows.length; i++) {
+		result[rows[i].getAttribute('data-row-id')] = true;
+	}
+	return result;
+}
+
+function togglePeerRow(row) {
+	const id = row.getAttribute('data-row-id');
+	const details = document.querySelector('.peer-details[data-row-id="' + id + '"]');
+	const expanded = row.classList.toggle('expanded');
+	if (details) details.classList.toggle('expanded', expanded);
+	refreshAllExpandedTimeAgo();
+}
+
+function refreshTimeAgoInContainer(container) {
+	const spans = container.querySelectorAll('[data-ms]');
+	for (let i = 0; i < spans.length; i++) {
+		spans[i].textContent = timeAgo(parseInt(spans[i].getAttribute('data-ms')));
+	}
+}
+
+function renderPeerMetrics(metrics) {
+	if (!metrics) return '<span class="metric-label">No metrics available</span>';
+	let html = '';
+	html += '<div class="metric-section"><div class="metric-section-title">Timestamps</div>';
+	html += metricRow('Last Seen', metrics.lastSeenTimeMs);
+	html += metricRow('Last Connect', metrics.lastConnectTimeMs);
+	html += metricRow('Last Connect &amp; Test', metrics.lastConnectAndTestTimeMs);
+	html += metricRow('Last Data Received', metrics.lastDataReceivedTimeMs);
+	html += metricRow('Last Out of Sync', metrics.lastOutOfSyncTimeMs);
+	html += metricRow('Last Invalid Chain', metrics.lastInvalidChainDetectedTimeMs);
+	html += '</div>';
+	if (metrics.recentPingTimes && metrics.recentPingTimes.length) {
+		let avgPing = 0;
+		for (let i = 0; i < metrics.recentPingTimes.length; i++) avgPing += metrics.recentPingTimes[i].pingDurationMs;
+		avgPing = Math.round(avgPing / metrics.recentPingTimes.length);
+		const latest = metrics.recentPingTimes[metrics.recentPingTimes.length - 1];
+		html += '<div class="metric-section"><div class="metric-section-title">Ping</div>';
+		html += metricRow('Avg (n=' + metrics.recentPingTimes.length + ')', avgPing + 'ms');
+		html += metricRowPingLatest(latest.pingDurationMs, latest.pingTimestampMs);
+		html += '</div>';
+	}
+	const beforeCount = metrics.recentUnintentionalDisconnectBeforeConnectTimesMs ? metrics.recentUnintentionalDisconnectBeforeConnectTimesMs.length : 0;
+	const afterCount = metrics.recentUnintentionalDisconnectAfterConnectTimesMs ? metrics.recentUnintentionalDisconnectAfterConnectTimesMs.length : 0;
+	if (beforeCount || afterCount) {
+		html += '<div class="metric-section"><div class="metric-section-title">Disconnects</div>';
+		if (beforeCount) {
+			html += metricRow('Before connect (n=' + beforeCount + ')', metrics.recentUnintentionalDisconnectBeforeConnectTimesMs[beforeCount - 1]);
+		}
+		if (afterCount) {
+			html += metricRow('After connect (n=' + afterCount + ')', metrics.recentUnintentionalDisconnectAfterConnectTimesMs[afterCount - 1]);
+		}
+		html += '</div>';
+	}
+	return html;
+}
+
+function metricRow(label, ts) {
+	if (typeof ts === 'number') {
+		return '<div class="metric-row"><span class="metric-label">' + label + ':</span> <span class="metric-value" data-ms="' + ts + '">-</span></div>';
+	}
+	return '<div class="metric-row"><span class="metric-label">' + label + ':</span> <span class="metric-value">' + (ts != null ? ts : '-') + '</span></div>';
+}
+
+function metricRowPingLatest(pingDurationMs, pingTimestampMs) {
+	return '<div class="metric-row"><span class="metric-label">Latest:</span> <span class="metric-value">' + Math.round(pingDurationMs) + 'ms at <span class="metric-timeago" data-ms="' + pingTimestampMs + '">-</span></span></div>';
 }
 
 function updateStatus(peers) {
-	var badge = document.getElementById('status-badge');
-	var btnStart = document.getElementById('btn-start');
-	var btnStop = document.getElementById('btn-stop');
+	const badge = document.getElementById('status-badge');
+	const btnStart = document.getElementById('btn-start');
+	const btnStop = document.getElementById('btn-stop');
 	if (peers && peers.length > 0) {
 		badge.className = 'badge running';
 		badge.innerHTML = '<span class="dot"></span>Running';
@@ -355,7 +448,7 @@ function updateStatus(peers) {
 }
 
 function dispatchStatusUpdate() {
-	var badge = document.getElementById('status-badge');
+	const badge = document.getElementById('status-badge');
 	if (badge.classList.contains('running') && adminVerified) {
 		document.getElementById('btn-stop').disabled = false;
 		document.getElementById('btn-start').disabled = true;
@@ -363,7 +456,7 @@ function dispatchStatusUpdate() {
 }
 
 async function startClient() {
-	var btn = document.getElementById('btn-start');
+	const btn = document.getElementById('btn-start');
 	btn.disabled = true;
 	btn.textContent = 'Starting...';
 	try {
@@ -381,7 +474,7 @@ async function startClient() {
 }
 
 async function stopClient() {
-	var btn = document.getElementById('btn-stop');
+	const btn = document.getElementById('btn-stop');
 	btn.disabled = true;
 	btn.textContent = 'Stopping...';
 	try {
@@ -390,7 +483,7 @@ async function stopClient() {
 		clientStartedAt = null;
 		updateStartBtnTitle();
 		btn.textContent = '\u25A0 Stop Client';
-		var badge = document.getElementById('status-badge');
+		const badge = document.getElementById('status-badge');
 		badge.className = 'badge stopped';
 		badge.innerHTML = '<span class="dot"></span>Stopped';
 		document.getElementById('btn-start').disabled = false;
@@ -406,14 +499,14 @@ async function stopClient() {
 
 async function lookupHeader(event) {
 	event.preventDefault();
-	var input = document.getElementById('lookup-input').value.trim();
-	var resultsEl = document.getElementById('lookup-results');
-	var errorEl = document.getElementById('lookup-error');
+	const input = document.getElementById('lookup-input').value.trim();
+	const resultsEl = document.getElementById('lookup-results');
+	const errorEl = document.getElementById('lookup-error');
 	resultsEl.innerHTML = '';
 	errorEl.textContent = '';
 	if (!input) return;
 	try {
-		var header = await apiFetch('/header/' + encodeURIComponent(input));
+		const header = await apiFetch('/header/' + encodeURIComponent(input));
 		resultsEl.innerHTML =
 			'<div class="card-row"><span class="label">Height</span><span class="value">' + header.height + '</span></div>' +
 			'<div class="card-row"><span class="label">Hash</span><span class="value">' + header.hashHex + '</span></div>' +
@@ -431,7 +524,7 @@ async function lookupHeader(event) {
 
 async function refreshPeers() {
 	try {
-		var peers = await apiFetch('/peers/connected');
+		const peers = await apiFetch('/peers/connected');
 		renderPeers(peers);
 		updateStatus(peers);
 		lastPeersRefreshTime = Date.now();
@@ -440,7 +533,7 @@ async function refreshPeers() {
 }
 
 function updateRefreshPeersTitle() {
-	var btn = document.getElementById('btn-refresh-peers');
+	const btn = document.getElementById('btn-refresh-peers');
 	btn.title = 'Reload the list of connected peers and their ratings (last refreshed ' + timeAgo(lastPeersRefreshTime) + ')';
 }
 
@@ -452,7 +545,7 @@ function toggleAutoRefresh() {
 }
 
 function updateStartBtnTitle() {
-	var btn = document.getElementById('btn-start');
+	const btn = document.getElementById('btn-start');
 	if (clientStartedAt) {
 		btn.title = 'Connect to Bitcoin nodes and begin syncing block headers (running since ' + new Date(clientStartedAt).toLocaleString(undefined, { timeZoneName: 'short' }) + ')';
 	} else {
@@ -465,9 +558,9 @@ function formatTimestamp(unixTs) {
 }
 
 function updateStatusBadgeTitle() {
-	var badge = document.getElementById('status-badge');
+	const badge = document.getElementById('status-badge');
 	if (badge.classList.contains('running')) {
-		var dur = duration(clientStartedAt);
+		const dur = duration(clientStartedAt);
 		badge.title = 'Client is connected to nodes and syncing block headers' + (dur ? ' (running for ' + dur + ')' : '');
 	} else {
 		badge.title = 'Client is not connected to any nodes and is not syncing block headers';
@@ -475,9 +568,9 @@ function updateStatusBadgeTitle() {
 }
 
 function updateWsTitle() {
-	var badge = document.getElementById('ws-badge');
+	const badge = document.getElementById('ws-badge');
 	if (badge.classList.contains('ws-connected')) {
-		var lastMsg = lastWsMsgTime ? ' Last msg ' + timeAgo(lastWsMsgTime) + '.' : '';
+		const lastMsg = lastWsMsgTime ? ' Last msg ' + timeAgo(lastWsMsgTime) + '.' : '';
 		badge.title = 'WebSocket connected. Chain tip updates appear in real time.' + lastMsg;
 	} else {
 		badge.title = 'WebSocket disconnected. Reconnects every 5 seconds.';
@@ -488,6 +581,31 @@ document.getElementById('btn-refresh-peers').addEventListener('mouseenter', upda
 document.getElementById('btn-start').addEventListener('mouseenter', updateStartBtnTitle);
 document.getElementById('ws-badge').addEventListener('mouseenter', updateWsTitle);
 document.getElementById('status-badge').addEventListener('mouseenter', updateStatusBadgeTitle);
+
+let lastFocusRefreshTime = 0;
+function triggerFocusRefresh() {
+	const now = performance.now();
+	if (now - lastFocusRefreshTime > 1000) {
+		lastFocusRefreshTime = now;
+		if (autoRefreshEnabled) { refreshPeers(); }
+		else { refreshAllExpandedTimeAgo(); }
+	}
+}
+
+window.addEventListener('focus', triggerFocusRefresh);
+
+document.addEventListener('visibilitychange', function () {
+	if (document.visibilityState === 'visible') {
+		triggerFocusRefresh();
+	}
+});
+
+function refreshAllExpandedTimeAgo() {
+	const allDetails = document.querySelectorAll('.peer-details.expanded');
+	for (let i = 0; i < allDetails.length; i++) {
+		refreshTimeAgoInContainer(allDetails[i]);
+	}
+}
 
 initAdminUI();
 connectWs();

@@ -1198,6 +1198,17 @@ export class NodesDatabase {
 	}
 
 	/**
+	 * Gets a structured clone of the connection metrics for a node.
+	 * @param ipPort - The IP port of the node.
+	 * @returns A structured clone of the node's connection metrics, or undefined if the node is not found.
+	 */
+	getNodeConnectionMetricsCopy = (ipPort: IpPort): NodeConnectionMetrics | undefined => {
+		const ipPortString = ipPortToString(ipPort);
+		const metrics = this._ipPortStringToMetrics.get(ipPortString);
+		return metrics ? structuredClone(metrics) : undefined;
+	}
+
+	/**
 	 * Gets the total number of nodes in the database.
 	 * @returns The total number of nodes.
 	 */

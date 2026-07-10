@@ -4,6 +4,7 @@ import { BlockHeader } from './BlockHeader.js';
 import { LegacyNodeConnection } from './LegacyNodeConnection.js';
 import { NodeConnection } from './NodeConnection.js';
 import { NodesDatabase } from './NodesDatabase.js';
+import type { NodeConnectionMetrics } from './NodesDatabase.js';
 import { BlockHeadersDatabase } from './BlockHeadersDatabase.js';
 import { DATABASE_VERSION_FOLDER } from './constants.js';
 import { IpPort, ProgressCallback } from './types.js';
@@ -1331,5 +1332,31 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		});
 		const ipPorts = Array.from(ratingToNode.valuesReversed());
 		return ipPorts.map(ipPort => ({ ...ipPort, rating: this._nodesDatabase.getNodeRating(ipPort, timeMs)! }));
+	}
+
+	/**
+	 * Internal-only variant of getPeersInfoConnected that also returns per-node connection metrics.
+	 * Used by the API server (which is not part of the published library) to power the dashboard's
+	 * expandable peer rows. Accessed via `as any` casting so it is not part of the public library API.
+	 * @returns An array of connected node's IP, port, rating, and a snapshot of its connection metrics.
+	 */
+	private _getPeersInfoConnectedWithMetrics = (): {
+		ip: string;
+		port: number;
+		rating: number;
+		metrics: NodeConnectionMetrics;
+	}[] => {
+		const ratingToNode = new RedBlackMap<number, IpPort>(CompareNumbers);
+		const timeMs = Date.now();
+		this._nodeConnectionsConnected.forEach((nodeConnection) => {
+			const ipPort = nodeConnection.getIpPort();
+			ratingToNode.set(this._nodesDatabase.getNodeRating(ipPort, timeMs)!, ipPort);
+		});
+		const ipPorts = Array.from(ratingToNode.valuesReversed());
+		return ipPorts.map(ipPort => ({
+			...ipPort,
+			rating: this._nodesDatabase.getNodeRating(ipPort, timeMs)!,
+			metrics: this._nodesDatabase.getNodeConnectionMetricsCopy(ipPort)!,
+		}));
 	}
 }
