@@ -355,6 +355,26 @@ export class BlockHeadersDatabase {
 	getInvalidBlocksArray = (): string[] => Array.from(this._invalidBlocks);
 
 	/**
+	 * Gets the total number of headers stored across all branches (including the longest chain and competing forks).
+	 * @returns The number of headers in `_allHeaders`.
+	 */
+	getNumAllHeaders = (): number => this._allHeaders.size;
+
+	/**
+	 * Gets the number of competing chain tips (leaf hashes in the headers tree).
+	 * A value greater than 1 indicates a live reorg with multiple branches held in memory.
+	 * @returns The number of header-tree leaves.
+	 */
+	getNumCompetingTips = (): number => this._headersTreeLeafHashes.size;
+
+	/**
+	 * Gets the number of headers in the longest chain (the main chain).
+	 * Equal to the chain tip height plus one (for the genesis header).
+	 * @returns The number of headers in `_sortedHeaders`.
+	 */
+	getNumLongestChainHeaders = (): number => this._sortedHeaders.length;
+
+	/**
 	 * Gets the block locator hash buffers.
 	 * @returns An array of block locator hash buffers.
 	 */

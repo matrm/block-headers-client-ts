@@ -9,10 +9,19 @@ export const createPeerRoutes = (client: BlockHeadersClient) => {
 
 	router.get('/peers/connected', publicRateLimit, (req: Request, res: Response) => {
 		if (isAdmin(req) && req.headers[DASHBOARD_APIS_HEADER] === 'true') {
-			res.json((client as any)._getPeersInfoConnectedWithMetrics());
+			res.json((client as any)._getPeersInfoConnectedForDashboard());
 		} else {
 			res.json(client.getPeersInfoConnected());
 		}
+	});
+
+	// Dashboard-only summary of the discovered-node population.
+	router.get('/peers/summary', publicRateLimit, (req: Request, res: Response) => {
+		if (!isAdmin(req) || req.headers[DASHBOARD_APIS_HEADER] !== 'true') {
+			res.status(404).send();
+			return;
+		}
+		res.json((client as any)._getNodesSummaryForDashboard());
 	});
 
 	return router;

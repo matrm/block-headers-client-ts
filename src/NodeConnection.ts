@@ -30,4 +30,14 @@ export interface NodeConnection extends EventEmitter<NodeConnectionEvents> {
 	connected(): boolean;
 	onValidChain(options?: { signal?: AbortSignal; }): Promise<boolean>;
 	syncHeaders(options?: { signal?: AbortSignal; }): Promise<void>;
+	// Live-state readers used only by dashboard-internal monitoring paths.
+	getNumPendingPongs(): number;
+	isSyncingHeaders(): boolean;
+	getNumSyncHeadersQueued(): number;
+	getTipHashHex(): string;
+	wasConnected(): boolean;
+	isVerackSent(): boolean;
+	isPendingConnect(): boolean;
+	isPendingGetHeaders(): boolean;
+	isPendingGetAddr(): boolean;
 }

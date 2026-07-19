@@ -4,11 +4,11 @@ import { mkdir } from 'node:fs/promises';
 import { expect, test, describe, beforeEach, afterEach, vi } from 'vitest';
 import { removeDirectoryWithRetries, createDbWithRetries } from './testUtils';
 
-import { BlockHeadersClient } from '../src/BlockHeadersClient';
-import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase';
-import { NodesDatabase } from '../src/NodesDatabase';
-import { Chain, getInvalidBlocks } from '../src/chainProtocol';
-import { getRandomHexString, ipPortToString } from '../src/utils/util';
+import { BlockHeadersClient } from '../src/BlockHeadersClient.js';
+import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase.js';
+import { NodesDatabase } from '../src/NodesDatabase.js';
+import { Chain, getInvalidBlocks } from '../src/chainProtocol.js';
+import { getRandomHexString, ipPortToString } from '../src/utils/util.js';
 
 const chain: Chain = 'bsv';
 
@@ -88,40 +88,45 @@ describe('BlockHeadersClient queue recovery', () => {
 		});
 
 		test('stop() while _start() is failing completes cleanup without throw', async () => {
-			(client as any)._connectionMonitor.start = async () => { };
-			(client as any)._connectionMonitor[Symbol.asyncDispose] = async () => { };
-			(client as any)._launchNodeConnectionsHealthMonitor = () => { };
-			(client as any)._nodesDatabase.open = async () => { };
-			(client as any)._nodesDatabase[Symbol.asyncDispose] = async () => { };
-			(client as any)._blockHeadersDatabase.open = async () => { };
-			(client as any)._blockHeadersDatabase[Symbol.asyncDispose] = async () => { };
-			(client as any)._closeNodeConnections = () => { };
+			vi.useFakeTimers();
+			try {
+				(client as any)._connectionMonitor.start = async () => { };
+				(client as any)._connectionMonitor[Symbol.asyncDispose] = async () => { };
+				(client as any)._launchNodeConnectionsHealthMonitor = () => { };
+				(client as any)._nodesDatabase.open = async () => { };
+				(client as any)._nodesDatabase[Symbol.asyncDispose] = async () => { };
+				(client as any)._blockHeadersDatabase.open = async () => { };
+				(client as any)._blockHeadersDatabase[Symbol.asyncDispose] = async () => { };
+				(client as any)._closeNodeConnections = () => { };
 
-			let rejectConnect!: (err: Error) => void;
-			const connectBlocker = new Promise<void>((_res, rej) => { rejectConnect = rej; });
+				let rejectConnect!: (err: Error) => void;
+				const connectBlocker = new Promise<void>((_res, rej) => { rejectConnect = rej; });
 
-			let connectCalled = false;
-			(client as any)._connectToNodes = async () => {
-				connectCalled = true;
-				await connectBlocker;
-			};
+				let connectCalled = false;
+				(client as any)._connectToNodes = async () => {
+					connectCalled = true;
+					await connectBlocker;
+				};
 
-			const startPromise = (client as any)._start();
+				const startPromise = (client as any)._start();
 
-			// Wait for the IIFE to reach _connectToNodes.
-			while (!connectCalled) {
-				await new Promise(r => setTimeout(r, 0));
+				// Wait for the IIFE to reach _connectToNodes.
+				while (!connectCalled) {
+					await vi.advanceTimersByTimeAsync(0);
+				}
+				expect((client as any)._startQueue).not.toBeNull();
+
+				const stopPromise = client.stop();
+
+				rejectConnect(new Error('Simulated connect failure after abort'));
+
+				await startPromise.catch(() => { });
+				await stopPromise;
+
+				expect((client as any)._stopQueue).toBeNull();
+			} finally {
+				vi.useRealTimers();
 			}
-			expect((client as any)._startQueue).not.toBeNull();
-
-			const stopPromise = client.stop();
-
-			rejectConnect(new Error('Simulated connect failure after abort'));
-
-			await startPromise.catch(() => { });
-			await stopPromise;
-
-			expect((client as any)._stopQueue).toBeNull();
 		});
 
 		test('stop() succeeds after _start() already rejected and _startQueue was cleared', async () => {
@@ -143,6 +148,170 @@ describe('BlockHeadersClient queue recovery', () => {
 
 			await client.stop();
 			expect((client as any)._stopQueue).toBeNull();
+		});
+
+		test('stop() emits client_stop even when the stop body rejects', async () => {
+			(client as any)._connectionMonitor.start = async () => { };
+			(client as any)._connectionMonitor[Symbol.asyncDispose] = async () => { };
+			(client as any)._launchNodeConnectionsHealthMonitor = () => { };
+			(client as any)._nodesDatabase.open = async () => { };
+			(client as any)._nodesDatabase[Symbol.asyncDispose] = async () => {
+				throw new Error('Simulated database dispose failure');
+			};
+			(client as any)._blockHeadersDatabase.open = async () => { };
+			(client as any)._blockHeadersDatabase[Symbol.asyncDispose] = async () => { };
+			(client as any)._closeNodeConnections = () => { };
+
+			let stopCount = 0;
+			(client as any)._dashboardEmitter.on('client_stop', () => { stopCount++; });
+
+			await expect(client.stop()).rejects.toThrow('Simulated database dispose failure');
+			// The emit fires unconditionally (via .finally) so the dashboard still learns the
+			// client is mostly stopped despite a database error during dispose.
+			expect(stopCount).toBe(1);
+			expect((client as any)._stopQueue).toBeNull();
+		});
+
+		test('concurrent stop() calls share a single client_stop emit', async () => {
+			(client as any)._connectionMonitor.start = async () => { };
+			(client as any)._connectionMonitor[Symbol.asyncDispose] = async () => { };
+			(client as any)._launchNodeConnectionsHealthMonitor = () => { };
+			(client as any)._nodesDatabase.open = async () => { };
+			(client as any)._nodesDatabase[Symbol.asyncDispose] = async () => { };
+			(client as any)._blockHeadersDatabase.open = async () => { };
+			(client as any)._blockHeadersDatabase[Symbol.asyncDispose] = async () => { };
+			(client as any)._closeNodeConnections = () => { };
+
+			let releaseConnect!: () => void;
+			const blocker = new Promise<void>(res => { releaseConnect = res; });
+			(client as any)._connectToNodes = async () => { await blocker; };
+
+			let stopCount = 0;
+			(client as any)._dashboardEmitter.on('client_stop', () => { stopCount++; });
+
+			const stopPromise1 = client.stop();
+			const stopPromise2 = client.stop();
+
+			expect((client as any)._stopQueue).not.toBeNull();
+			releaseConnect();
+			await Promise.all([stopPromise1, stopPromise2]);
+
+			expect(stopCount).toBe(1);
+			expect((client as any)._stopQueue).toBeNull();
+		});
+
+		test('public start() emits client_start exactly once per concurrent batch', async () => {
+			(client as any)._connectionMonitor.start = async () => { };
+			(client as any)._launchNodeConnectionsHealthMonitor = () => { };
+			(client as any)._nodesDatabase.open = async () => { };
+			(client as any)._blockHeadersDatabase.open = async () => { };
+
+			let releaseConnect!: () => void;
+			const blocker = new Promise<void>(res => { releaseConnect = res; });
+			(client as any)._connectToNodes = async () => { await blocker; };
+
+			let startCount = 0;
+			(client as any)._dashboardEmitter.on('client_start', () => { startCount++; });
+
+			// Two concurrent public start() calls.
+			const startPromise1 = client.start();
+			const startPromise2 = client.start();
+			releaseConnect();
+			await Promise.all([startPromise1, startPromise2]);
+
+			expect(startCount).toBe(1);
+		});
+
+		test('public start() does NOT emit client_start when _start() rejects', async () => {
+			(client as any)._connectionMonitor.start = async () => { };
+			(client as any)._launchNodeConnectionsHealthMonitor = () => { };
+			(client as any)._nodesDatabase.open = async () => { };
+			(client as any)._blockHeadersDatabase.open = async () => { throw new Error('boom'); };
+
+			let startCount = 0;
+			(client as any)._dashboardEmitter.on('client_start', () => { startCount++; });
+
+			await expect(client.start()).rejects.toThrow('boom');
+
+			// The client did not actually start, so no dashboard event should fire.
+			expect(startCount).toBe(0);
+			// The queue is cleared by the .finally() in _start(), so a later start() can retry.
+			expect((client as any)._startQueue).toBeNull();
+		});
+
+		test('concurrent start() calls during an in-flight stop produce a single client_start emit', async () => {
+			(client as any)._connectionMonitor.start = async () => { };
+			(client as any)._launchNodeConnectionsHealthMonitor = () => { };
+			(client as any)._nodesDatabase.open = async () => { };
+			(client as any)._blockHeadersDatabase.open = async () => { };
+			(client as any)._connectToNodes = async () => { };
+
+			let releaseStop!: () => void;
+			const stopBlocker = new Promise<void>(res => { releaseStop = res; });
+			(client as any)._stopQueue = stopBlocker;
+
+			let startCount = 0;
+			(client as any)._dashboardEmitter.on('client_start', () => { startCount++; });
+
+			const startPromise1 = client.start();
+			const startPromise2 = client.start();
+
+			// Both start() calls are now awaiting _stopQueue. Release it.
+			releaseStop();
+
+			await Promise.all([startPromise1, startPromise2]);
+
+			// Only one start() built a new chain, so only one client_start should fire.
+			expect(startCount).toBe(1);
+			expect((client as any)._startQueue).toBeNull();
+		});
+	});
+
+	describe('_closeNodeConnections', () => {
+		test('emits peer_disconnected for connected peers, not for pending-only ones, and disposes all', () => {
+			const clientAny = client as any;
+			const disposed: string[] = [];
+			const makeConn = (ip: string, port: number) => {
+				const ipPort = { ip, port };
+				return {
+					getIpPort: () => ipPort,
+					getIpPortString: () => ipPortToString(ipPort),
+					[Symbol.dispose]: () => { disposed.push(ipPortToString(ipPort)); },
+				};
+			};
+			// Two connections that completed the handshake.
+			const connA = makeConn('1.1.1.1', 8333);
+			const connB = makeConn('2.2.2.2', 8333);
+			// One connection still in the handshake (in _nodeConnections but not _nodeConnectionsConnected).
+			const connPending = makeConn('3.3.3.3', 8333);
+			clientAny._nodeConnections.set('1.1.1.1:8333', connA);
+			clientAny._nodeConnections.set('2.2.2.2:8333', connB);
+			clientAny._nodeConnections.set('3.3.3.3:8333', connPending);
+			clientAny._nodeConnectionsConnected.set('1.1.1.1:8333', connA);
+			clientAny._nodeConnectionsConnected.set('2.2.2.2:8333', connB);
+
+			const emitted: string[] = [];
+			clientAny._dashboardEmitter.on('peer_disconnected', (ipPort: any) => emitted.push(ipPortToString(ipPort)));
+
+			clientAny._closeNodeConnections();
+
+			// peer_disconnected emitted for the connected peers only (alphabetical order is
+			// not guaranteed by Map iteration; sort for a stable comparison).
+			expect(emitted.sort()).toEqual([
+				JSON.stringify({ ip: '1.1.1.1', port: 8333 }),
+				JSON.stringify({ ip: '2.2.2.2', port: 8333 }),
+			]);
+
+			// All three connections were disposed, including the pending handshake.
+			expect(disposed.sort()).toEqual([
+				JSON.stringify({ ip: '1.1.1.1', port: 8333 }),
+				JSON.stringify({ ip: '2.2.2.2', port: 8333 }),
+				JSON.stringify({ ip: '3.3.3.3', port: 8333 }),
+			]);
+
+			// Both maps are cleared.
+			expect(clientAny._nodeConnections.size).toBe(0);
+			expect(clientAny._nodeConnectionsConnected.size).toBe(0);
 		});
 	});
 

@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 
 import { BlockHeadersClient } from '../../BlockHeadersClient.js';
 import { publicRateLimit } from '../middleware/rateLimiter.js';
+import { DASHBOARD_APIS_HEADER } from '../middleware/adminAuth.js';
 import { toBlockHeaderPresented } from '../presenters.js';
 
 export const createHeaderRoutes = (client: BlockHeadersClient) => {
@@ -35,6 +36,18 @@ export const createHeaderRoutes = (client: BlockHeadersClient) => {
 		}
 
 		res.status(400).send();
+	});
+
+	// Dashboard-only snapshot of the block-headers database state (branch counts, orphaned
+	// headers, invalid blocks, chain-tip extension progress). Gated by the x-dashboard-apis
+	// header only. Not admin-gated because this route is operational/diagnostic and contains no
+	// per-peer or sensitive data beyond what the already-public /header/tip exposes.
+	router.get('/headers/info', publicRateLimit, (req: Request, res: Response) => {
+		if (req.headers[DASHBOARD_APIS_HEADER] !== 'true') {
+			res.status(404).send();
+			return;
+		}
+		res.json((client as any)._getHeadersDatabaseInfoForDashboard());
 	});
 
 	return router;

@@ -1341,4 +1341,13 @@ export class NodesDatabase {
 		}
 		return rating < NodesDatabase._blacklistedRatingThreshold;
 	}
+
+	/**
+	 * Gets the static rating threshold below which a node is considered blacklisted.
+	 * Computed once at class-load time from synthetic borderline-test scenarios.
+	 * @returns The blacklist rating threshold.
+	 */
+	getBlacklistedRatingThreshold = (): number => {
+		return NodesDatabase._blacklistedRatingThreshold;
+	}
 }

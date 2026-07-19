@@ -1,616 +1,1626 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dashboard</title>
-<style>
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-:root {
-	--bg: #0f1117;
-	--surface: #1a1d27;
-	--surface-hover: #222533;
-	--border: #2a2d3a;
-	--text: #e1e4ed;
-	--text-muted: #8890a4;
-	--accent: #6c8cff;
-	--accent-hover: #8ba3ff;
-	--green: #4ade80;
-	--red: #f87171;
-	--yellow: #facc15;
-	--orange: #fb923c;
-	--radius: 8px;
-	--radius-sm: 5px;
-	--shadow: 0 1px 3px rgba(0,0,0,.3);
-}
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; line-height: 1.5; }
-.container { max-width: 1100px; margin: 0 auto; padding: 24px 20px; }
-header { position: relative; display: flex; justify-content: center; align-items: center; padding: 4px 0; margin-bottom: 12px; }
-header h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em; }
-.header-right { position: absolute; right: 0; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
-.badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 20px; font-size: .8rem; font-weight: 600; }
-.badge .dot { width: 8px; height: 8px; border-radius: 50%; }
-.badge.running, .badge.ws-connected { background: rgba(74,222,128,.12); color: var(--green); }
-.badge.running .dot, .badge.ws-connected .dot { background: var(--green); }
-.badge.stopped, .badge.ws-disconnected { background: rgba(248,113,113,.12); color: var(--red); }
-.badge.stopped .dot, .badge.ws-disconnected .dot { background: var(--red); }
-.controls { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }
-.btn { display: inline-flex; align-items: center; gap: 6px; padding: 10px 20px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font-size: .875rem; font-weight: 500; cursor: pointer; transition: all .15s; font-family: inherit; }
-.btn:hover { background: var(--surface-hover); border-color: #3a3e4f; }
-.btn:disabled { opacity: .4; cursor: not-allowed; }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-.btn.primary:hover:not(:disabled) { background: var(--accent-hover); }
-.btn.danger { background: transparent; border-color: var(--red); color: var(--red); }
-.btn.danger:hover:not(:disabled) { background: rgba(248,113,113,.1); }
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
-@media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow); }
-.card h2 { font-size: .95rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 16px; }
-.card-row { display: flex; justify-content: space-between; padding: 7px 0; font-size: .85rem; border-bottom: 1px solid rgba(255,255,255,.04); }
-.card-row:last-child { border-bottom: none; }
-.card-row .label { color: var(--text-muted); }
-.card-row .value { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: .8rem; word-break: break-all; text-align: right; max-width: 65%; }
-table { width: 100%; font-size: .85rem; border-collapse: collapse; }
-th { text-align: left; color: var(--text-muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
-td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,.04); font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: .8rem; }
-td:first-child, th:first-child { padding-left: 4px; padding-right: 4px; }
-.peer-rating { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-.peer-rating.high { background: var(--green); }
-.peer-rating.mid { background: var(--orange); }
-.peer-rating.low { background: var(--red); }
-.peer-row { cursor: pointer; transition: background .1s; }
-.peer-row:hover { background: var(--surface-hover); }
-.peer-row .expand-arrow { display: inline-block; width: 14px; font-size: .7rem; text-align: center; transition: transform .15s; }
-.peer-row.expanded .expand-arrow { transform: rotate(90deg); }
-.peer-details { display: none; background: rgba(0,0,0,.15); }
-.peer-details.expanded { display: table-row; }
-.peer-details td { padding: 4px 10px 8px 34px; font-family: inherit; font-size: .78rem; color: var(--text-muted); line-height: 1.6; }
-.peer-details .metric-label { color: var(--text-muted); }
-.peer-details .metric-value { color: var(--text); }
-.peer-details .metric-section { margin-bottom: 6px; }
-.peer-details .metric-section-title { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); margin-bottom: 2px; }
-.peer-details .metric-row { line-height: 1.6; }
-.lookup { margin-bottom: 24px; }
-.lookup form { display: flex; gap: 10px; }
-.lookup input { flex: 1; padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: .85rem; outline: none; transition: border-color .15s; }
-.lookup input:focus { border-color: var(--accent); }
-.lookup-results { margin-top: 16px; }
-.lookup-error { color: var(--red); font-size: .85rem; margin-top: 12px; }
-.toast { position: fixed; top: 18px; left: 50%; transform: translateX(-50%); padding: 12px 20px; border-radius: var(--radius-sm); font-size: .85rem; font-weight: 500; z-index: 999; animation: toastIn .25s ease; box-shadow: 0 4px 12px rgba(0,0,0,.4); }
-.toast.success { background: #14532d; color: #86efac; border: 1px solid #166534; }
-.toast.error { background: #7f1d1d; color: #fca5a5; border: 1px solid #991b1b; }
-@keyframes toastIn { from { opacity: 0; transform: translateX(-50%) translateY(-8px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
-.empty { color: var(--text-muted); font-size: .85rem; text-align: center; padding: 20px 0; }
-.auto-refresh-label { display: flex; align-items: center; gap: 5px; cursor: pointer; font-size: .8rem; color: var(--text-muted); user-select: none; }
-.auto-refresh-label input { accent-color: var(--accent); cursor: pointer; }
-.api-key-group { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 16px; }
-.api-key-input { padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: .8rem; outline: none; width: 180px; transition: border-color .15s; }
-.api-key-input:focus { border-color: var(--accent); }
-.api-key-input.invalid { border-color: var(--red); }
-.api-key-label { font-size: .8rem; color: var(--text-muted); }
-.admin-only { display: none; }
-.admin-only.visible { display: contents; }
-</style>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Dashboard</title>
+	<style>
+		*,
+		*::before,
+		*::after {
+			box-sizing: border-box;
+			margin: 0;
+			padding: 0;
+		}
+
+		:root {
+			--bg: #0f1117;
+			--surface: #1a1d27;
+			--surface-hover: #222533;
+			--border: #2a2d3a;
+			--text: #e1e4ed;
+			--text-muted: #8890a4;
+			--accent: #6c8cff;
+			--accent-hover: #8ba3ff;
+			--green: #4ade80;
+			--red: #f87171;
+			--yellow: #facc15;
+			--orange: #fb923c;
+			--radius: 8px;
+			--radius-sm: 5px;
+			--shadow: 0 1px 3px rgba(0, 0, 0, .3);
+		}
+
+		body {
+			font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+			background: var(--bg);
+			color: var(--text);
+			min-height: 100vh;
+			line-height: 1.5;
+		}
+
+		.container {
+			max-width: 1100px;
+			margin: 0 auto;
+			padding: 24px 20px;
+		}
+
+		header {
+			position: relative;
+			display: flex;
+			justify-content: center;
+			align-items: center;
+			padding: 4px 0;
+			margin-bottom: 12px;
+		}
+
+		header h1 {
+			font-size: 1.5rem;
+			font-weight: 700;
+			letter-spacing: -.02em;
+		}
+
+		.header-right {
+			position: absolute;
+			right: 0;
+			top: 50%;
+			transform: translateY(-50%);
+			display: flex;
+			flex-direction: column;
+			align-items: flex-end;
+			gap: 4px;
+		}
+
+		.badge {
+			display: inline-flex;
+			align-items: center;
+			gap: 6px;
+			padding: 5px 12px;
+			border-radius: 20px;
+			font-size: .8rem;
+			font-weight: 600;
+		}
+
+		.badge .dot {
+			width: 8px;
+			height: 8px;
+			border-radius: 50%;
+		}
+
+		.badge.running,
+		.badge.ws-connected {
+			background: rgba(74, 222, 128, .12);
+			color: var(--green);
+		}
+
+		.badge.running .dot,
+		.badge.ws-connected .dot {
+			background: var(--green);
+		}
+
+		.badge.stopped,
+		.badge.ws-disconnected {
+			background: rgba(248, 113, 113, .12);
+			color: var(--red);
+		}
+
+		.badge.stopped .dot,
+		.badge.ws-disconnected .dot {
+			background: var(--red);
+		}
+
+		.badge.unknown {
+			background: rgba(251, 146, 60, .12);
+			color: var(--orange);
+		}
+
+		.badge.unknown .dot {
+			background: var(--orange);
+		}
+
+		.controls {
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			gap: 10px;
+			flex-wrap: wrap;
+			margin-bottom: 24px;
+		}
+
+		.btn {
+			display: inline-flex;
+			align-items: center;
+			gap: 6px;
+			padding: 10px 20px;
+			border: 1px solid var(--border);
+			border-radius: var(--radius-sm);
+			background: var(--surface);
+			color: var(--text);
+			font-size: .875rem;
+			font-weight: 500;
+			cursor: pointer;
+			transition: all .15s;
+			font-family: inherit;
+		}
+
+		.btn:hover {
+			background: var(--surface-hover);
+			border-color: #3a3e4f;
+		}
+
+		.btn:disabled {
+			opacity: .4;
+			cursor: not-allowed;
+		}
+
+		.btn.primary {
+			background: var(--accent);
+			border-color: var(--accent);
+			color: #fff;
+		}
+
+		.btn.primary:hover:not(:disabled) {
+			background: var(--accent-hover);
+		}
+
+		.btn.danger {
+			background: transparent;
+			border-color: var(--red);
+			color: var(--red);
+		}
+
+		.btn.danger:hover:not(:disabled) {
+			background: rgba(248, 113, 113, .1);
+		}
+
+		.grid {
+			display: grid;
+			grid-template-columns: 1fr 1fr;
+			gap: 20px;
+			margin-bottom: 24px;
+		}
+
+		.grid-3 {
+			display: grid;
+			grid-template-columns: 1fr 1fr 1fr;
+			gap: 20px;
+			margin-bottom: 24px;
+		}
+
+		@media (max-width: 720px) {
+			.grid {
+				grid-template-columns: 1fr;
+			}
+
+			.grid-3 {
+				grid-template-columns: 1fr;
+			}
+		}
+
+		.card {
+			background: var(--surface);
+			border: 1px solid var(--border);
+			border-radius: var(--radius);
+			padding: 20px;
+			box-shadow: var(--shadow);
+		}
+
+		.card h2 {
+			font-size: .95rem;
+			font-weight: 600;
+			color: var(--text-muted);
+			text-transform: uppercase;
+			letter-spacing: .05em;
+			margin-bottom: 16px;
+		}
+
+		.card-row {
+			display: flex;
+			justify-content: space-between;
+			padding: 7px 0;
+			font-size: .85rem;
+			border-bottom: 1px solid rgba(255, 255, 255, .04);
+		}
+
+		.card-row:last-child {
+			border-bottom: none;
+		}
+
+		.card-row .label {
+			color: var(--text-muted);
+		}
+
+		.card-row .value {
+			font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+			font-size: .8rem;
+			word-break: break-all;
+			text-align: right;
+			max-width: 65%;
+		}
+
+		table {
+			width: 100%;
+			font-size: .85rem;
+			border-collapse: collapse;
+		}
+
+		th {
+			text-align: left;
+			color: var(--text-muted);
+			font-weight: 500;
+			padding: 8px 10px;
+			border-bottom: 1px solid var(--border);
+			font-size: .78rem;
+			text-transform: uppercase;
+			letter-spacing: .04em;
+		}
+
+		td {
+			padding: 8px 10px;
+			border-bottom: 1px solid rgba(255, 255, 255, .04);
+			font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+			font-size: .8rem;
+		}
+
+		td:first-child,
+		th:first-child {
+			padding-left: 4px;
+			padding-right: 4px;
+		}
+
+		.peer-rating {
+			display: inline-block;
+			width: 8px;
+			height: 8px;
+			border-radius: 50%;
+			margin-right: 6px;
+		}
+
+		.peer-rating.high {
+			background: var(--green);
+		}
+
+		.peer-rating.mid {
+			background: var(--orange);
+		}
+
+		.peer-rating.low {
+			background: var(--red);
+		}
+
+		.peer-row {
+			cursor: pointer;
+			transition: background .1s;
+		}
+
+		.peer-row:hover {
+			background: var(--surface-hover);
+		}
+
+		.peer-row .expand-arrow {
+			display: inline-block;
+			width: 14px;
+			font-size: .7rem;
+			text-align: center;
+			transition: transform .15s;
+		}
+
+		.peer-row.expanded .expand-arrow {
+			transform: rotate(90deg);
+		}
+
+		.peer-details {
+			display: none;
+			background: rgba(0, 0, 0, .15);
+		}
+
+		.peer-details.expanded {
+			display: table-row;
+		}
+
+		.peer-details td {
+			padding: 4px 10px 8px 34px;
+			font-family: inherit;
+			font-size: .78rem;
+			color: var(--text-muted);
+			line-height: 1.6;
+		}
+
+		.peer-details .metric-label {
+			color: var(--text-muted);
+		}
+
+		.peer-details .metric-value {
+			color: var(--text);
+		}
+
+		.peer-details .metric-section {
+			margin-bottom: 6px;
+		}
+
+		.peer-details .metric-section-title {
+			font-size: .72rem;
+			text-transform: uppercase;
+			letter-spacing: .04em;
+			color: var(--accent);
+			margin-bottom: 2px;
+		}
+
+		.peer-details .metric-row {
+			line-height: 1.6;
+		}
+
+		.invalid-blocks {
+			margin-top: 8px;
+			max-height: 120px;
+			overflow-y: auto;
+			border: 1px solid var(--border);
+			border-radius: var(--radius-sm);
+			padding: 6px 8px;
+			font-size: .72rem;
+			font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+			color: var(--text-muted);
+		}
+
+		.invalid-blocks div {
+			word-break: break-all;
+		}
+
+		.lookup {
+			margin-bottom: 24px;
+		}
+
+		.lookup form {
+			display: flex;
+			gap: 10px;
+		}
+
+		.lookup input {
+			flex: 1;
+			padding: 10px 14px;
+			border: 1px solid var(--border);
+			border-radius: var(--radius-sm);
+			background: var(--bg);
+			color: var(--text);
+			font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+			font-size: .85rem;
+			outline: none;
+			transition: border-color .15s;
+		}
+
+		.lookup input:focus {
+			border-color: var(--accent);
+		}
+
+		.lookup-results {
+			margin-top: 16px;
+		}
+
+		.lookup-error {
+			color: var(--red);
+			font-size: .85rem;
+			margin-top: 12px;
+		}
+
+		.toast {
+			position: fixed;
+			top: 18px;
+			left: 50%;
+			transform: translateX(-50%);
+			padding: 12px 20px;
+			border-radius: var(--radius-sm);
+			font-size: .85rem;
+			font-weight: 500;
+			z-index: 999;
+			animation: toastIn .25s ease;
+			box-shadow: 0 4px 12px rgba(0, 0, 0, .4);
+		}
+
+		.toast.success {
+			background: #14532d;
+			color: #86efac;
+			border: 1px solid #166534;
+		}
+
+		.toast.error {
+			background: #7f1d1d;
+			color: #fca5a5;
+			border: 1px solid #991b1b;
+		}
+
+		@keyframes toastIn {
+			from {
+				opacity: 0;
+				transform: translateX(-50%) translateY(-8px);
+			}
+
+			to {
+				opacity: 1;
+				transform: translateX(-50%) translateY(0);
+			}
+		}
+
+		.empty {
+			color: var(--text-muted);
+			font-size: .85rem;
+			text-align: center;
+			padding: 20px 0;
+		}
+
+		.api-key-group {
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			gap: 6px;
+			margin-top: 16px;
+		}
+
+		.api-key-input {
+			padding: 6px 10px;
+			border: 1px solid var(--border);
+			border-radius: var(--radius-sm);
+			background: var(--bg);
+			color: var(--text);
+			font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+			font-size: .8rem;
+			outline: none;
+			width: 180px;
+			transition: border-color .15s;
+		}
+
+		.api-key-input:focus {
+			border-color: var(--accent);
+		}
+
+		.api-key-input.invalid {
+			border-color: var(--red);
+		}
+
+		.api-key-label {
+			font-size: .8rem;
+			color: var(--text-muted);
+		}
+
+		.admin-only:not(.visible) {
+			display: none;
+		}
+
+		#admin-controls.visible {
+			display: contents;
+		}
+
+		.event-log {
+			margin-bottom: 24px;
+		}
+
+		.event-log-header {
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			margin-bottom: 16px;
+		}
+
+		.event-log-header h2 {
+			margin-bottom: 0;
+		}
+
+		.event-log-body {
+			max-height: 420px;
+			overflow-y: auto;
+			font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+			font-size: .78rem;
+			padding-right: 8px;
+		}
+
+		/* dark scrollbar */
+		.event-log-body::-webkit-scrollbar {
+			width: 6px;
+		}
+
+		.event-log-body::-webkit-scrollbar-track {
+			background: transparent;
+		}
+
+		.event-log-body::-webkit-scrollbar-thumb {
+			background: var(--border);
+			border-radius: 3px;
+		}
+
+		.event-log-body::-webkit-scrollbar-thumb:hover {
+			background: #3a3e4f;
+		}
+
+		.event-log-filters {
+			position: relative;
+		}
+
+		.event-log-filters .filter-btn {
+			display: inline-flex;
+			align-items: center;
+			gap: 4px;
+			padding: 3px 10px;
+			border: 1px solid var(--border);
+			border-radius: var(--radius-sm);
+			background: var(--surface);
+			color: var(--text-muted);
+			font-size: .72rem;
+			cursor: pointer;
+			font-family: inherit;
+		}
+
+		.event-log-filters .filter-btn:hover {
+			border-color: #3a3e4f;
+			color: var(--text);
+		}
+
+		.event-log-filters .filter-btn .count {
+			color: var(--accent);
+		}
+
+		.event-log-filters .filter-dropdown {
+			display: none;
+			position: absolute;
+			top: 100%;
+			right: 0;
+			margin-top: 4px;
+			padding: 8px 10px;
+			background: var(--surface);
+			border: 1px solid var(--border);
+			border-radius: var(--radius-sm);
+			box-shadow: var(--shadow);
+			width: max-content;
+			max-height: calc(100vh - 120px);
+			overflow-y: auto;
+			z-index: 10;
+		}
+
+		.event-log-filters .filter-dropdown.open {
+			display: block;
+		}
+
+		.event-log-filters .filter-dropdown label {
+			display: flex;
+			align-items: center;
+			gap: 4px;
+			padding: 2px 0;
+			font-size: .72rem;
+			color: var(--text-muted);
+			cursor: pointer;
+			white-space: nowrap;
+		}
+
+		.event-log-filters .filter-dropdown label input {
+			cursor: pointer;
+			accent-color: var(--accent);
+		}
+
+		.event-log-filters .filter-dropdown .filter-divider {
+			border: none;
+			border-top: 1px solid var(--border);
+			margin: 4px 0;
+		}
+
+		.event-log-filters .filter-dropdown .filter-group-label {
+			font-size: .66rem;
+			text-transform: uppercase;
+			letter-spacing: .04em;
+			color: var(--text-muted);
+			padding: 2px 0;
+		}
+
+		.event-log-body .card-row {
+			padding: 4px 0;
+		}
+
+		.event-log-body .card-row .label {
+			color: var(--text-muted);
+		}
+
+		.event-log-body .card-row .value {
+			font-size: .75rem;
+		}
+
+		.event-log-entry {
+			display: flex;
+			justify-content: space-between;
+			padding: 4px 0 4px 10px;
+			font-size: .78rem;
+			border-bottom: 1px solid rgba(255, 255, 255, .04);
+		}
+
+		.event-log-entry .event-text {
+			color: var(--text);
+			word-break: break-all;
+			flex: 1;
+			margin-right: 12px;
+		}
+
+		.event-log-entry .event-unix {
+			color: var(--text-muted);
+			white-space: nowrap;
+			font-size: .75rem;
+			margin-right: 8px;
+			font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+		}
+
+		.event-log-entry .event-time {
+			color: var(--text-muted);
+			white-space: nowrap;
+			font-size: .75rem;
+			user-select: none;
+			-webkit-user-select: none;
+		}
+
+		.event-log-entry.important {
+			border-left: 2px solid var(--accent);
+			padding-left: 8px;
+			background: rgba(108, 140, 255, .06);
+		}
+	</style>
 </head>
+
 <body>
-<div class="container">
-	<header>
-		<h1>Dashboard</h1>
-		<div class="header-right">
-			<div id="status-badge" class="badge stopped" title="Client is not connected to any nodes and is not syncing block headers"><span class="dot"></span>Stopped</div>
-			<div id="ws-badge" class="badge ws-disconnected" title="WebSocket disconnected. Reconnects every 5 seconds."><span class="dot"></span>Disconnected from client</div>
+	<div class="container">
+		<header>
+			<h1>Dashboard</h1>
+			<div class="header-right">
+				<div id="status-badge" class="badge stopped"><span class="dot"></span>Stopped</div>
+				<div id="ws-badge" class="badge ws-disconnected"
+					title="WebSocket disconnected. Reconnects every 5 seconds."><span class="dot"></span>Disconnected
+					from client</div>
+			</div>
+		</header>
+
+		<div class="controls">
+			<span class="admin-only" id="admin-controls">
+				<button id="btn-start" class="btn primary" onclick="startClient()"
+					title="Connect to Bitcoin nodes and begin syncing block headers">&#9654; Start Client</button>
+				<button id="btn-stop" class="btn danger" onclick="stopClient()" disabled
+					title="Disconnect from all nodes and stop syncing">&#9632; Stop Client</button>
+			</span>
 		</div>
-	</header>
 
-	<div class="controls">
-		<span class="admin-only" id="admin-controls">
-			<button id="btn-start" class="btn primary" onclick="startClient()" title="Connect to Bitcoin nodes and begin syncing block headers">&#9654; Start Client</button>
-			<button id="btn-stop" class="btn danger" onclick="stopClient()" disabled title="Disconnect from all nodes and stop syncing">&#9632; Stop Client</button>
-		</span>
-		<button id="btn-refresh-peers" class="btn" onclick="refreshPeers()" title="Reload the list of connected peers and their ratings">&#8635; Refresh Peers</button>
-		<label class="auto-refresh-label" title="Refresh the peers list when new WebSocket messages arrive">
-			<input type="checkbox" id="auto-refresh-checkbox" checked onchange="toggleAutoRefresh()"> Auto-refresh peers
-		</label>
-	</div>
-
-	<div class="grid">
-		<div class="card">
-			<h2>Chain Info</h2>
-			<div id="chain-info"><div class="empty">Waiting for data...</div></div>
+		<div class="grid">
+			<div class="card">
+				<h2>Chain Info</h2>
+				<div id="chain-info">
+					<div class="empty">Waiting for data...</div>
+				</div>
+			</div>
+			<div class="card">
+				<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+					<h2 style="margin-bottom:0;">Connected Peers <span id="peer-count"
+							style="font-weight:400;font-size:.75rem;color:var(--text-muted);"></span></h2>
+					<button class="btn" onclick="copyPeersData()" title="Copy peers JSON to clipboard"
+						style="padding:3px 10px;font-size:.72rem;">Copy</button>
+				</div>
+				<div id="peers-table">
+					<div class="empty">No connected peers</div>
+				</div>
+			</div>
 		</div>
-		<div class="card">
-			<h2>Connected Peers <span id="peer-count" style="font-weight:400;font-size:.75rem;color:var(--text-muted);"></span></h2>
-			<div id="peers-table"><div class="empty">No connected peers</div></div>
+
+		<div class="grid">
+			<div class="card">
+				<h2>Block Headers Database</h2>
+				<div id="headers-db-info">
+					<div class="empty">Waiting for data...</div>
+				</div>
+			</div>
+			<div class="card admin-only">
+				<h2>Node Database</h2>
+				<div id="nodes-summary">
+					<div class="empty" id="nodes-summary-empty">Waiting for admin data...</div>
+				</div>
+			</div>
+		</div>
+
+		<div class="grid admin-only">
+			<div class="card">
+				<h2>Memory Usage</h2>
+				<div id="memory-usage">
+					<div class="empty">Waiting for admin data...</div>
+				</div>
+			</div>
+		</div>
+
+		<div class="card lookup">
+			<h2>Lookup Header</h2>
+			<form onsubmit="lookupHeader(event)">
+				<input id="lookup-input" type="text" placeholder="Block hash (hex), block height (number), or 'tip'"
+					autocomplete="off">
+				<button type="submit" class="btn primary">Search</button>
+			</form>
+			<div id="lookup-results" class="lookup-results"></div>
+			<div id="lookup-error" class="lookup-error"></div>
+		</div>
+
+		<div class="card event-log">
+			<div class="event-log-header">
+				<h2>Event Log</h2>
+				<div class="event-log-filters" id="event-log-filters"></div>
+			</div>
+			<div id="event-log-body" class="event-log-body">
+				<div class="empty">Waiting for events...</div>
+			</div>
+		</div>
+
+		<div id="api-key-group" class="api-key-group">
+			<input id="api-key-input" class="api-key-input" type="password" placeholder="API key" autocomplete="off">
+			<span id="api-key-status" class="api-key-label"></span>
 		</div>
 	</div>
 
-	<div class="card lookup">
-		<h2>Lookup Header</h2>
-		<form onsubmit="lookupHeader(event)">
-			<input id="lookup-input" type="text" placeholder="Block hash (hex), block height (number), or 'tip'" autocomplete="off">
-			<button type="submit" class="btn primary">Search</button>
-		</form>
-		<div id="lookup-results" class="lookup-results"></div>
-		<div id="lookup-error" class="lookup-error"></div>
-	</div>
+	<script>
+		const BYPASS_ADMIN_AUTH = __BYPASS_ADMIN_AUTH__;
 
-	<div id="api-key-group" class="api-key-group">
-		<input id="api-key-input" class="api-key-input" type="password" placeholder="API key" autocomplete="off">
-		<span id="api-key-status" class="api-key-label"></span>
-	</div>
-</div>
+		let ws = null;
+		let wsReconnectTimer = null;
+		let wsGen = 0;
+		let lastWsMsgTime = null;
+		let clientStartedAt = null;
+		let adminVerified = BYPASS_ADMIN_AUTH;
+		let wsAdmin = BYPASS_ADMIN_AUTH;
+		let verifyDebounceTimer = null;
+		let _lastPeersData = null;
+		let _eventLog = [];
+		const EVENT_LOG_MAX = 50000;
+		const EVENT_LOG_DISPLAY_MAX = 50;
 
-<script>
-const BYPASS_ADMIN_AUTH = __BYPASS_ADMIN_AUTH__;
+		const EVENT_LOG_FILTERS = [
+			{ name: 'client_start', label: 'Client start' },
+			{ name: 'client_stop', label: 'Client stop' },
+			{ name: 'new_chain_tip', label: 'New chain tip' },
+			{ name: 'peer_connected', label: 'Peer connected' },
+			{ name: 'peer_disconnected', label: 'Peer disconnected' },
+			{ name: 'connection_monitor_offline_to_online', label: 'Internet: offline to online' },
+			{ name: 'connection_monitor_online_to_offline', label: 'Internet: online to offline' },
+		];
 
-let ws = null;
-let wsReconnectTimer = null;
-let lastWsMsgTime = null;
-let lastPeersRefreshTime = null;
-let clientStartedAt = null;
-let autoRefreshEnabled = true;
-let adminVerified = BYPASS_ADMIN_AUTH;
-let verifyDebounceTimer = null;
+		const ADMIN_EVENT_LOG_FILTERS = [
+			{ name: 'peer_reconnected', label: 'Peer reconnected' },
+			{ name: 'peer_unintentional_disconnect_after_connect', label: 'Peer unintentional disconnect after connect' },
+			{ name: 'peer_unintentional_disconnect_before_connect', label: 'Peer unintentional disconnect before connect' },
+			{ name: 'peer_out_of_sync', label: 'Peer out of sync' },
+			{ name: 'peer_invalid_blocks', label: 'Invalid blocks' },
+			{ name: 'peer_block_hashes_received', label: 'Block hash received', defaultChecked: false },
+			{ name: 'peer_addr_discovered', label: 'Addresses discovered', defaultChecked: false },
+			{ name: 'peer_pong_received', label: 'Pong received', defaultChecked: false },
+			{ name: 'connection_monitor_online_to_online', label: 'Internet: online (no change)' },
+			{ name: 'connection_monitor_offline_to_offline', label: 'Internet: offline (no change)' },
+			{ name: 'stuck_detection_purge', label: 'Stuck detection purge' },
+			{ name: 'stuck_detection_recovery', label: 'Stuck detection recovery' },
+		];
 
-function timeAgo(ms) {
-	if (!ms) return 'never';
-	const ago = Math.round((Date.now() - ms) / 1000);
-	if (ago < 60) return ago + 's ago';
-	if (ago < 3600) return Math.round(ago / 60) + 'm ago';
-	if (ago < 86400) return Math.round(ago / 3600) + 'h ago';
-	return Math.round(ago / 86400) + 'd ago';
-}
+		const CLIENT_STATUS_RUNNING = { className: 'running', text: 'Running', title: 'Client is connected to nodes and syncing block headers' };
+		const CLIENT_STATUS_STOPPED = { className: 'stopped', text: 'Stopped', title: 'Client is not connected to any nodes and is not syncing block headers' };
+		const CLIENT_STATUS_UNKNOWN = { className: 'unknown', text: 'Unknown', title: 'WebSocket disconnected; client state is unknown' };
 
-function duration(ms) {
-	if (!ms) return '';
-	const secs = Math.round((Date.now() - ms) / 1000);
-	if (secs < 60) return secs + 's';
-	if (secs < 3600) return Math.round(secs / 60) + 'm';
-	return Math.round(secs / 3600) + 'h';
-}
+		function formatEventForLog(name, data) {
+			if (name === 'new_chain_tip') return { text: 'New chain tip at height ' + data.height, important: false };
+			if (data && data.ip) {
+				const peer = data.ip + ':' + data.port;
+				let text = '';
+				if (name === 'peer_connected') text = 'Connected: ' + peer;
+				else if (name === 'peer_disconnected') text = 'Disconnected: ' + peer;
+				else if (name === 'peer_reconnected') text = 'Reconnected: ' + peer;
+				else if (name === 'peer_out_of_sync') text = 'Out of sync: ' + peer;
+				else if (name === 'peer_invalid_blocks') text = 'Invalid blocks reported by: ' + peer;
+				else if (name === 'peer_unintentional_disconnect_before_connect') text = 'Unintentional disconnect (before connect): ' + peer;
+				else if (name === 'peer_unintentional_disconnect_after_connect') text = 'Unintentional disconnect (after connect): ' + peer;
+				else if (name === 'peer_addr_discovered') text = (data.count != null ? data.count + ' addresses discovered from: ' + peer : 'Addresses discovered from: ' + peer);
+				else if (name === 'peer_block_hashes_received') text = 'Block hash received from: ' + peer;
+				else if (name === 'peer_pong_received') text = (data.durationMs != null ? 'Pong received from: ' + peer + ' (' + Math.round(data.durationMs) + 'ms)' : 'Pong received from: ' + peer);
+				return { text: text || name, important: false };
+			}
+			if (name === 'connection_monitor_online_to_online') return { text: 'Internet check: online (no change)', important: false };
+			if (name === 'connection_monitor_offline_to_offline') return { text: 'Internet check: offline (no change)', important: false };
+			if (name === 'connection_monitor_offline_to_online') return { text: 'Internet came back online', important: true };
+			if (name === 'connection_monitor_online_to_offline') return { text: 'Internet went offline', important: true };
+			if (name === 'stuck_detection_purge') return { text: 'Stuck peers purged', important: true };
+			if (name === 'stuck_detection_recovery') return { text: 'Stuck detection recovery', important: true };
+			if (name === 'client_start') return { text: 'Client started', important: true };
+			if (name === 'client_stop') return { text: 'Client stopped', important: true };
+			return { text: name, important: false };
+		}
 
-function getApiKey() {
-	return document.getElementById('api-key-input').value.trim();
-}
+		function addEventLogEntry(name, data) {
+			const formatted = formatEventForLog(name, data);
+			const timeMs = Date.now();
+			_eventLog.unshift({ name: name, text: formatted.text, important: formatted.important, timeMs: timeMs, timeUnix: (Math.floor(timeMs) / 1000).toFixed(3) });
+			if (_eventLog.length > EVENT_LOG_MAX) _eventLog.length = EVENT_LOG_MAX;
+		}
 
-function getApiHeaders() {
-	const headers = { 'Content-Type': 'application/json', 'x-dashboard-apis': 'true' };
-	const key = getApiKey();
-	if (key) headers['x-admin-api-key'] = key;
-	return headers;
-}
+		function renderEventLog() {
+			const el = document.getElementById('event-log-body');
+			const filters = getEventLogFilters();
+			let html = '';
+			let shown = 0;
+			for (let i = 0; i < _eventLog.length && shown < EVENT_LOG_DISPLAY_MAX; i++) {
+				const e = _eventLog[i];
+				if (filters[e.name] === false) continue;
+				html += '<div class="event-log-entry' + (e.important ? ' important' : '') + '"><span class="event-text"><span class="event-unix">' + e.timeUnix + '</span> ' + e.text + '</span><span class="event-time" data-ms="' + e.timeMs + '">-</span></div>';
+				shown++;
+			}
+			el.innerHTML = html || '<div class="empty">No matching events...</div>';
+			scheduleTimeAgoRefresh();
+		}
 
-async function apiFetch(url, options) {
-	options = options || {};
-	const res = await fetch(url, Object.assign({}, options, { headers: Object.assign(getApiHeaders(), options.headers || {}) }));
-	if (!res.ok) {
-		const text = await res.text();
-		let msg = res.statusText;
-		try { const j = JSON.parse(text); msg = j.error || msg; } catch (e) {}
-		throw new Error(msg);
-	}
-	if (res.status === 204) return null;
-	return res.json();
-}
+		function getEventLogFilters() {
+			const checkboxes = document.querySelectorAll('#event-log-filters input[type="checkbox"]');
+			const filters = {};
+			for (let i = 0; i < checkboxes.length; i++) {
+				filters[checkboxes[i].getAttribute('data-event')] = checkboxes[i].checked;
+			}
+			return filters;
+		}
 
-function initAdminUI() {
-	if (BYPASS_ADMIN_AUTH) {
-		document.getElementById('api-key-group').style.display = 'none';
-		showAdminControls();
-	} else {
-		document.getElementById('api-key-group').style.display = '';
-		document.getElementById('api-key-input').addEventListener('input', onApiKeyInput);
-	}
-}
+		function initEventLogFilters() {
+			const container = document.getElementById('event-log-filters');
+			const btn = document.createElement('button');
+			btn.className = 'filter-btn';
+			btn.textContent = 'Filter';
+			container.appendChild(btn);
 
-function onApiKeyInput() {
-	clearTimeout(verifyDebounceTimer);
-	const input = document.getElementById('api-key-input');
-	const statusEl = document.getElementById('api-key-status');
-	const key = input.value.trim();
+			const dropdown = document.createElement('div');
+			dropdown.className = 'filter-dropdown';
+			container.appendChild(dropdown);
 
-	if (!key) {
-		adminVerified = false;
-		hideAdminControls();
-		statusEl.textContent = '';
-		input.classList.remove('invalid');
-		return;
-	}
+			const buildCheckbox = function (filter) {
+				const label = document.createElement('label');
+				const input = document.createElement('input');
+				input.type = 'checkbox';
+				input.checked = filter.defaultChecked !== false;
+				input.setAttribute('data-event', filter.name);
+				input.onchange = function () { renderEventLog(); };
+				label.appendChild(input);
+				label.appendChild(document.createTextNode(filter.label));
+				return label;
+			};
 
-	verifyDebounceTimer = setTimeout(async function () {
-		try {
-			const headers = { 'x-admin-api-key': key };
-			const res = await fetch('/verify', { headers: headers });
-			if (res.ok) {
-				adminVerified = true;
+			const addGroupLabel = function (text) {
+				const span = document.createElement('span');
+				span.className = 'filter-group-label';
+				span.textContent = text;
+				dropdown.appendChild(span);
+			};
+
+			const addDivider = function () {
+				const div = document.createElement('div');
+				div.className = 'filter-divider';
+				dropdown.appendChild(div);
+			};
+
+			addGroupLabel('Non-admin');
+			for (let i = 0; i < EVENT_LOG_FILTERS.length; i++) {
+				dropdown.appendChild(buildCheckbox(EVENT_LOG_FILTERS[i]));
+			}
+			addDivider();
+			addGroupLabel('Admin');
+			for (let i = 0; i < ADMIN_EVENT_LOG_FILTERS.length; i++) {
+				dropdown.appendChild(buildCheckbox(ADMIN_EVENT_LOG_FILTERS[i]));
+			}
+
+			btn.onclick = function (e) {
+				e.stopPropagation();
+				dropdown.classList.toggle('open');
+				if (dropdown.classList.contains('open')) {
+					const rect = dropdown.getBoundingClientRect();
+					if (rect.bottom > window.innerHeight - 12) {
+						dropdown.style.top = 'auto';
+						dropdown.style.bottom = '100%';
+						dropdown.style.marginTop = '0';
+						dropdown.style.marginBottom = '4px';
+					}
+				} else {
+					dropdown.style.top = '';
+					dropdown.style.bottom = '';
+					dropdown.style.marginTop = '';
+					dropdown.style.marginBottom = '';
+				}
+			};
+
+			dropdown.addEventListener('click', function (e) {
+				e.stopPropagation();
+			});
+
+			document.addEventListener('click', function () {
+				dropdown.classList.remove('open');
+			});
+		}
+
+		function timeAgo(ms) {
+			if (!ms) return 'never';
+			const elapsed = Math.max(0, Date.now() - ms);
+			if (elapsed === 0) return '0s ago';
+			const ago = Math.floor(elapsed / 1000);
+			if (ago < 60) return ago + 's ago';
+			if (ago < 3600) return Math.floor(ago / 60) + 'm ago';
+			if (ago < 86400) return Math.floor(ago / 3600) + 'h ago';
+			return Math.floor(ago / 86400) + 'd ago';
+		}
+
+		function duration(ms) {
+			if (!ms) return '';
+			const secs = Math.round((Date.now() - ms) / 1000);
+			if (secs < 60) return secs + 's';
+			if (secs < 3600) return Math.round(secs / 60) + 'm';
+			return Math.round(secs / 3600) + 'h';
+		}
+
+		function getApiKey() {
+			return document.getElementById('api-key-input').value.trim();
+		}
+
+		function getApiHeaders() {
+			const headers = { 'Content-Type': 'application/json', 'x-dashboard-apis': 'true' };
+			const key = getApiKey();
+			if (key) headers['x-admin-api-key'] = key;
+			return headers;
+		}
+
+		async function apiFetch(url, options) {
+			options = options || {};
+			const res = await fetch(url, Object.assign({}, options, { headers: Object.assign(getApiHeaders(), options.headers || {}) }));
+			if (!res.ok) {
+				const text = await res.text();
+				let msg = res.statusText;
+				try { const j = JSON.parse(text); msg = j.error || msg; } catch (e) { }
+				throw new Error(msg);
+			}
+			if (res.status === 204) return null;
+			return res.json();
+		}
+
+		// Like apiFetch but returns null on 4xx so Promise.all doesn't all-reject when some endpoints
+		// are admin-only and the dashboard is not currently admin-verified.
+		async function apiFetchOptional(url, options) {
+			options = options || {};
+			const res = await fetch(url, Object.assign({}, options, { headers: Object.assign(getApiHeaders(), options.headers || {}) }));
+			if (!res.ok) {
+				if (res.status >= 400 && res.status < 500) return null;
+				const text = await res.text();
+				let msg = res.statusText;
+				try { const j = JSON.parse(text); msg = j.error || msg; } catch (e) { }
+				throw new Error(msg);
+			}
+			if (res.status === 204) return null;
+			return res.json();
+		}
+
+		function initAdminUI() {
+			if (BYPASS_ADMIN_AUTH) {
+				document.getElementById('api-key-group').style.display = 'none';
 				showAdminControls();
-				if (autoRefreshEnabled) { refreshPeers(); }
-				statusEl.textContent = 'admin';
-				statusEl.style.color = 'var(--green)';
-				input.classList.remove('invalid');
 			} else {
+				document.getElementById('api-key-group').style.display = '';
+				document.getElementById('api-key-input').addEventListener('input', onApiKeyInput);
+			}
+		}
+
+		function onApiKeyInput() {
+			clearTimeout(verifyDebounceTimer);
+			const input = document.getElementById('api-key-input');
+			const statusEl = document.getElementById('api-key-status');
+			const key = input.value.trim();
+
+			if (!key) {
 				adminVerified = false;
 				hideAdminControls();
-				statusEl.textContent = 'invalid';
-				statusEl.style.color = 'var(--red)';
-				input.classList.add('invalid');
+				statusEl.textContent = '';
+				input.classList.remove('invalid');
+				return;
 			}
-		} catch (e) {
-			adminVerified = false;
-			hideAdminControls();
-			statusEl.textContent = 'error';
-			statusEl.style.color = 'var(--red)';
-			input.classList.add('invalid');
+
+			verifyDebounceTimer = setTimeout(async function () {
+				try {
+					const res = await fetch('/verify', { headers: getApiHeaders() });
+					if (res.ok) {
+						adminVerified = true;
+						showAdminControls();
+						refresh();
+						connectWs();
+						statusEl.textContent = 'admin';
+						statusEl.style.color = 'var(--green)';
+						input.classList.remove('invalid');
+					} else {
+						adminVerified = false;
+						hideAdminControls();
+						statusEl.textContent = 'invalid';
+						statusEl.style.color = 'var(--red)';
+						input.classList.add('invalid');
+					}
+				} catch (e) {
+					adminVerified = false;
+					hideAdminControls();
+					statusEl.textContent = 'error';
+					statusEl.style.color = 'var(--red)';
+					input.classList.add('invalid');
+				}
+			}, 300);
 		}
-	}, 300);
-}
 
-function showAdminControls() {
-	document.getElementById('admin-controls').classList.add('visible');
-}
+		function showAdminControls() {
+			document.getElementById('admin-controls').classList.add('visible');
+			forEachAdminOnly(function (el) { el.classList.add('visible'); });
+		}
 
-function hideAdminControls() {
-	document.getElementById('admin-controls').classList.remove('visible');
-}
+		function hideAdminControls() {
+			document.getElementById('admin-controls').classList.remove('visible');
+			forEachAdminOnly(function (el) { el.classList.remove('visible'); });
+		}
 
-function connectWs() {
-	if (ws) { ws.close(); ws = null; }
-	const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-	ws = new WebSocket(proto + '//' + location.host);
+		function forEachAdminOnly(fn) {
+			const els = document.querySelectorAll('.admin-only');
+			for (let i = 0; i < els.length; i++) { fn(els[i]); }
+		}
 
-	ws.onopen = function () {
-		const badge = document.getElementById('ws-badge');
-		badge.className = 'badge ws-connected';
-		badge.innerHTML = '<span class="dot"></span>Connected to client';
-		ws.send(JSON.stringify({ type: 'subscribe', channel: 'new_chain_tip' }));
-		if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
-		if (autoRefreshEnabled) { refreshPeers(); }
-	};
+		async function connectWs() {
+			wsGen++;
+			const myGen = wsGen;
+			wsAdmin = BYPASS_ADMIN_AUTH;
+			if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+			if (ws) { ws.close(); ws = null; }
+			const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+			// Only the dashboard subscriber flag travels in the WS upgrade URL: it is a
+			// public hint and is safe for reverse-proxy access logs. The long-lived
+			// admin API key is intentionally NOT placed in the URL (URL query strings
+			// are routinely logged by reverse proxies and would leak the secret).
+			// Instead, the admin key (when configured and BYPASS_ADMIN_AUTH is false)
+			// travels inside the encrypted `subscribe` WS message payload from onopen.
+			// BYPASS_ADMIN_AUTH=true skips admin-key verification entirely; the WS
+			// server grants admin status unconditionally in that mode.
+			const params = new URLSearchParams({ dashboard: 'true' });
+			ws = new WebSocket(proto + '//' + location.host + '?' + params.toString());
 
-	ws.onclose = function () {
-		const badge = document.getElementById('ws-badge');
-		badge.className = 'badge ws-disconnected';
-		badge.innerHTML = '<span class="dot"></span>Reconnecting to client...';
-		wsReconnectTimer = setTimeout(connectWs, 5000);
-	};
+			ws.onopen = function () {
+				// Optimistic badge: the dashboard subscribe suback will refine it.
+				const badge = document.getElementById('ws-badge');
+				badge.className = 'badge ws-connected';
+				badge.innerHTML = '<span class="dot"></span>Connected to client';
+				badge.title = 'WebSocket connected. Chain tip updates appear in real time.';
+				ws.send(JSON.stringify({ type: 'subscribe', channel: 'new_chain_tip', requestId: 'sub-nct' }));
+				// The dashboard channel subscribe carries the admin API key (or omits
+				// it when no key is configured). The server's suback reports whether
+				// the connection was elevated to admin status.
+				const dashKey = (!BYPASS_ADMIN_AUTH && getApiKey()) ? getApiKey() : undefined;
+				ws.send(JSON.stringify({ type: 'subscribe', channel: 'dashboard', adminApiKey: dashKey, requestId: 'sub-dash' }));
+				if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+				refresh();
+			};
 
-	ws.onmessage = function (event) {
-		try {
-			const msg = JSON.parse(event.data);
-			if (msg.type === 'new_chain_tip' && msg.data) {
+			ws.onclose = function () {
+				if (myGen !== wsGen) return;
+				wsAdmin = BYPASS_ADMIN_AUTH;
+				const wsBadge = document.getElementById('ws-badge');
+				wsBadge.className = 'badge ws-disconnected';
+				wsBadge.innerHTML = '<span class="dot"></span>Reconnecting to client...';
+				wsBadge.title = 'WebSocket disconnected; reconnecting.';
+				setStatusBadge(CLIENT_STATUS_UNKNOWN);
+				wsReconnectTimer = setTimeout(connectWs, 5000);
+			};
+
+			ws.onmessage = function (event) {
+				let msg = null;
+				try { msg = JSON.parse(event.data); } catch (e) { return; }
 				lastWsMsgTime = Date.now();
+
+				if (msg.type === 'suback' && msg.requestId === 'sub-dash') {
+					// The server reports admin elevation (or rejection) for the
+					// dashboard subscription. Update wsAdmin and the badge so the
+					// user knows whether admin-only events will be received.
+					if (msg.success === false) {
+						wsAdmin = false;
+						const badge = document.getElementById('ws-badge');
+						badge.className = 'badge ws-connected';
+						badge.innerHTML = '<span class="dot"></span>Connected to client';
+						badge.title = msg.error || 'Dashboard subscription rejected; admin-only events are not received.';
+						showToast(msg.error || 'Dashboard subscription rejected', 'error');
+					} else if (msg.admin === true) {
+						wsAdmin = true;
+						const badge = document.getElementById('ws-badge');
+						badge.className = 'badge ws-connected';
+						badge.innerHTML = '<span class="dot"></span>Connected to client (Admin)';
+						badge.title = 'WebSocket connected. Chain tip updates appear in real time.';
+					} else {
+						wsAdmin = false;
+						const badge = document.getElementById('ws-badge');
+						badge.className = 'badge ws-connected';
+						badge.innerHTML = '<span class="dot"></span>Connected to client';
+						badge.title = 'WebSocket connected. Chain tip updates appear in real time.';
+					}
+					return;
+				}
+				// Drop other subacks (e.g. sub-nct); they are protocol-level
+				// confirmations and not user-visible events.
+
+			if (msg.type === 'new_chain_tip' && msg.data) {
+				addEventLogEntry('new_chain_tip', msg.data);
 				renderChainInfo(msg.data);
-				const badge = document.getElementById('status-badge');
-				badge.className = 'badge running';
-				badge.innerHTML = '<span class="dot"></span>Running';
+				setStatusBadge(CLIENT_STATUS_RUNNING);
 				dispatchStatusUpdate();
+				renderEventLog();
+				fetchMemoryUsage();
+				refreshPeers();
+				fetchHeadersDbInfo();
+				return;
 			}
-		} catch (e) {}
 
-		// Eventually a peers specific websocket message may be implemented. For now
-		// we just refresh the peers list on any message if auto-refresh is enabled.
-		if (autoRefreshEnabled) { refreshPeers(); }
-	};
-}
-
-function showToast(message, type) {
-	const toast = document.createElement('div');
-	toast.className = 'toast ' + type;
-	toast.textContent = message;
-	document.body.appendChild(toast);
-	setTimeout(function () { toast.remove(); }, 3000);
-}
-
-async function refresh() {
-	try {
-		const results = await Promise.all([
-			apiFetch('/header/tip'),
-			apiFetch('/peers/connected')
-		]);
-		renderChainInfo(results[0]);
-		renderPeers(results[1]);
-		updateStatus(results[1]);
-	} catch (err) {
-		showToast('Refresh failed: ' + err.message, 'error');
-	}
-}
-
-function renderChainInfo(tip) {
-	const el = document.getElementById('chain-info');
-	if (!tip) { el.innerHTML = '<div class="empty">No data</div>'; return; }
-	el.innerHTML =
-		'<div class="card-row"><span class="label">Height</span><span class="value">' + tip.height + '</span></div>' +
-		'<div class="card-row"><span class="label">Hash</span><span class="value">' + tip.hashHex + '</span></div>' +
-		'<div class="card-row"><span class="label">Previous Hash</span><span class="value">' + tip.prevHashHex + '</span></div>' +
-		'<div class="card-row"><span class="label">Merkle Root</span><span class="value">' + tip.merkleRootHex + '</span></div>' +
-		'<div class="card-row"><span class="label">Timestamp</span><span class="value">' + formatTimestamp(tip.timestamp) + '</span></div>' +
-		'<div class="card-row"><span class="label">Bits</span><span class="value">' + tip.bitsHex + '</span></div>' +
-		'<div class="card-row"><span class="label">Nonce</span><span class="value">' + tip.nonce + '</span></div>' +
-		'<div class="card-row"><span class="label">Work</span><span class="value">' + tip.workHex + '</span></div>' +
-		'<div class="card-row"><span class="label">Work Total</span><span class="value">' + tip.workTotalHex + '</span></div>';
-}
-
-function renderPeers(peers) {
-	const el = document.getElementById('peers-table');
-	const countEl = document.getElementById('peer-count');
-	if (!peers || !peers.length) {
-		el.innerHTML = '<div class="empty">No connected peers</div>';
-		countEl.textContent = '';
-		return;
-	}
-	countEl.textContent = '(' + peers.length + ')';
-	const stored = el.querySelector('table') ? getExpandedPeers(el) : {};
-	let html = '<table><thead><tr><th></th><th>IP</th><th>Port</th><th>Rating</th></tr></thead><tbody>';
-	for (let i = 0; i < peers.length; i++) {
-		const p = peers[i];
-		const ratingClass = p.rating >= 0.7 ? 'high' : p.rating >= 0.3 ? 'mid' : 'low';
-		const rowId = p.ip + ':' + p.port;
-		const expanded = stored[rowId] || false;
-		const hasMetrics = !!p.metrics;
-		html += '<tr class="peer-row' + (expanded && hasMetrics ? ' expanded' : '') + '" ' + (hasMetrics ? 'onclick="togglePeerRow(this)"' : '') + ' data-row-id="' + rowId + '"><td><span class="expand-arrow">' + (hasMetrics ? '&#9656;' : '&#8203;') + '</span></td><td>' + p.ip + '</td><td>' + p.port + '</td><td><span class="peer-rating ' + ratingClass + '"></span>' + (p.rating != null ? p.rating.toFixed(3) : '-') + '</td></tr>';
-		if (hasMetrics) {
-			html += '<tr class="peer-details' + (expanded ? ' expanded' : '') + '" data-row-id="' + rowId + '"><td colspan="4">' + renderPeerMetrics(p.metrics) + '</td></tr>';
+				if (msg.type === 'dashboard:event' && Array.isArray(msg.events)) {
+					for (let i = 0; i < msg.events.length; i++) {
+						addEventLogEntry(msg.events[i].name, msg.events[i].data);
+					}
+					renderEventLog();
+					handleDashboardEvents(msg.events);
+					return;
+				}
+			};
 		}
-	}
-	html += '</tbody></table>';
-	el.innerHTML = html;
-	refreshTimeAgoInContainer(el);
-}
 
-function getExpandedPeers(el) {
-	const result = {};
-	const rows = el.querySelectorAll('.peer-row.expanded');
-	for (let i = 0; i < rows.length; i++) {
-		result[rows[i].getAttribute('data-row-id')] = true;
-	}
-	return result;
-}
+		// Maps dashboard events to the HTTP re-fetches they should trigger.
+		// Events are objects { name: string, data?: any }.
+		function handleDashboardEvents(events) {
+			if (!events || !events.length) return;
 
-function togglePeerRow(row) {
-	const id = row.getAttribute('data-row-id');
-	const details = document.querySelector('.peer-details[data-row-id="' + id + '"]');
-	const expanded = row.classList.toggle('expanded');
-	if (details) details.classList.toggle('expanded', expanded);
-	refreshAllExpandedTimeAgo();
-}
+			// Update per-peer live-state fields and status badge directly in the DOM (no HTTP round-trip).
+			for (let i = 0; i < events.length; i++) {
+				const ev = events[i];
+				if (ev.name === 'peer_block_hashes_received' && ev.data) {
+					updatePeerField(ev.data.ip, ev.data.port, 'tipHash', ev.data.hashHex);
+				}
+				if (ev.name === 'client_start') {
+					setStatusBadge(CLIENT_STATUS_RUNNING);
+					dispatchStatusUpdate();
+					fetchMemoryUsage();
+				}
+				if (ev.name === 'client_stop') {
+					setStatusBadge(CLIENT_STATUS_STOPPED);
+					dispatchStatusUpdate();
+					fetchMemoryUsage();
+				}
+			}
 
-function refreshTimeAgoInContainer(container) {
-	const spans = container.querySelectorAll('[data-ms]');
-	for (let i = 0; i < spans.length; i++) {
-		spans[i].textContent = timeAgo(parseInt(spans[i].getAttribute('data-ms')));
-	}
-}
-
-function renderPeerMetrics(metrics) {
-	if (!metrics) return '<span class="metric-label">No metrics available</span>';
-	let html = '';
-	html += '<div class="metric-section"><div class="metric-section-title">Timestamps</div>';
-	html += metricRow('Last Seen', metrics.lastSeenTimeMs);
-	html += metricRow('Last Connect', metrics.lastConnectTimeMs);
-	html += metricRow('Last Connect &amp; Test', metrics.lastConnectAndTestTimeMs);
-	html += metricRow('Last Data Received', metrics.lastDataReceivedTimeMs);
-	html += metricRow('Last Out of Sync', metrics.lastOutOfSyncTimeMs);
-	html += metricRow('Last Invalid Chain', metrics.lastInvalidChainDetectedTimeMs);
-	html += '</div>';
-	if (metrics.recentPingTimes && metrics.recentPingTimes.length) {
-		let avgPing = 0;
-		for (let i = 0; i < metrics.recentPingTimes.length; i++) avgPing += metrics.recentPingTimes[i].pingDurationMs;
-		avgPing = Math.round(avgPing / metrics.recentPingTimes.length);
-		const latest = metrics.recentPingTimes[metrics.recentPingTimes.length - 1];
-		html += '<div class="metric-section"><div class="metric-section-title">Ping</div>';
-		html += metricRow('Avg (n=' + metrics.recentPingTimes.length + ')', avgPing + 'ms');
-		html += metricRowPingLatest(latest.pingDurationMs, latest.pingTimestampMs);
-		html += '</div>';
-	}
-	const beforeCount = metrics.recentUnintentionalDisconnectBeforeConnectTimesMs ? metrics.recentUnintentionalDisconnectBeforeConnectTimesMs.length : 0;
-	const afterCount = metrics.recentUnintentionalDisconnectAfterConnectTimesMs ? metrics.recentUnintentionalDisconnectAfterConnectTimesMs.length : 0;
-	if (beforeCount || afterCount) {
-		html += '<div class="metric-section"><div class="metric-section-title">Disconnects</div>';
-		if (beforeCount) {
-			html += metricRow('Before connect (n=' + beforeCount + ')', metrics.recentUnintentionalDisconnectBeforeConnectTimesMs[beforeCount - 1]);
+			const fetchPeers = events.some(e =>
+				// Only re-fetch on connection membership changes. If admin-only
+				// events (such as peer_pong_received) are included, they would cause
+				// displayed node ratings to diverge between admin and non-admin dashboards
+				// and generate excessive HTTP requests. The trade-off is that displayed
+				// ratings are sometimes slightly out of date.
+				e.name === 'peer_connected' || e.name === 'peer_disconnected'
+			);
+			const fetchNodesSummary = events.some(e =>
+				e.name === 'peer_addr_discovered' || e.name === 'stuck_detection_purge' || e.name === 'stuck_detection_recovery'
+			);
+			if (fetchPeers) { refreshPeers(); }
+			if (fetchNodesSummary) { fetchNodesSummaryCard(); }
 		}
-		if (afterCount) {
-			html += metricRow('After connect (n=' + afterCount + ')', metrics.recentUnintentionalDisconnectAfterConnectTimesMs[afterCount - 1]);
+
+		// peer_data_received emit is commented out; kept for reference.
+		// Update a specific peer detail field in the DOM (no HTTP round-trip).
+		function updatePeerField(ip, port, field, value) {
+			const rowId = ip + ':' + port;
+			const details = document.querySelector('.peer-details[data-row-id="' + rowId + '"]');
+			if (!details) return;
+			const span = details.querySelector('[data-field="' + field + '"]');
+			if (span) span.textContent = value || '-';
 		}
-		html += '</div>';
-	}
-	return html;
-}
 
-function metricRow(label, ts) {
-	if (typeof ts === 'number') {
-		return '<div class="metric-row"><span class="metric-label">' + label + ':</span> <span class="metric-value" data-ms="' + ts + '">-</span></div>';
-	}
-	return '<div class="metric-row"><span class="metric-label">' + label + ':</span> <span class="metric-value">' + (ts != null ? ts : '-') + '</span></div>';
-}
-
-function metricRowPingLatest(pingDurationMs, pingTimestampMs) {
-	return '<div class="metric-row"><span class="metric-label">Latest:</span> <span class="metric-value">' + Math.round(pingDurationMs) + 'ms at <span class="metric-timeago" data-ms="' + pingTimestampMs + '">-</span></span></div>';
-}
-
-function updateStatus(peers) {
-	const badge = document.getElementById('status-badge');
-	const btnStart = document.getElementById('btn-start');
-	const btnStop = document.getElementById('btn-stop');
-	if (peers && peers.length > 0) {
-		badge.className = 'badge running';
-		badge.innerHTML = '<span class="dot"></span>Running';
-		if (adminVerified) {
-			btnStart.disabled = true;
-			btnStop.disabled = false;
+		async function fetchHeadersDbInfo() {
+			try {
+				const info = await apiFetchOptional('/headers/info');
+				renderHeadersDbInfo(info);
+			} catch (e) { }
 		}
-	} else {
-		badge.className = 'badge stopped';
-		badge.innerHTML = '<span class="dot"></span>Stopped';
-		btnStart.disabled = false;
-		btnStop.disabled = true;
-	}
-}
 
-function dispatchStatusUpdate() {
-	const badge = document.getElementById('status-badge');
-	if (badge.classList.contains('running') && adminVerified) {
-		document.getElementById('btn-stop').disabled = false;
-		document.getElementById('btn-start').disabled = true;
-	}
-}
+		async function fetchNodesSummaryCard() {
+			try {
+				const summary = await apiFetchOptional('/peers/summary');
+				renderNodesSummary(summary);
+			} catch (e) { }
+		}
 
-async function startClient() {
-	const btn = document.getElementById('btn-start');
-	btn.disabled = true;
-	btn.textContent = 'Starting...';
-	try {
-		await apiFetch('/admin/start');
-		clientStartedAt = Date.now();
-		updateStartBtnTitle();
-		showToast('Client started', 'success');
-		btn.textContent = '\u25B6 Start Client';
-		refreshPeers();
-	} catch (err) {
-		showToast('Start failed: ' + err.message, 'error');
-		btn.disabled = false;
-		btn.textContent = '\u25B6 Start Client';
-	}
-}
+		async function fetchMemoryUsage() {
+			try {
+				const data = await apiFetchOptional('/admin/memory');
+				renderMemoryUsage(data);
+			} catch (e) { }
+		}
 
-async function stopClient() {
-	const btn = document.getElementById('btn-stop');
-	btn.disabled = true;
-	btn.textContent = 'Stopping...';
-	try {
-		await apiFetch('/admin/stop');
-		showToast('Client stopped', 'success');
-		clientStartedAt = null;
-		updateStartBtnTitle();
-		btn.textContent = '\u25A0 Stop Client';
-		const badge = document.getElementById('status-badge');
-		badge.className = 'badge stopped';
-		badge.innerHTML = '<span class="dot"></span>Stopped';
-		document.getElementById('btn-start').disabled = false;
-		document.getElementById('btn-stop').disabled = true;
-		document.getElementById('peers-table').innerHTML = '<div class="empty">No connected peers</div>';
-		document.getElementById('peer-count').textContent = '';
-	} catch (err) {
-		showToast('Stop failed: ' + err.message, 'error');
-		btn.disabled = false;
-		btn.textContent = '\u25A0 Stop Client';
-	}
-}
+		function showToast(message, type) {
+			const toast = document.createElement('div');
+			toast.className = 'toast ' + type;
+			toast.textContent = message;
+			document.body.appendChild(toast);
+			setTimeout(function () { toast.remove(); }, 3000);
+		}
 
-async function lookupHeader(event) {
-	event.preventDefault();
-	const input = document.getElementById('lookup-input').value.trim();
-	const resultsEl = document.getElementById('lookup-results');
-	const errorEl = document.getElementById('lookup-error');
-	resultsEl.innerHTML = '';
-	errorEl.textContent = '';
-	if (!input) return;
-	try {
-		const header = await apiFetch('/header/' + encodeURIComponent(input));
-		resultsEl.innerHTML =
-			'<div class="card-row"><span class="label">Height</span><span class="value">' + header.height + '</span></div>' +
-			'<div class="card-row"><span class="label">Hash</span><span class="value">' + header.hashHex + '</span></div>' +
-			'<div class="card-row"><span class="label">Previous Hash</span><span class="value">' + header.prevHashHex + '</span></div>' +
-			'<div class="card-row"><span class="label">Merkle Root</span><span class="value">' + header.merkleRootHex + '</span></div>' +
-			'<div class="card-row"><span class="label">Timestamp</span><span class="value">' + formatTimestamp(header.timestamp) + '</span></div>' +
-			'<div class="card-row"><span class="label">Bits</span><span class="value">' + header.bitsHex + '</span></div>' +
-			'<div class="card-row"><span class="label">Nonce</span><span class="value">' + header.nonce + '</span></div>' +
-			'<div class="card-row"><span class="label">Work</span><span class="value">' + header.workHex + '</span></div>' +
-			'<div class="card-row"><span class="label">Work Total</span><span class="value">' + header.workTotalHex + '</span></div>';
-	} catch (err) {
-		errorEl.textContent = 'Not found or invalid lookup';
-	}
-}
+		async function refresh() {
+			try {
+				const results = await Promise.all([
+					apiFetch('/header/tip'),
+					apiFetch('/peers/connected'),
+					apiFetchOptional('/headers/info'),
+					apiFetchOptional('/peers/summary'),
+					apiFetchOptional('/admin/memory'),
+				]);
+				renderChainInfo(results[0]);
+				renderPeers(results[1]);
+				updateStatus(results[1]);
+				renderHeadersDbInfo(results[2]);
+				renderNodesSummary(results[3]);
+				renderMemoryUsage(results[4]);
+			} catch (err) {
+				showToast('Refresh failed: ' + err.message, 'error');
+			}
+		}
 
-async function refreshPeers() {
-	try {
-		const peers = await apiFetch('/peers/connected');
-		renderPeers(peers);
-		updateStatus(peers);
-		lastPeersRefreshTime = Date.now();
-	} catch (e) {}
-	updateRefreshPeersTitle();
-}
+		function renderChainInfo(tip) {
+			const el = document.getElementById('chain-info');
+			if (!tip) { el.innerHTML = '<div class="empty">No data</div>'; return; }
+			el.innerHTML =
+				'<div class="card-row"><span class="label">Height</span><span class="value">' + tip.height + '</span></div>' +
+				'<div class="card-row"><span class="label">Hash</span><span class="value">' + tip.hashHex + '</span></div>' +
+				'<div class="card-row"><span class="label">Previous Hash</span><span class="value">' + tip.prevHashHex + '</span></div>' +
+				'<div class="card-row"><span class="label">Merkle Root</span><span class="value">' + tip.merkleRootHex + '</span></div>' +
+				'<div class="card-row"><span class="label">Timestamp</span><span class="value">' + formatTimestamp(tip.timestamp) + '</span></div>' +
+				'<div class="card-row"><span class="label">Bits</span><span class="value">' + tip.bitsHex + '</span></div>' +
+				'<div class="card-row"><span class="label">Nonce</span><span class="value">' + tip.nonce + '</span></div>' +
+				'<div class="card-row"><span class="label">Work</span><span class="value">' + tip.workHex + '</span></div>' +
+				'<div class="card-row"><span class="label">Work Total</span><span class="value">' + tip.workTotalHex + '</span></div>';
+		}
 
-function updateRefreshPeersTitle() {
-	const btn = document.getElementById('btn-refresh-peers');
-	btn.title = 'Reload the list of connected peers and their ratings (last refreshed ' + timeAgo(lastPeersRefreshTime) + ')';
-}
+		function renderPeers(peers) {
+			_lastPeersData = peers;
+			const el = document.getElementById('peers-table');
+			const countEl = document.getElementById('peer-count');
+			if (!peers || !peers.length) {
+				el.innerHTML = '<div class="empty">No connected peers</div>';
+				countEl.textContent = '';
+				return;
+			}
+			countEl.textContent = '(' + peers.length + ')';
+			const stored = el.querySelector('table') ? getExpandedPeers(el) : {};
+			let html = '<table><thead><tr><th></th><th>IP</th><th>Port</th><th>Rating</th></tr></thead><tbody>';
+			for (let i = 0; i < peers.length; i++) {
+				const p = peers[i];
+				const ratingClass = p.rating >= 0.7 ? 'high' : p.rating >= 0.3 ? 'mid' : 'low';
+				const rowId = p.ip + ':' + p.port;
+				const expanded = stored[rowId] || false;
+				const hasMetrics = !!p.metrics;
+				html += '<tr class="peer-row' + (expanded && hasMetrics ? ' expanded' : '') + '" ' + (hasMetrics ? 'onclick="togglePeerRow(this)"' : '') + ' data-row-id="' + rowId + '"><td><span class="expand-arrow">' + (hasMetrics ? '&#9656;' : '&#8203;') + '</span></td><td>' + p.ip + '</td><td>' + p.port + '</td><td><span class="peer-rating ' + ratingClass + '"></span>' + (p.rating != null ? p.rating.toFixed(3) : '-') + '</td></tr>';
+				if (hasMetrics) {
+					html += '<tr class="peer-details' + (expanded ? ' expanded' : '') + '" data-row-id="' + rowId + '"><td colspan="4">' + renderPeerMetrics(p.metrics, p.liveState) + '</td></tr>';
+				}
+			}
+			html += '</tbody></table>';
+			el.innerHTML = html;
+			scheduleTimeAgoRefresh();
+		}
 
-function toggleAutoRefresh() {
-	autoRefreshEnabled = document.getElementById('auto-refresh-checkbox').checked;
-	if (autoRefreshEnabled) {
-		refreshPeers();
-	}
-}
+		function copyPeersData() {
+			if (!_lastPeersData) return;
+			navigator.clipboard.writeText(JSON.stringify(_lastPeersData, null, '\t')).then(function () {
+				showToast('Copied peers data', 'success');
+			}).catch(function () {
+				showToast('Copy failed', 'error');
+			});
+		}
 
-function updateStartBtnTitle() {
-	const btn = document.getElementById('btn-start');
-	if (clientStartedAt) {
-		btn.title = 'Connect to Bitcoin nodes and begin syncing block headers (running since ' + new Date(clientStartedAt).toLocaleString(undefined, { timeZoneName: 'short' }) + ')';
-	} else {
-		btn.title = 'Connect to Bitcoin nodes and begin syncing block headers';
-	}
-}
+		function renderHeadersDbInfo(info) {
+			const el = document.getElementById('headers-db-info');
+			if (!info) { el.innerHTML = '<div class="empty">Waiting for data...</div>'; return; }
+			let html = '';
+			html += '<div class="card-row"><span class="label">Longest chain headers</span><span class="value">' + info.numLongestChainHeaders + '</span></div>';
+			html += '<div class="card-row"><span class="label">All branches headers</span><span class="value">' + info.numAllHeaders + '</span></div>';
+			html += '<div class="card-row"><span class="label">Orphaned headers</span><span class="value">' + info.numOrphanedHeaders + '</span></div>';
+			const tips = info.numCompetingTips;
+			const tipsClass = tips > 1 ? 'color:var(--yellow);' : 'color:var(--text);';
+			html += '<div class="card-row"><span class="label">Competing tips</span><span class="value" style="' + tipsClass + (tips > 1 ? '" title="A reorg with multiple branches is currently in memory">' : '">') + tips + (tips > 1 ? ' (reorg in progress)' : '') + '</span></div>';
+			html += '<div class="card-row"><span class="label">Invalid blocks configured</span><span class="value">' + info.invalidBlocks.length + '</span></div>';
+			if (info.invalidBlocks.length) {
+				html += '<div class="invalid-blocks">';
+				for (let i = 0; i < info.invalidBlocks.length; i++) {
+					html += '<div>' + info.invalidBlocks[i] + '</div>';
+				}
+				html += '</div>';
+			}
+			el.innerHTML = html;
+		}
 
-function formatTimestamp(unixTs) {
-	return unixTs + ' (' + new Date(unixTs * 1000).toLocaleString(undefined, { timeZoneName: 'short' }) + ')';
-}
+		function renderNodesSummary(summary) {
+			const el = document.getElementById('nodes-summary');
+			if (!summary) {
+				el.innerHTML = '<div class="empty">Requires admin API key</div>';
+				return;
+			}
+			let html = '';
+			html += '<div class="card-row"><span class="label">Total discovered nodes</span><span class="value">' + summary.numTotalNodes + '</span></div>';
+			html += '<div class="card-row"><span class="label">Non-blacklisted</span><span class="value" style="color:var(--green);">' + summary.numNonBlacklistedNodes + '</span></div>';
+			html += '<div class="card-row"><span class="label">Blacklisted</span><span class="value" style="color:var(--red);">' + summary.numBlacklistedNodes + '</span></div>';
+			html += '<div class="card-row"><span class="label">Blacklist rating threshold</span><span class="value">' + summary.blacklistRatingThreshold.toFixed(6) + '</span></div>';
+			html += '<div style="font-size:.72rem;color:var(--text-muted);margin-top:6px;">Node ratings below this threshold are considered blacklisted.</div>';
+			el.innerHTML = html;
+		}
 
-function updateStatusBadgeTitle() {
-	const badge = document.getElementById('status-badge');
-	if (badge.classList.contains('running')) {
-		const dur = duration(clientStartedAt);
-		badge.title = 'Client is connected to nodes and syncing block headers' + (dur ? ' (running for ' + dur + ')' : '');
-	} else {
-		badge.title = 'Client is not connected to any nodes and is not syncing block headers';
-	}
-}
+		function renderMemoryUsage(data) {
+			const el = document.getElementById('memory-usage');
+			if (!data) { el.innerHTML = '<div class="empty">No data</div>'; return; }
+			el.innerHTML =
+				'<div class="card-row"><span class="label">RSS</span><span class="value">' + data.rssMB.toFixed(3) + ' MB</span></div>' +
+				'<div class="card-row"><span class="label">Heap Total</span><span class="value">' + data.heapTotalMB.toFixed(3) + ' MB</span></div>' +
+				'<div class="card-row"><span class="label">Heap Used</span><span class="value">' + data.heapUsedMB.toFixed(3) + ' MB</span></div>' +
+				'<div class="card-row"><span class="label">External</span><span class="value">' + data.externalMB.toFixed(3) + ' MB</span></div>' +
+				'<div class="card-row"><span class="label">Array Buffers</span><span class="value">' + data.arrayBuffersMB.toFixed(3) + ' MB</span></div>';
+		}
 
-function updateWsTitle() {
-	const badge = document.getElementById('ws-badge');
-	if (badge.classList.contains('ws-connected')) {
-		const lastMsg = lastWsMsgTime ? ' Last msg ' + timeAgo(lastWsMsgTime) + '.' : '';
-		badge.title = 'WebSocket connected. Chain tip updates appear in real time.' + lastMsg;
-	} else {
-		badge.title = 'WebSocket disconnected. Reconnects every 5 seconds.';
-	}
-}
+		function getExpandedPeers(el) {
+			const result = {};
+			const rows = el.querySelectorAll('.peer-row.expanded');
+			for (let i = 0; i < rows.length; i++) {
+				result[rows[i].getAttribute('data-row-id')] = true;
+			}
+			return result;
+		}
 
-document.getElementById('btn-refresh-peers').addEventListener('mouseenter', updateRefreshPeersTitle);
-document.getElementById('btn-start').addEventListener('mouseenter', updateStartBtnTitle);
-document.getElementById('ws-badge').addEventListener('mouseenter', updateWsTitle);
-document.getElementById('status-badge').addEventListener('mouseenter', updateStatusBadgeTitle);
+		function togglePeerRow(row) {
+			const id = row.getAttribute('data-row-id');
+			const details = document.querySelector('.peer-details[data-row-id="' + id + '"]');
+			const expanded = row.classList.toggle('expanded');
+			if (details) details.classList.toggle('expanded', expanded);
+			scheduleTimeAgoRefresh();
+		}
 
-let lastFocusRefreshTime = 0;
-function triggerFocusRefresh() {
-	const now = performance.now();
-	if (now - lastFocusRefreshTime > 1000) {
-		lastFocusRefreshTime = now;
-		if (autoRefreshEnabled) { refreshPeers(); }
-		else { refreshAllExpandedTimeAgo(); }
-	}
-}
+		function renderPeerMetrics(metrics, liveState) {
+			if (!metrics) return '<span class="metric-label">No metrics available</span>';
+			let html = '';
+			html += '<div class="metric-section"><div class="metric-section-title">Timestamps</div>';
+			// Last Seen and Last Data Received hidden: they cause too-frequent peer re-fetches via WS.
+			// html += metricRow('Last Seen', metrics.lastSeenTimeMs);
+			html += metricRow('Last Connect', metrics.lastConnectTimeMs);
+			html += metricRow('Last Connect &amp; Test', metrics.lastConnectAndTestTimeMs);
+			// html += metricRow('Last Data Received', metrics.lastDataReceivedTimeMs);
+			html += metricRow('Last Out of Sync', metrics.lastOutOfSyncTimeMs);
+			html += metricRow('Last Invalid Chain', metrics.lastInvalidChainDetectedTimeMs);
+			html += '</div>';
+			if (metrics.recentPingTimes && metrics.recentPingTimes.length) {
+				let avgPing = 0;
+				for (let i = 0; i < metrics.recentPingTimes.length; i++) avgPing += metrics.recentPingTimes[i].pingDurationMs;
+				avgPing = Math.round(avgPing / metrics.recentPingTimes.length);
+				const latest = metrics.recentPingTimes[metrics.recentPingTimes.length - 1];
+				html += '<div class="metric-section"><div class="metric-section-title">Ping</div>';
+				html += metricRow('Avg (n=' + metrics.recentPingTimes.length + ')', avgPing + 'ms');
+				html += metricRowPingLatest(latest.pingDurationMs, latest.pingTimestampMs);
+				html += '</div>';
+			}
+			const beforeCount = metrics.recentUnintentionalDisconnectBeforeConnectTimesMs ? metrics.recentUnintentionalDisconnectBeforeConnectTimesMs.length : 0;
+			const afterCount = metrics.recentUnintentionalDisconnectAfterConnectTimesMs ? metrics.recentUnintentionalDisconnectAfterConnectTimesMs.length : 0;
+			if (beforeCount || afterCount) {
+				html += '<div class="metric-section"><div class="metric-section-title">Disconnects</div>';
+				if (beforeCount) {
+					html += metricRow('Before connect (n=' + beforeCount + ')', metrics.recentUnintentionalDisconnectBeforeConnectTimesMs[beforeCount - 1]);
+				}
+				if (afterCount) {
+					html += metricRow('After connect (n=' + afterCount + ')', metrics.recentUnintentionalDisconnectAfterConnectTimesMs[afterCount - 1]);
+				}
+				html += '</div>';
+			}
+			if (liveState) {
+				html += '<div class="metric-section"><div class="metric-section-title">State</div>';
+				html += metricRow('Verack Sent', liveState.verackSent ? 'yes' : 'no');
+				html += metricRow('Pending Connect', liveState.pendingConnect ? 'yes' : 'no');
+				html += metricRow('Pending GetHeaders', liveState.pendingGetHeaders ? 'yes' : 'no');
+				html += metricRow('Pending GetAddr', liveState.pendingGetAddr ? 'yes' : 'no');
+				html += metricRow('Syncing Headers', liveState.syncingHeaders ? 'yes' : 'no');
+				html += metricRow('Sync Headers Queued', liveState.numSyncHeadersQueued);
+				html += metricRow('Pending Pongs', liveState.numPendingPongs);
+				html += '<div class="metric-row"><span class="metric-label">Node Tip Hash:</span> <span class="metric-value" data-field="tipHash" style="font-family:\'SF Mono\',monospace;font-size:.72rem;word-break:break-all;">' + (liveState.tipHashHex || '-') + '</span></div>';
+				html += '</div>';
+			}
+			return html;
+		}
 
-window.addEventListener('focus', triggerFocusRefresh);
+		function metricRow(label, ts) {
+			if (typeof ts === 'number') {
+				return '<div class="metric-row"><span class="metric-label">' + label + ':</span> <span class="metric-value" data-ms="' + ts + '">-</span></div>';
+			}
+			return '<div class="metric-row"><span class="metric-label">' + label + ':</span> <span class="metric-value">' + (ts != null ? ts : '-') + '</span></div>';
+		}
 
-document.addEventListener('visibilitychange', function () {
-	if (document.visibilityState === 'visible') {
-		triggerFocusRefresh();
-	}
-});
+		function metricRowPingLatest(pingDurationMs, pingTimestampMs) {
+			return '<div class="metric-row"><span class="metric-label">Latest:</span> <span class="metric-value">' + Math.round(pingDurationMs) + 'ms at <span class="metric-timeago" data-ms="' + pingTimestampMs + '">-</span></span></div>';
+		}
 
-function refreshAllExpandedTimeAgo() {
-	const allDetails = document.querySelectorAll('.peer-details.expanded');
-	for (let i = 0; i < allDetails.length; i++) {
-		refreshTimeAgoInContainer(allDetails[i]);
-	}
-}
+		function setStatusBadge(status) {
+			const badge = document.getElementById('status-badge');
+			badge.className = 'badge ' + status.className;
+			badge.innerHTML = '<span class="dot"></span>' + status.text;
+			badge.title = status.title;
+		}
 
-initAdminUI();
-connectWs();
-refresh();
-toggleAutoRefresh();
-</script>
+		function updateStatus(peers) {
+			const btnStart = document.getElementById('btn-start');
+			const btnStop = document.getElementById('btn-stop');
+			if (peers && peers.length > 0) {
+				setStatusBadge(CLIENT_STATUS_RUNNING);
+				if (adminVerified) {
+					btnStart.disabled = true;
+					btnStop.disabled = false;
+				}
+			} else {
+				setStatusBadge(CLIENT_STATUS_STOPPED);
+				btnStart.disabled = false;
+				btnStop.disabled = true;
+			}
+		}
+
+		function dispatchStatusUpdate() {
+			if (!adminVerified) return;
+			const badge = document.getElementById('status-badge');
+			const btnStart = document.getElementById('btn-start');
+			const btnStop = document.getElementById('btn-stop');
+			if (badge.classList.contains('running')) {
+				btnStop.disabled = false;
+				btnStart.disabled = true;
+			} else {
+				btnStop.disabled = true;
+				btnStart.disabled = false;
+			}
+		}
+
+		async function startClient() {
+			const btn = document.getElementById('btn-start');
+			btn.disabled = true;
+			btn.textContent = 'Starting...';
+			try {
+				await apiFetch('/admin/start');
+				clientStartedAt = Date.now();
+				updateStartBtnTitle();
+				showToast('Client started', 'success');
+				btn.textContent = '\u25B6 Start Client';
+				refreshPeers();
+			} catch (err) {
+				showToast('Start failed: ' + err.message, 'error');
+				btn.disabled = false;
+				btn.textContent = '\u25B6 Start Client';
+			}
+		}
+
+		async function stopClient() {
+			const btn = document.getElementById('btn-stop');
+			btn.disabled = true;
+			btn.textContent = 'Stopping...';
+			try {
+				await apiFetch('/admin/stop');
+				showToast('Client stopped', 'success');
+				clientStartedAt = null;
+				updateStartBtnTitle();
+				btn.textContent = '\u25A0 Stop Client';
+				setStatusBadge(CLIENT_STATUS_STOPPED);
+				document.getElementById('btn-start').disabled = false;
+				document.getElementById('btn-stop').disabled = true;
+				document.getElementById('peers-table').innerHTML = '<div class="empty">No connected peers</div>';
+				document.getElementById('peer-count').textContent = '';
+			} catch (err) {
+				showToast('Stop failed: ' + err.message, 'error');
+				btn.disabled = false;
+				btn.textContent = '\u25A0 Stop Client';
+			}
+		}
+
+		async function lookupHeader(event) {
+			event.preventDefault();
+			const input = document.getElementById('lookup-input').value.trim();
+			const resultsEl = document.getElementById('lookup-results');
+			const errorEl = document.getElementById('lookup-error');
+			resultsEl.innerHTML = '';
+			errorEl.textContent = '';
+			if (!input) return;
+			try {
+				const header = await apiFetch('/header/' + encodeURIComponent(input));
+				resultsEl.innerHTML =
+					'<div class="card-row"><span class="label">Height</span><span class="value">' + header.height + '</span></div>' +
+					'<div class="card-row"><span class="label">Hash</span><span class="value">' + header.hashHex + '</span></div>' +
+					'<div class="card-row"><span class="label">Previous Hash</span><span class="value">' + header.prevHashHex + '</span></div>' +
+					'<div class="card-row"><span class="label">Merkle Root</span><span class="value">' + header.merkleRootHex + '</span></div>' +
+					'<div class="card-row"><span class="label">Timestamp</span><span class="value">' + formatTimestamp(header.timestamp) + '</span></div>' +
+					'<div class="card-row"><span class="label">Bits</span><span class="value">' + header.bitsHex + '</span></div>' +
+					'<div class="card-row"><span class="label">Nonce</span><span class="value">' + header.nonce + '</span></div>' +
+					'<div class="card-row"><span class="label">Work</span><span class="value">' + header.workHex + '</span></div>' +
+					'<div class="card-row"><span class="label">Work Total</span><span class="value">' + header.workTotalHex + '</span></div>';
+			} catch (err) {
+				errorEl.textContent = 'Not found or invalid lookup';
+			}
+		}
+
+		async function refreshPeers() {
+			try {
+				const peers = await apiFetch('/peers/connected');
+				renderPeers(peers);
+				updateStatus(peers);
+			} catch (e) { }
+		}
+
+		function updateStartBtnTitle() {
+			const btn = document.getElementById('btn-start');
+			if (clientStartedAt) {
+				btn.title = 'Connect to Bitcoin nodes and begin syncing block headers (running since ' + new Date(clientStartedAt).toLocaleString(undefined, { timeZoneName: 'short' }) + ')';
+			} else {
+				btn.title = 'Connect to Bitcoin nodes and begin syncing block headers';
+			}
+		}
+
+		function formatTimestamp(unixTs) {
+			return unixTs + ' (' + new Date(unixTs * 1000).toLocaleString(undefined, { timeZoneName: 'short' }) + ')';
+		}
+
+		function updateStatusBadgeTitle() {
+			const badge = document.getElementById('status-badge');
+			if (badge.classList.contains('running')) {
+				const dur = duration(clientStartedAt);
+				badge.title = CLIENT_STATUS_RUNNING.title + (dur ? ' (running for ' + dur + ')' : '');
+			} else if (badge.classList.contains('unknown')) {
+				badge.title = CLIENT_STATUS_UNKNOWN.title;
+			} else {
+				badge.title = CLIENT_STATUS_STOPPED.title;
+			}
+		}
+
+		function updateWsTitle() {
+			const badge = document.getElementById('ws-badge');
+			if (badge.classList.contains('ws-connected')) {
+				const lastMsg = lastWsMsgTime ? ' Last msg ' + timeAgo(lastWsMsgTime) + '.' : '';
+				badge.title = 'WebSocket connected. Chain tip updates appear in real time.' + lastMsg;
+			} else {
+				badge.title = 'WebSocket disconnected. Reconnects every 5 seconds.';
+			}
+		}
+
+		document.getElementById('btn-start').addEventListener('mouseenter', updateStartBtnTitle);
+		document.getElementById('ws-badge').addEventListener('mouseenter', updateWsTitle);
+		document.getElementById('status-badge').addEventListener('mouseenter', updateStatusBadgeTitle);
+
+		// Boundary-scheduled timeAgo updates. One timer at a time, fires only when
+		// a span's text would actually change (e.g. "47s ago" → "48s ago" in 1s,
+		// "1m ago" → "2m ago" in ~60s).
+		let _timeAgoTimer = null;
+
+		function scheduleTimeAgoRefresh(fromTimer) {
+			const now = Date.now();
+			const spans = document.querySelectorAll('[data-ms]');
+
+			for (let i = 0; i < spans.length; i++) {
+				const ms = parseInt(spans[i].getAttribute('data-ms'));
+				if (!ms) continue;
+				const elapsed = Math.max(0, now - ms);
+				const ago = Math.floor(elapsed / 1000);
+				let text;
+				if (ago < 60) { text = ago + 's ago'; }
+				else if (ago < 3600) { text = Math.floor(ago / 60) + 'm ago'; }
+				else if (ago < 86400) { text = Math.floor(ago / 3600) + 'h ago'; }
+				else { text = Math.floor(ago / 86400) + 'd ago'; }
+				spans[i].textContent = text;
+			}
+
+			if (fromTimer) {
+				_timeAgoTimer = null;
+			}
+			if (_timeAgoTimer === null) {
+				const nextMs = Math.ceil(now / 1000) * 1000;
+				_timeAgoTimer = setTimeout(function () { scheduleTimeAgoRefresh(true); }, Math.max(100, nextMs - now));
+			}
+		}
+
+		// Force immediate refresh when the user returns to the tab so stale
+		// time-ago text (from a background timer that may have fired seconds ago)
+		// doesn't linger.
+		window.addEventListener('focus', scheduleTimeAgoRefresh);
+
+		initEventLogFilters();
+		initAdminUI();
+		connectWs();
+		refresh();
+	</script>
 </body>
+
 </html>

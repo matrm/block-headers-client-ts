@@ -97,7 +97,7 @@ npm run build
 npm run start-nobuild
 ```
 
-The server will be running at `http://localhost:3000` but is not syncing to the longest chain yet.
+The server will be running at `http://localhost:3000` but is not syncing to the longest chain yet. You can visit this URL to view the dashboard.
 
 2. If you have `AUTO_START` set to `false` in your `.env` file, you can send a GET request to `/admin/start` to start the client, syncing to the longest chain. Requires admin authentication. If `AUTO_START` is set to `true`, the client will start syncing automatically.
 ```

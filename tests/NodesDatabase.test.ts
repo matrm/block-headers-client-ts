@@ -1,7 +1,7 @@
 /// <reference types="node" />
 import { mkdir } from 'node:fs/promises';
 
-import { expect, test, describe, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { expect, test, describe, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { removeDirectoryWithRetries, createDbWithRetries } from './testUtils';
 
 import {
@@ -11,11 +11,11 @@ import {
 	createDefaultNodeConnectionMetrics,
 	createBlacklistedRatingThreshold,
 	getHighestMetricsTime
-} from '../src/NodesDatabase';
-import { IpPort } from '../src/types';
-import { ipPortToString, stringToIpPort } from '../src/utils/util';
-import { DEFAULT_DATABASE_PATH } from '../src/constants';
-import { getRandomHexString } from '../src/utils/util';
+} from '../src/NodesDatabase.js';
+import { IpPort } from '../src/types.js';
+import { ipPortToString, stringToIpPort } from '../src/utils/util.js';
+import { DEFAULT_DATABASE_PATH } from '../src/constants.js';
+import { getRandomHexString } from '../src/utils/util.js';
 
 // Function to check if array is sorted in ascending order.
 function isSorted(arr: number[]): boolean {
@@ -319,6 +319,7 @@ describe('NodesDatabase', () => {
 	]);
 
 	beforeEach(async (context) => {
+		vi.useFakeTimers();
 		databasePath = `tests/db/nodes-${getRandomHexString(16)}`;
 
 		await mkdir(databasePath, { recursive: true });
@@ -331,6 +332,7 @@ describe('NodesDatabase', () => {
 			await db.close();
 		}
 		await removeDirectoryWithRetries(databasePath);
+		vi.useRealTimers();
 	});
 
 	// Test Cases for NodesDatabase methods.
@@ -345,7 +347,7 @@ describe('NodesDatabase', () => {
 		const initialSeenTime = db.getNodeSeenTimeMs(ipPort);
 		expect(initialSeenTime).toBeTypeOf('number');
 
-		await new Promise(resolve => setTimeout(resolve, 10));
+		await vi.advanceTimersByTimeAsync(10);
 		await db.addSeen(ipPort, Date.now());
 		const updatedSeenTime = db.getNodeSeenTimeMs(ipPort);
 
@@ -362,7 +364,7 @@ describe('NodesDatabase', () => {
 		const newIpPorts = [ipPorts[1], ipPorts[2]];
 		const batchIpPorts = [existingIpPort, ...newIpPorts];
 
-		await new Promise(resolve => setTimeout(resolve, 10));
+		await vi.advanceTimersByTimeAsync(10);
 		await db.addSeenBatch(batchIpPorts, Date.now());
 
 		expect(db.getNumNodes()).toBe(1 + newIpPorts.length);
@@ -410,9 +412,9 @@ describe('NodesDatabase', () => {
 		const [ipPort1, ipPort2, ipPort3] = ipPorts;
 
 		await db.addSeen(ipPort1, Date.now());
-		await new Promise(resolve => setTimeout(resolve, 10));
+		await vi.advanceTimersByTimeAsync(10);
 		await db.addSeen(ipPort2, Date.now());
-		await new Promise(resolve => setTimeout(resolve, 10));
+		await vi.advanceTimersByTimeAsync(10);
 		await db.addSeen(ipPort3, Date.now());
 
 		const mostRecent = db.getMostRecentlySeenNodes({ timeMs: Date.now(), amount: 3, allowBlacklisted: true });
@@ -427,9 +429,9 @@ describe('NodesDatabase', () => {
 		const [ipPort1, ipPort2, ipPort3] = ipPorts;
 
 		await db.addSeen(ipPort1, Date.now());
-		await new Promise(resolve => setTimeout(resolve, 10));
+		await vi.advanceTimersByTimeAsync(10);
 		await db.addSeen(ipPort2, Date.now());
-		await new Promise(resolve => setTimeout(resolve, 10));
+		await vi.advanceTimersByTimeAsync(10);
 		await db.addSeen(ipPort3, Date.now());
 
 		const mostRecentTwo = db.getMostRecentlySeenNodes({ timeMs: Date.now(), amount: 2, allowBlacklisted: true });
@@ -446,9 +448,9 @@ describe('NodesDatabase', () => {
 		const [ipPort1, ipPort2, ipPort3] = ipPorts;
 
 		await db.addSeen(ipPort1, Date.now());
-		await new Promise(resolve => setTimeout(resolve, 10));
+		await vi.advanceTimersByTimeAsync(10);
 		await db.addSeen(ipPort2, Date.now());
-		await new Promise(resolve => setTimeout(resolve, 10));
+		await vi.advanceTimersByTimeAsync(10);
 		await db.addSeen(ipPort3, Date.now());
 
 		const excludedIpPortStringsMap: Map<string, any> = new Map();

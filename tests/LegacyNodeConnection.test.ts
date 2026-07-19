@@ -1,14 +1,14 @@
 /// <reference types="node" />
 import { mkdir } from 'node:fs/promises';
 
-import { expect, test, describe, beforeEach, afterEach } from 'vitest';
+import { expect, test, describe, beforeEach, afterEach, vi } from 'vitest';
 import { removeDirectoryWithRetries, createDbWithRetries } from './testUtils';
 
-import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase';
-import { ConnectionMonitor } from '../src/ConnectionMonitor';
-import { LegacyNodeConnection } from '../src/LegacyNodeConnection';
-import { Chain, getInvalidBlocks } from '../src/chainProtocol';
-import { getRandomHexString } from '../src/utils/util';
+import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase.js';
+import { ConnectionMonitor } from '../src/ConnectionMonitor.js';
+import { LegacyNodeConnection } from '../src/LegacyNodeConnection.js';
+import { Chain, getInvalidBlocks } from '../src/chainProtocol.js';
+import { getRandomHexString } from '../src/utils/util.js';
 
 const chain: Chain = 'bsv';
 
@@ -31,6 +31,7 @@ describe('LegacyNodeConnection', () => {
 		let connMonitor: ConnectionMonitor;
 
 		beforeEach(async () => {
+			vi.useFakeTimers();
 			databasePath = `tests/db/node-connection-${getRandomHexString(16)}`;
 			await mkdir(databasePath, { recursive: true });
 			db = await createDbWithRetries(() => BlockHeadersDatabase.fromGenesis({
@@ -44,6 +45,7 @@ describe('LegacyNodeConnection', () => {
 		afterEach(async () => {
 			if (db) await db.close();
 			await removeDirectoryWithRetries(databasePath);
+			vi.useRealTimers();
 		});
 
 		test('queue depth of at most 2: running + 1 queued, 3rd caller waits for tail', async () => {
@@ -69,7 +71,7 @@ describe('LegacyNodeConnection', () => {
 			};
 
 			conn.syncHeaders({});
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
 			expect(syncCallCount).toBe(1);
 			expect((conn as any)._numSyncHeadersQueued).toBe(1);
 
@@ -81,8 +83,8 @@ describe('LegacyNodeConnection', () => {
 			expect(syncCallCount).toBe(1);
 
 			sync1Deferred.resolve(undefined);
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			expect(syncCallCount).toBe(2);
 			expect(thirdSyncStarted).toBe(false);
@@ -112,7 +114,7 @@ describe('LegacyNodeConnection', () => {
 			};
 
 			conn.syncHeaders({});
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
 			expect(syncCallCount).toBe(1);
 			expect((conn as any)._numSyncHeadersQueued).toBe(1);
 
@@ -120,8 +122,8 @@ describe('LegacyNodeConnection', () => {
 			expect((conn as any)._numSyncHeadersQueued).toBe(2);
 
 			sync1Deferred.resolve(undefined);
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			expect(syncCallCount).toBe(2);
 			expect(secondSyncStarted).toBe(true);
@@ -199,7 +201,7 @@ describe('LegacyNodeConnection', () => {
 			// Start first sync (blocks on deferred).
 			let call1Rejection: any;
 			conn.syncHeaders({}).catch((err) => { call1Rejection = err; });
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
 			expect(syncCallCount).toBe(1);
 			expect((conn as any)._numSyncHeadersQueued).toBe(1);
 
@@ -217,8 +219,8 @@ describe('LegacyNodeConnection', () => {
 
 			// Resolve first sync (it will throw).
 			sync1Deferred.resolve(undefined);
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			// First caller sees the error.
 			expect(call1Rejection).toBeInstanceOf(Error);
@@ -258,7 +260,7 @@ describe('LegacyNodeConnection', () => {
 			// Call 1 starts (blocks on deferred).
 			let call1Rejection: any;
 			conn.syncHeaders({}).catch((err) => { call1Rejection = err; });
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
 			expect(syncCallCount).toBe(1);
 			expect((conn as any)._numSyncHeadersQueued).toBe(1);
 
@@ -280,8 +282,8 @@ describe('LegacyNodeConnection', () => {
 
 			// Resolve call 1 (succeeds).
 			sync1Deferred.resolve(undefined);
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			// Call 1 succeeded.
 			expect(call1Rejection).toBeUndefined();
@@ -290,8 +292,8 @@ describe('LegacyNodeConnection', () => {
 			// Call 2 fires and blocks on sync2Deferred.
 			// Call 2 fails.
 			sync2Deferred.resolve(undefined);
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			// Call 2 sees the error.
 			expect(call2Rejection).toBeInstanceOf(Error);
@@ -329,7 +331,7 @@ describe('LegacyNodeConnection', () => {
 			// Call 1 starts.
 			let call1Rejection: any;
 			conn.syncHeaders({}).catch((err) => { call1Rejection = err; });
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
 			expect((conn as any)._numSyncHeadersQueued).toBe(1);
 
 			// Call 2 queues.
@@ -348,8 +350,8 @@ describe('LegacyNodeConnection', () => {
 
 			// Call 1 fails.
 			sync1Deferred.resolve(undefined);
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			// Call 1 sees its own error, not call 2's.
 			expect(call1Rejection).toBeInstanceOf(Error);
@@ -358,8 +360,8 @@ describe('LegacyNodeConnection', () => {
 
 			// Call 2 fires, then fails.
 			sync2Deferred.resolve(undefined);
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			// Call 2 sees its error.
 			expect(call2Rejection).toBeInstanceOf(Error);
@@ -389,7 +391,7 @@ describe('LegacyNodeConnection', () => {
 			// Call 1 starts.
 			let call1Rejection: any;
 			conn.syncHeaders({}).catch((err) => { call1Rejection = err; });
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
 
 			// Call 2 queues.
 			let call2Rejection: any;
@@ -403,9 +405,9 @@ describe('LegacyNodeConnection', () => {
 			expect((conn as any)._numSyncHeadersQueued).toBe(2);
 
 			sync1Deferred.resolve(undefined);
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			expect(call1Rejection).toBeUndefined();
 			expect(call2Rejection).toBeUndefined();
@@ -437,7 +439,7 @@ describe('LegacyNodeConnection', () => {
 
 			// Cycle 1: fill and drain.
 			let c1r1: any; conn.syncHeaders({}).catch((err) => { c1r1 = err; });
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
 			expect((conn as any)._numSyncHeadersQueued).toBe(1);
 
 			let c1r2: any; conn.syncHeaders({}).catch((err) => { c1r2 = err; });
@@ -448,13 +450,13 @@ describe('LegacyNodeConnection', () => {
 
 			expect(syncCallCount).toBe(1);
 			syncDeferreds[0].resolve();
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			expect(syncCallCount).toBe(2);
 			syncDeferreds[1].resolve();
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			expect((conn as any)._numSyncHeadersQueued).toBe(0);
 			expect(c1r1).toBeUndefined();
@@ -463,7 +465,7 @@ describe('LegacyNodeConnection', () => {
 
 			// Cycle 2: new calls after drain should work fresh.
 			let c2r1: any; conn.syncHeaders({}).catch((err) => { c2r1 = err; });
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
 			expect((conn as any)._numSyncHeadersQueued).toBe(1);
 			expect(syncCallCount).toBe(3);
 
@@ -476,13 +478,13 @@ describe('LegacyNodeConnection', () => {
 
 			expect(syncCallCount).toBe(3);
 			syncDeferreds[2].resolve();
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			expect(syncCallCount).toBe(4);
 			syncDeferreds[3].resolve();
-			await new Promise(r => setTimeout(r, 0));
-			await new Promise(r => setTimeout(r, 0));
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(0);
 
 			expect((conn as any)._numSyncHeadersQueued).toBe(0);
 			expect(c2r1).toBeUndefined();

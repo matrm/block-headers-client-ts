@@ -48,11 +48,11 @@ npm run start-nobuild   # Run server without rebuilding (requires prior build)
 | `src/api/middleware/errorHandlers.ts` | Express error handling middleware |
 | `src/api/middleware/logger.ts` | Request logging middleware |
 | `src/api/middleware/rateLimiter.ts` | Rate limiting middleware |
-| `src/api/routes/adminRoutes.ts` | `GET /admin/start`, `GET /admin/stop`, `GET /verify`(doesn't use /admin path so it can be later used for non-admin auth) |
+| `src/api/routes/adminRoutes.ts` | `GET /admin/start`, `GET /admin/stop`, `GET /admin/memory`, `GET /verify` (doesn't use /admin path so it can be later used for non-admin auth) |
 | `src/api/routes/dashboard.html` | Server dashboard HTML page |
 | `src/api/routes/dashboardRoutes.ts` | Dashboard page route |
-| `src/api/routes/headerRoutes.ts` | `GET /header/:id` (by height or hash or 'tip') |
-| `src/api/routes/peerRoutes.ts` | `GET /peers/connected` |
+| `src/api/routes/headerRoutes.ts` | `GET /header/:id` (by height or hash or 'tip'), `GET /headers/info` (dashboard-only snapshot of the block-headers database; gated by the `x-dashboard-apis` header) |
+| `src/api/routes/peerRoutes.ts` | `GET /peers/connected` (returns per-peer `metrics` and `liveState` when admin + `x-dashboard-apis` header is present), `GET /peers/summary` (dashboard-only summary of the discovered-node population; admin + `x-dashboard-apis` header) |
 
 ### Test Files (`tests/`)
 
@@ -70,7 +70,7 @@ npm run start-nobuild   # Run server without rebuilding (requires prior build)
 | `tests/api/websockets.test.ts` | Unit tests for WebSocket server behavior |
 | `tests/api/routes/adminRoutes.test.ts` | Unit tests for admin API endpoints |
 | `tests/api/routes/headerRoutes.test.ts` | Unit tests for the header lookup endpoint |
-| `tests/api/routes/peerRoutes.test.ts` | Unit tests for the peer listing endpoint |
+| `tests/api/routes/peerRoutes.test.ts` | Unit tests for the peer listing and nodes summary endpoints |
 | `tests/p2p/messages.test.ts` | Unit tests for P2P message serialization and parsing |
 | `tests/utils/util.test.ts` | Unit tests for utility functions |
 
@@ -109,6 +109,9 @@ npm run start-nobuild   # Run server without rebuilding (requires prior build)
 - **Published package** (via `"files"` in `package.json`): `dist/` (minus `dist/api/`), `README.md`, `LICENSE.txt`; no source, tests, or config are published
 - **Runtime deps**: `level` (LevelDB) and `red-black-map` only; Express/ws are dev-only dependencies and not in the published package because server users are expected to install via git clone instead of npm.
 - **Database async save strategy**: In-memory state is updated synchronously; LevelDB writes are queued asynchronously via internal promise chains (`_metricsSaveQueue`, etc.) and not awaited during normal operation. The DB flush is awaited in `dispose()` / `stop()` methods. If a queued LevelDB write fails, the error is logged unconditionally via `console.error` and then swallowed to avoid poisoning the queue. The in-memory data is the source of truth for the next save.
+- **Dashboard-only API strategy**: The API server exposes internal client state to the dashboard via `private _get...ForDashboard()` methods on `BlockHeadersClient`, reached by routes through `(client as any)._get...ForDashboard()`. Dashboard routes are gated by the `x-dashboard-apis: true` HTTP header; sensitive routes additionally require admin auth.
+- **Dashboard-only WebSocket channel**: The WS server exposes a `'dashboard'` channel alongside the existing `'new_chain_tip'` channel. `BlockHeadersClient` maintains a private `_dashboardEmitter` (`EventEmitter`) with a typed `DashboardEmitterEvents` interface; events on this emitter are NOT on the public `BlockHeadersClientEvents` interface. The WS server accesses the emitter via `(client as any)._dashboardEmitter` and debounces events into a single `{ type: 'dashboard:event', events: [...] }` broadcast where each event is an object `{ name: string, data?: any }`. Some event types are admin-gated.
+- **Note on Dashboard APIs**: The dashboard API and WebSocket endpoints are intentionally undocumented and require custom headers (`x-dashboard-apis: true`) or specific query parameters (`dashboard=true`) to use. This design is intentional to keep these features difficult to discover and use for general public API users.
 
 ## Testing Quirks
 
@@ -127,6 +130,7 @@ npm run start-nobuild   # Run server without rebuilding (requires prior build)
 - Comments shouldn't reference older versions of the codebase unless the context is backwards compatibility.
 - Comment style: Use `/** ... */` JSDoc only for public method documentation describing the API contract (parameters, return values, purpose). All other comments, including internal implementation notes, design decisions, test documentation, benchmark comments, and section headers, must use the `// ` prefix. Inline single-word comments inside code blocks (e.g., `catch (e) { /* expected */ }`) are an exception and may remain `/* */` for readability.
 - Private class members use an underscore prefix (e.g., `_foo`) in addition to TypeScript's `private` keyword (not `#` private fields). Internal code (tests, API server) reaches privates via `as any` casting. Reasons: cleaner code, debuggability and testability via `as any` casting to reach internals, and the ability to add internal-only members (e.g., on `BlockHeadersClient`) that the API server can access without exposing them to library-mode consumers.
+- Do not declare variables with `var`.
 - The em dash character (—) must not be used anywhere in the codebase.
 
 ## Logging Strategy

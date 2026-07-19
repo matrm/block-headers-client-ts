@@ -4,11 +4,11 @@ import { mkdir } from 'node:fs/promises';
 import { expect, test, describe, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { removeDirectoryWithRetries, createDbWithRetries } from './testUtils';
 
-import { BlockHeaderMutable } from '../src/BlockHeader';
-import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase';
-import { Chain, getInvalidBlocks } from '../src/chainProtocol';
-import { DEFAULT_DATABASE_PATH } from '../src/constants';
-import { getRandomHexString } from '../src/utils/util';
+import { BlockHeaderMutable } from '../src/BlockHeader.js';
+import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase.js';
+import { Chain, getInvalidBlocks } from '../src/chainProtocol.js';
+import { DEFAULT_DATABASE_PATH } from '../src/constants.js';
+import { getRandomHexString } from '../src/utils/util.js';
 
 const chain = 'bsv';
 

@@ -152,4 +152,42 @@ describe('ConnectionMonitor', () => {
 			await expect(monitor.connectedToInternetExpensiveAsync(new AbortController().signal)).resolves.toBe(false);
 		});
 	});
+
+	describe('setOnProbeResult', () => {
+		test('fires on initial probe during start', async () => {
+			const monitor = new ConnectionMonitor();
+			const abortController = new AbortController();
+			(fetch as any).mockResolvedValue({ ok: true });
+			const callback = vi.fn();
+			monitor.setOnProbeResult(callback);
+			await monitor.start(abortController.signal);
+			expect(callback).toHaveBeenCalledTimes(1);
+			expect(callback).toHaveBeenCalledWith(null, true);
+			await monitor.stop();
+		});
+
+		test('fires on failed probe', async () => {
+			const monitor = new ConnectionMonitor();
+			const abortController = new AbortController();
+			(fetch as any).mockRejectedValue(new Error('Network error'));
+			const callback = vi.fn();
+			monitor.setOnProbeResult(callback);
+			await monitor.start(abortController.signal);
+			expect(callback).toHaveBeenCalledTimes(1);
+			expect(callback).toHaveBeenCalledWith(null, false);
+			await monitor.stop();
+		});
+
+		test('null clears the callback', async () => {
+			const monitor = new ConnectionMonitor();
+			const abortController = new AbortController();
+			(fetch as any).mockResolvedValue({ ok: true });
+			const callback = vi.fn();
+			monitor.setOnProbeResult(callback);
+			await monitor.start(abortController.signal);
+			expect(callback).toHaveBeenCalledTimes(1);
+			monitor.setOnProbeResult(null);
+			await monitor.stop();
+		});
+	});
 });

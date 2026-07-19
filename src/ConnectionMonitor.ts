@@ -49,6 +49,17 @@ export class ConnectionMonitor {
 	private readonly _enableConsoleDebugLog: boolean = false;
 	private _abortSignal: AbortSignal | null = null;
 	private _updateResolvers: Array<{ condition: () => boolean, resolver: () => void }> = [];
+	// Optional callback invoked whenever the fallback probe (checkInternetConnection) runs.
+	// The probe is a fallback: normally node data arrivals call updateLastKnownConnectionTime()
+	// to signal connectivity. If no data arrives within (intervalMs - timeoutMs) * 0.9, the
+	// fallback fires. Nodes don't always send data reliably within that window even when the
+	// internet is connected, so this probe may fire during normal operation.
+	// The callback receives the previous and the new isConnected status so the host can
+	// distinguish transitions (online↔offline) from no-op probes (online→online, offline→offline).
+	// `_lastReportedStatus` is null until the first probe completes; the host treats null as
+	// "no transition yet" and emits the matching no-op classification.
+	private _lastReportedStatus: boolean | null = null;
+	private _onProbeResult: ((prev: boolean | null, isConnected: boolean) => void) | null = null;
 
 	constructor({ intervalMs, timeoutMs, enableConsoleDebugLog }: {
 		intervalMs?: number;
@@ -76,6 +87,10 @@ export class ConnectionMonitor {
 			await this._intervalFunctionQueue;
 			this._intervalFunctionQueue = null;
 		}
+		// Reset so the next start() emits a fresh probe classification instead of comparing
+		// against the stale pre-dispose status.
+		this._lastReportedStatus = null;
+		this._onProbeResult = null;
 	}
 
 	stop = async (): Promise<void> => {
@@ -89,6 +104,11 @@ export class ConnectionMonitor {
 			}
 			return;
 		}
+		// Reset so the next probe emits a fresh classification instead of comparing
+		// against a stale pre-start status. The reconnection path calls _start() from
+		// BlockHeadersClient without an intervening dispose(), so the null collapse
+		// documented on the connection_monitor_* events must happen here.
+		this._lastReportedStatus = null;
 		this._abortSignal = signal;
 		this._intervalId = setInterval(this._intervalFunction, this._intervalMs);
 		// Allows the user to guarentee that this._lastKnownConnectionTimeMs has been set at least once.
@@ -107,9 +127,20 @@ export class ConnectionMonitor {
 		const signal = this._abortSignal;
 		this._intervalFunctionQueue = (async () => {
 			const isConnected = await checkInternetConnection(this._timeoutMs, signal!);
+			if (signal!.aborted) {
+				this._intervalFunctionQueue = null;
+				clearInterval(this._intervalId!);
+				this._intervalId = null;
+				return;
+			}
 			this._enableConsoleDebugLog && console.log(unixTime3Decimal(), `- ${isConnected ? 'C' : 'Not c'}onnected to internet.`);
 			if (isConnected) {
 				this._lastKnownConnectionTimeMs = performance.now();
+			}
+			if (this._onProbeResult) {
+				const prev = this._lastReportedStatus;
+				this._lastReportedStatus = isConnected;
+				this._onProbeResult(prev, isConnected);
 			}
 			this._intervalFunctionQueue = null;
 		})();
@@ -126,6 +157,17 @@ export class ConnectionMonitor {
 
 	getTimeoutMs = (): number => {
 		return this._timeoutMs;
+	}
+
+	/**
+	 * Sets a callback invoked whenever an active probe runs and reports a new isConnected
+	 * status. The callback receives the previous status (or null if this is the first probe
+	 * after start() or a dispose()) so the host can distinguish transitions from no-op probes.
+	 * Used by the host (BlockHeadersClient) to re-emit as dashboard-facing events.
+	 * @param callback - Function receiving (prev, newStatus), or null to clear.
+	 */
+	setOnProbeResult = (callback: ((prev: boolean | null, isConnected: boolean) => void) | null): void => {
+		this._onProbeResult = callback;
 	}
 
 	updateLastKnownConnectionTime = (): void => {

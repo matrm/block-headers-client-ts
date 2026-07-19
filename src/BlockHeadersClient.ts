@@ -46,8 +46,38 @@ interface BlockHeadersClientEvents {
 	'new_chain_tip': [height: number, hashHex: string];
 }
 
+interface DashboardEmitterEvents {
+	// Whenever a node connection is added to this._nodeConnectionsConnected.
+	'peer_connected': [ipPort: IpPort];
+	// Whenever a node connection is removed from this._nodeConnectionsConnected.
+	'peer_disconnected': [ipPort: IpPort];
+	'peer_reconnected': [ipPort: IpPort];
+	'peer_out_of_sync': [ipPort: IpPort];
+	'peer_invalid_blocks': [ipPort: IpPort];
+	'peer_unintentional_disconnect_before_connect': [ipPort: IpPort];
+	'peer_unintentional_disconnect_after_connect': [ipPort: IpPort];
+	'peer_addr_discovered': [ipPort: IpPort, count: number];
+	'peer_block_hashes_received': [ipPort: IpPort, hashHex: string];
+	'peer_pong_received': [ipPort: IpPort, durationMs: number];
+	// 'peer_data_received' is commented out because it causes too many WS messages.
+	// 'peer_data_received': [ipPort: IpPort, timeMs: number];
+	'client_start': [];
+	'client_stop': [];
+	// The four connection-monitor classifications cover both pieces of information: whether
+	// the fallback probe ran at all (every probe emits one of these four), and whether the
+	// status transitioned. Null previous status (first probe after start or dispose) is
+	// treated as the matching no-transition event (online_to_online or offline_to_offline).
+	'connection_monitor_online_to_online': [];
+	'connection_monitor_online_to_offline': [];
+	'connection_monitor_offline_to_online': [];
+	'connection_monitor_offline_to_offline': [];
+	'stuck_detection_purge': [];
+	'stuck_detection_recovery': [];
+}
+
 export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	private readonly _enableConsoleDebugLog: boolean = false;
+	private readonly _dashboardEmitter = new EventEmitter<DashboardEmitterEvents>();
 	private readonly _chain: Chain;
 	private readonly _nodesDatabase: NodesDatabase;
 	private readonly _blockHeadersDatabase: BlockHeadersDatabase;
@@ -242,7 +272,15 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				this._enableConsoleDebugLog && console.log('BlockHeadersClient stop() end.');
 			})
 			.finally(() => {
+				// Reset _stopQueue first so a re-entrant stop() call observing the in-flight
+				// chain's completion sees a null queue and starts a fresh chain (which gets
+				// its own emit). The emit fires unconditionally (success or rejection) because
+				// even a database error during dispose still means the program is mostly
+				// stopped. Promise.prototype.finally schedules its callback as a microtask on
+				// the settled promise, so the await in any concurrent stop() caller is
+				// guaranteed to observe the new null _stopQueue and the emitted event.
 				this._stopQueue = null;
+				this._dashboardEmitter.emit('client_stop');
 			});
 		return this._stopQueue;
 	}
@@ -255,10 +293,20 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	}
 
 	private _closeNodeConnections = (): void => {
-		const connections = Array.from(this._nodeConnections.values());
+		const all = Array.from(this._nodeConnections.values());
+		const connectedSet = new Set(this._nodeConnectionsConnected.values());
 		this._nodeConnections.clear();
 		this._nodeConnectionsConnected.clear();
-		for (const connection of connections) {
+		for (const connection of all) {
+			// dispose() routes to _disconnectNoEmit() on LegacyNodeConnection, which
+			// removes socket listeners and destroys the socket without firing the
+			// 'disconnect' event. Emit peer_disconnected for the dashboard before the
+			// silent cleanup, but only for connections that had completed the handshake
+			// (the others never emitted peer_connected, so a peer_disconnected for them
+			// would be an unbalanced row in the dashboard event log).
+			if (connectedSet.has(connection)) {
+				this._dashboardEmitter.emit('peer_disconnected', connection.getIpPort());
+			}
 			connection[Symbol.dispose]();
 		}
 	}
@@ -266,7 +314,9 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	private _destroyNodeConnection = (nodeConnection: NodeConnection): void => {
 		const ipPortString = nodeConnection.getIpPortString();
 		this._nodeConnections.delete(ipPortString);
-		this._nodeConnectionsConnected.delete(ipPortString);
+		if (this._nodeConnectionsConnected.delete(ipPortString)) {
+			this._dashboardEmitter.emit('peer_disconnected', nodeConnection.getIpPort());
+		}
 		nodeConnection[Symbol.dispose]();
 	}
 
@@ -443,6 +493,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		this._nodeConnectionsConnected.set(nodeConnection.getIpPortString(), nodeConnection);
 		// Reset the stuck-detection timer since we just successfully connected to a node.
 		this._lastConnectionProgressTime = performance.now();
+		this._dashboardEmitter.emit('peer_connected', nodeConnection.getIpPort());
 	}
 
 	private _createConnectedNodeConnection = async ({
@@ -591,6 +642,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 					// to avoid removing nodes that are currently running callbacks which may leave
 					// the node in a corrupted state if removed from the database.
 					this._nodesDatabase.deleteNodes({ excludedIpPortStringsMap: this._nodeConnections });
+					this._dashboardEmitter.emit('stuck_detection_purge');
 					this._addedSeedNodesFromExternalAPI = false;
 					this._addedSeedNodesFromEnvAndHardcoded = false;
 					assert(this._seedReAddPromise === null);
@@ -627,6 +679,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 						// modify the this._nodesCurrentlyRunningGetAddr counter to prevent this if
 						// statement from being triggered by another worker.
 						this._lastConnectionProgressTime = performance.now();
+						this._dashboardEmitter.emit('stuck_detection_recovery');
 					})().finally(() => {
 						// We use a .finally() in case future devs make changes that forget to handle
 						// errors when re-adding seeds. If we do not want that protection then this
@@ -700,7 +753,10 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		});
 
 		nodeConnection.on('data', () => {
-			this._nodesDatabase.addLastDataReceivedTimeMs(ipPort, Date.now()).catch((error: Error) => {
+			const timeMs = Date.now();
+			// peer_data_received emit commented out: it spams the WS channel.
+			// this._dashboardEmitter.emit('peer_data_received', ipPort, timeMs);
+			this._nodesDatabase.addLastDataReceivedTimeMs(ipPort, timeMs).catch((error: Error) => {
 				console.error('Nodes database error when addLastDataReceivedTimeMs', ipPort, ':', error);
 			});
 		});
@@ -720,6 +776,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			this._nodesDatabase.addSeenBatch(ipPorts, timeMs).catch((error: Error) => {
 				console.error('Nodes database error when adding seen nodes', ipPorts, ':', error);
 			});
+			this._dashboardEmitter.emit('peer_addr_discovered', ipPort, ipPorts.length);
 		});
 
 		nodeConnection.on('block_hashes', async (hashes: Buffer[]) => {
@@ -737,9 +794,12 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				return;
 			}
 
-			if (this._blockHeadersDatabase.getHeaderTip().hashHex === hashes.at(-1)!.toString('hex')) {
+			const lastHashHex = hashes.at(-1)!.toString('hex');
+			this._dashboardEmitter.emit('peer_block_hashes_received', ipPort, lastHashHex);
+
+			if (this._blockHeadersDatabase.getHeaderTip().hashHex === lastHashHex) {
 				// Another node has already downloaded this header.
-				//this._enableConsoleDebugLog && console.log(ipPort, 'Skipping syncing headers for', hashes.at(-1)!.toString('hex'), 'because another node already downloaded.');
+				//this._enableConsoleDebugLog && console.log(ipPort, 'Skipping syncing headers for', lastHashHex, 'because another node already downloaded.');
 				return;
 			}
 			this._nodesSyncingHeaders.add(nodeConnection.getIpPortString());
@@ -776,6 +836,8 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				return;
 			}
 
+			this._dashboardEmitter.emit('peer_out_of_sync', ipPort);
+
 			assert(this._nodesDatabase.has(ipPort));
 			const timeMs = Date.now();
 			const ratingBefore = this._nodesDatabase.getNodeRating(ipPort, timeMs);
@@ -802,6 +864,8 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				return;
 			}
 
+			this._dashboardEmitter.emit('peer_invalid_blocks', ipPort);
+
 			assert(this._nodesDatabase.has(ipPort));
 			const timeMs = Date.now();
 			const ratingBefore = this._nodesDatabase.getNodeRating(ipPort, timeMs);
@@ -826,6 +890,8 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				return;
 			}
 
+			this._dashboardEmitter.emit('peer_pong_received', ipPort, durationMs);
+
 			assert(this._nodesDatabase.has(ipPort));
 			const timeMs = Date.now();
 			const blacklistedBeforeAndDebugLogging = this._enableConsoleDebugLog && this._nodesDatabase.isBlacklisted(ipPort, timeMs);
@@ -846,9 +912,12 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 
 			assert(this._nodesDatabase.has(ipPort));
 
+			this._dashboardEmitter.emit('peer_unintentional_disconnect_before_connect', ipPort);
 			// Remove this node from this._nodeConnectionsConnected so connected counters are accurate while this function
 			// is waiting for promises to resolve.
-			this._nodeConnectionsConnected.delete(ipPortString);
+			if (this._nodeConnectionsConnected.delete(ipPortString)) {
+				this._dashboardEmitter.emit('peer_disconnected', ipPort);
+			}
 
 			const connectedToInternetAndNotAborted = await this._connectionMonitor.connectedToInternetCheapAsync(clientStopSignal).catch(() => {
 				this._enableConsoleDebugLog && console.log('Node unintentionally disconnected before connecting: ABORTED', ipPort);
@@ -894,13 +963,16 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			const nodesBefore = new Set(this._nodeConnectionsConnected.keys());
 			const nodesAfter = new Set(nodesBefore);
 
+			this._dashboardEmitter.emit('peer_unintentional_disconnect_after_connect', ipPort);
 			// When creating a node connection, it only gets added to this._nodeConnectionsConnected if the
 			// connection is both successfully made and successfully tested. _createConnectedNodeConnection()
 			// doesn't destroy the node connection if the connection is not completely tested and relies on this callback.
 			const wasConnectedAndTested = this._nodeConnectionsConnected.has(ipPortString);
 			// Remove this node from this._nodeConnectionsConnected so connected counters are accurate while this function
 			// is waiting for promises to resolve.
-			this._nodeConnectionsConnected.delete(ipPortString);
+			if (this._nodeConnectionsConnected.delete(ipPortString)) {
+				this._dashboardEmitter.emit('peer_disconnected', ipPort);
+			}
 
 			const internetConnectionCheckAbortController = new AbortController();
 			const combinedAbortControllers = combineAbortControllers(clientStopSignal, internetConnectionCheckAbortController.signal);
@@ -1005,10 +1077,13 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 						}
 					}
 					this._nodeConnectionsConnected.set(ipPortString, nodeConnection);
+					this._dashboardEmitter.emit('peer_connected', nodeConnection.getIpPort());
 					this._enableConsoleDebugLog && console.log('Successfully reconnected to node:', ipPort, performance.now() - startTimeMs, 'ms after disconnecting.');
 					if (this._nodeConnectionsConnected.size > TARGET_NUM_CONNECTIONS) {
 						this._enableConsoleDebugLog && console.log('Reconnected to node, but target connections exceeded, destroying reconnected to node:', ipPort);
 						this._destroyNodeConnection(nodeConnection);
+					} else {
+						this._dashboardEmitter.emit('peer_reconnected', nodeConnection.getIpPort());
 					}
 					return;
 				} catch (error) {
@@ -1251,9 +1326,14 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		this._enableConsoleDebugLog && console.log("#".repeat(60));
 	}
 
-	private _start = async (options: {
+	private _start = async ({
+		priorityIpPort,
+		progressCallback,
+		shouldEmitClientStart = false,
+	}: {
 		priorityIpPort?: IpPort;
 		progressCallback?: ProgressCallback;
+		shouldEmitClientStart?: boolean;
 	} = {}): Promise<void> => {
 		// Wait for an in-progress stop() to complete.
 		// This must be OUTSIDE the _startQueue chain to avoid
@@ -1273,11 +1353,23 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			}
 			const abortController = this._abortController;
 			this._enableConsoleDebugLog && console.log(unixTime3Decimal(), '- Starting connection monitor and opening databases.');
+			this._connectionMonitor.setOnProbeResult((prev: boolean | null, isConnected: boolean) => {
+				// Classify the probe result into one of four dashboard events. prev === null
+				// (first probe after start or dispose) collapses to the matching no-transition
+				// event so the dashboard gets a heartbeat row without a spurious transition.
+				const eventName = (prev === null || prev === isConnected)
+					? (isConnected ? 'connection_monitor_online_to_online' : 'connection_monitor_offline_to_offline')
+					: (isConnected ? 'connection_monitor_offline_to_online' : 'connection_monitor_online_to_offline');
+				this._dashboardEmitter.emit(eventName);
+			});
 			await this._connectionMonitor.start(abortController.signal);
 			await this._nodesDatabase.open();
 			await this._blockHeadersDatabase.open();
-			await this._connectToNodes({ ...options, clientStopSignal: abortController.signal });
+			await this._connectToNodes({ priorityIpPort, progressCallback, clientStopSignal: abortController.signal });
 			this._launchNodeConnectionsHealthMonitor(abortController.signal);
+			if (shouldEmitClientStart) {
+				this._dashboardEmitter.emit('client_start');
+			}
 		})()
 			.finally(() => {
 				this._startQueue = null;
@@ -1290,7 +1382,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	 * Connects to nodes and syncs to the longest chain.
 	 */
 	start = async (): Promise<void> => {
-		return this._start();
+		await this._start({ shouldEmitClientStart: true });
 	}
 
 	/**
@@ -1335,16 +1427,29 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	}
 
 	/**
-	 * Internal-only variant of getPeersInfoConnected that also returns per-node connection metrics.
-	 * Used by the API server (which is not part of the published library) to power the dashboard's
-	 * expandable peer rows. Accessed via `as any` casting so it is not part of the public library API.
-	 * @returns An array of connected node's IP, port, rating, and a snapshot of its connection metrics.
+	 * Internal-only variant of getPeersInfoConnected that also returns per-node connection metrics
+	 * and the node's live state. Used by the API server (which is not part of the published
+	 * library) to power the dashboard's expandable peer rows. Accessed via `as any` casting so it
+	 * is not part of the public library API.
+	 * @returns An array of connected node's IP, port, rating, historical metrics, and live state.
 	 */
-	private _getPeersInfoConnectedWithMetrics = (): {
+	private _getPeersInfoConnectedForDashboard = (): {
 		ip: string;
 		port: number;
 		rating: number;
 		metrics: NodeConnectionMetrics;
+		liveState: {
+			numPendingPongs: number;
+			syncingHeaders: boolean;
+			numSyncHeadersQueued: number;
+			tipHashHex: string;
+			wasConnected: boolean;
+			verackSent: boolean;
+			pendingConnect: boolean;
+			pendingGetHeaders: boolean;
+			pendingGetAddr: boolean;
+			connected: boolean;
+		};
 	}[] => {
 		const ratingToNode = new RedBlackMap<number, IpPort>(CompareNumbers);
 		const timeMs = Date.now();
@@ -1353,10 +1458,77 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			ratingToNode.set(this._nodesDatabase.getNodeRating(ipPort, timeMs)!, ipPort);
 		});
 		const ipPorts = Array.from(ratingToNode.valuesReversed());
-		return ipPorts.map(ipPort => ({
-			...ipPort,
-			rating: this._nodesDatabase.getNodeRating(ipPort, timeMs)!,
-			metrics: this._nodesDatabase.getNodeConnectionMetricsCopy(ipPort)!,
-		}));
+		return ipPorts.map(ipPort => {
+			const nodeConnection = this._nodeConnectionsConnected.get(ipPortToString(ipPort))!;
+			return {
+				...ipPort,
+				rating: this._nodesDatabase.getNodeRating(ipPort, timeMs)!,
+				metrics: this._nodesDatabase.getNodeConnectionMetricsCopy(ipPort)!,
+				liveState: {
+					numPendingPongs: nodeConnection.getNumPendingPongs(),
+					syncingHeaders: nodeConnection.isSyncingHeaders(),
+					numSyncHeadersQueued: nodeConnection.getNumSyncHeadersQueued(),
+					tipHashHex: nodeConnection.getTipHashHex(),
+					wasConnected: nodeConnection.wasConnected(),
+					verackSent: nodeConnection.isVerackSent(),
+					pendingConnect: nodeConnection.isPendingConnect(),
+					pendingGetHeaders: nodeConnection.isPendingGetHeaders(),
+					pendingGetAddr: nodeConnection.isPendingGetAddr(),
+					connected: nodeConnection.connected(),
+				},
+			};
+		});
+	}
+
+	/**
+	 * Internal-only snapshot of the discovered-node population summary used by the dashboard to
+	 * surface the candidate-pool size and the rating cutoff that contextualizes per-peer ratings.
+	 * Accessed via `as any` casting so it is not part of the public library API.
+	 * @returns Counts of total, non-blacklisted, and blacklisted nodes plus the blacklist threshold.
+	 */
+	private _getNodesSummaryForDashboard = (): {
+		numTotalNodes: number;
+		numNonBlacklistedNodes: number;
+		numBlacklistedNodes: number;
+		blacklistRatingThreshold: number;
+	} => {
+		const timeMs = Date.now();
+		const numTotalNodes = this._nodesDatabase.getNumNodes();
+		const numNonBlacklistedNodes = this._nodesDatabase.getNumNodesNonBlacklisted({ timeMs });
+		return {
+			numTotalNodes,
+			numNonBlacklistedNodes,
+			numBlacklistedNodes: numTotalNodes - numNonBlacklistedNodes,
+			blacklistRatingThreshold: this._nodesDatabase.getBlacklistedRatingThreshold(),
+		};
+	}
+
+	/**
+	 * Internal-only snapshot of the block-headers database state used by the dashboard to surface
+	 * branch counts, orphaned headers, invalid blocks, and chain-tip extension progress. Accessed
+	 * via `as any` casting so it is not part of the public library API.
+	 * @returns Counts of headers across branches, competing tips, invalid blocks, and chain-tip lag.
+	 */
+	private _getHeadersDatabaseInfoForDashboard = (): {
+		numLongestChainHeaders: number;
+		longestChainHeight: number;
+		numAllHeaders: number;
+		numOrphanedHeaders: number;
+		numCompetingTips: number;
+		invalidBlocks: string[];
+		timeSinceLastChainTipExtensionThisSessionMs: number | undefined;
+	} => {
+		const tip = this._blockHeadersDatabase.getHeaderTip();
+		const numLongestChainHeaders = this._blockHeadersDatabase.getNumLongestChainHeaders();
+		const numAllHeaders = this._blockHeadersDatabase.getNumAllHeaders();
+		return {
+			numLongestChainHeaders,
+			longestChainHeight: tip.height,
+			numAllHeaders,
+			numOrphanedHeaders: numAllHeaders - numLongestChainHeaders,
+			numCompetingTips: this._blockHeadersDatabase.getNumCompetingTips(),
+			invalidBlocks: this._blockHeadersDatabase.getInvalidBlocksArray(),
+			timeSinceLastChainTipExtensionThisSessionMs: this._blockHeadersDatabase.getTimeSinceLastChainTipExtensionThisSessionMs(),
+		};
 	}
 }
