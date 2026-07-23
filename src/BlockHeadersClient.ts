@@ -797,8 +797,8 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			const lastHashHex = hashes.at(-1)!.toString('hex');
 			this._dashboardEmitter.emit('peer_block_hashes_received', ipPort, lastHashHex);
 
-			if (this._blockHeadersDatabase.getHeaderTip().hashHex === lastHashHex) {
-				// Another node has already downloaded this header.
+			if (this._blockHeadersDatabase.getHeaderFromHashHex(lastHashHex)?.hashHex === lastHashHex) {
+				// Another node has already downloaded this header and added it to the database.
 				//this._enableConsoleDebugLog && console.log(ipPort, 'Skipping syncing headers for', lastHashHex, 'because another node already downloaded.');
 				return;
 			}

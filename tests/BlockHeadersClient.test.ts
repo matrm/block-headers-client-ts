@@ -1,14 +1,17 @@
 /// <reference types="node" />
 import { mkdir } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
 
 import { expect, test, describe, beforeEach, afterEach, vi } from 'vitest';
 import { removeDirectoryWithRetries, createDbWithRetries } from './testUtils';
 
+import { BlockHeaderMutable } from '../src/BlockHeader.js';
 import { BlockHeadersClient } from '../src/BlockHeadersClient.js';
 import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase.js';
 import { NodesDatabase } from '../src/NodesDatabase.js';
 import { Chain, getInvalidBlocks } from '../src/chainProtocol.js';
 import { getRandomHexString, ipPortToString } from '../src/utils/util.js';
+import { IpPort } from '../src/types.js';
 
 const chain: Chain = 'bsv';
 
@@ -457,6 +460,107 @@ describe('BlockHeadersClient queue recovery', () => {
 			expect(addSeedEnvSpy).toHaveBeenCalledTimes(1);
 			expect(addSeedApiSpy).toHaveBeenCalledTimes(1);
 			expect(clientAny._seedReAddPromise).toBeNull();
+		});
+	});
+
+	// Helper that creates a mock NodeConnection whose _tipHashHex is updated
+	// before block_hashes is emitted, mirroring LegacyNodeConnection's new behavior.
+	function createMockConnection(ipPort: IpPort, initialTipHex: string) {
+		const ipPortStr = ipPortToString(ipPort);
+		let tipHex = initialTipHex;
+		const conn = new EventEmitter() as any;
+		conn.getIpPort = () => ipPort;
+		conn.getIpPortString = () => ipPortStr;
+		conn.getTipHashHex = () => tipHex;
+		conn.removeAllListeners = vi.fn();
+		conn.syncHeaders = vi.fn().mockResolvedValue(undefined);
+		// Simulate LegacyNodeConnection: update _tipHashHex before emitting.
+		conn.emitBlockHashes = (hashes: Buffer[]) => {
+			tipHex = hashes.at(-1)!.toString('hex');
+			conn.emit('block_hashes', hashes);
+		};
+		return conn;
+	}
+
+	describe('block_hashes handler tipHashHex staleness', () => {
+		test('when lastHashHex matches DB tip, _tipHashHex is updated before the event so the out-of-sync detector does not trip', () => {
+			const clientAny = client as any;
+			const genesisHashHex = headersDb.getHeaderFromHeight(0)!.hashHex;
+
+			const block1Hex = '010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000982051fd1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e61bc6649ffff001d01e36299';
+			const block1 = BlockHeaderMutable.fromHex(block1Hex);
+			headersDb.addHeaders([block1]);
+			const dbTipHashHex = headersDb.getHeaderTip().hashHex;
+			expect(dbTipHashHex).not.toBe(genesisHashHex);
+
+			const mockConn = createMockConnection({ ip: '1.1.1.1', port: 8333 }, genesisHashHex);
+
+			const signal = new AbortController().signal;
+			clientAny._setupNodeConnectionCallbacks(mockConn, signal);
+
+			const dbTipHashBuffer = Buffer.from(dbTipHashHex, 'hex');
+			mockConn.emitBlockHashes([dbTipHashBuffer]);
+
+			expect(mockConn.syncHeaders).not.toHaveBeenCalled();
+			expect(mockConn.getTipHashHex()).toBe(dbTipHashHex);
+		});
+
+		test('when lastHashHex is in the DB but not the chain tip, _tipHashHex is still updated', () => {
+			const clientAny = client as any;
+			const genesisHashHex = headersDb.getHeaderFromHeight(0)!.hashHex;
+
+			const block1Hex = '010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000982051fd1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e61bc6649ffff001d01e36299';
+			const block2Hex = '010000004860eb18bf1b1620e37e9490fc8a427514416fd75159ab86688e9a8300000000d5fdcc541e25de1c7a5addedf24858b8bb665c9f36ef744ee42c316022c90f9bb0bc6649ffff001d08d2bd61';
+			const block1 = BlockHeaderMutable.fromHex(block1Hex);
+			const block2 = BlockHeaderMutable.fromHex(block2Hex);
+			headersDb.addHeaders([block1, block2]);
+			const dbTipHashHex = headersDb.getHeaderTip().hashHex;
+			const block1HashHex = block1.hashHex;
+			expect(block1HashHex).not.toBe(dbTipHashHex);
+
+			const mockConn = createMockConnection({ ip: '2.2.2.2', port: 8333 }, genesisHashHex);
+
+			const signal = new AbortController().signal;
+			clientAny._setupNodeConnectionCallbacks(mockConn, signal);
+
+			const block1HashBuffer = Buffer.from(block1HashHex, 'hex');
+			mockConn.emitBlockHashes([block1HashBuffer]);
+
+			expect(mockConn.syncHeaders).not.toHaveBeenCalled();
+			expect(mockConn.getTipHashHex()).toBe(block1HashHex);
+		});
+
+		test('_tipHashHex is correct when dashboard reads it during peer_block_hashes_received', () => {
+			const clientAny = client as any;
+			const genesisHashHex = headersDb.getHeaderFromHeight(0)!.hashHex;
+
+			const block1Hex = '010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000982051fd1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e61bc6649ffff001d01e36299';
+			const block1 = BlockHeaderMutable.fromHex(block1Hex);
+			const block1HashHex = block1.hashHex;
+
+			const mockConn = createMockConnection({ ip: '3.3.3.3', port: 8333 }, genesisHashHex);
+
+			const signal = new AbortController().signal;
+			clientAny._setupNodeConnectionCallbacks(mockConn, signal);
+
+			// Listen to the dashboard emitter and verify that when it fires,
+			// getTipHashHex() already returns the new hash -- no race condition.
+			let dashboardTipAtEmit: string | undefined;
+			const onPeerBlockHashes = (ipPort: IpPort, lastHashHex: string) => {
+				if (ipPort.ip === '3.3.3.3') {
+					dashboardTipAtEmit = mockConn.getTipHashHex();
+				}
+			};
+			clientAny._dashboardEmitter.on('peer_block_hashes_received', onPeerBlockHashes);
+
+			const block1HashBuffer = Buffer.from(block1HashHex, 'hex');
+			mockConn.emitBlockHashes([block1HashBuffer]);
+
+			expect(mockConn.syncHeaders).toHaveBeenCalledTimes(1);
+			expect(mockConn.getTipHashHex()).toBe(block1HashHex);
+			expect(dashboardTipAtEmit).toBe(block1HashHex);
+
+			clientAny._dashboardEmitter.off('peer_block_hashes_received', onPeerBlockHashes);
 		});
 	});
 });

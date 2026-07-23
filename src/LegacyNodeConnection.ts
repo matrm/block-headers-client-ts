@@ -292,6 +292,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 			try {
 				const blockHashes = parseInvPayload(payload);
 				if (blockHashes.length > 0) {
+					this._tipHashHex = blockHashes.at(-1)!.toString('hex');
 					this.emit('block_hashes', blockHashes);
 				}
 			} catch (error) {
