@@ -118,56 +118,13 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 		return this._defaultGetAddrTimeoutMs;
 	}
 
-	// --- Live-state readers (read-only primitive snapshots for dashboard monitoring) ---
-	// These expose the per-instance in-flight RPC / handshake state without leaking references
-	// to internal Maps/Promises. Used by BlockHeadersClient's dashboard-only methods.
-
-	/**
-	 * The number of pings currently awaiting a pong response from this node.
-	 */
-	getNumPendingPongs = (): number => this._pendingPongs.size;
-
-	/**
-	 * Whether syncHeaders() is currently executing on this connection.
-	 */
-	isSyncingHeaders = (): boolean => this._syncingHeaders;
-
-	/**
-	 * The number of queued syncHeaders calls (capped internally at 2).
-	 */
-	getNumSyncHeadersQueued = (): number => this._numSyncHeadersQueued;
+	// --- Live-state reader (read-only snapshot for dashboard monitoring) ---
 
 	/**
 	 * The last known chain-tip hash hex this node has reported while syncing.
 	 * Compared against the global chain tip to detect out-of-sync peers.
 	 */
 	getTipHashHex = (): string => this._tipHashHex;
-
-	/**
-	 * Whether connect() has ever fully completed for this connection.
-	 * Used to classify disconnects as before-connect vs after-connect.
-	 */
-	wasConnected = (): boolean => this._wasConnected;
-
-	/**
-	 * Whether a verack has been sent to this node (part of the P2P handshake).
-	 */
-	isVerackSent = (): boolean => this._verackSent;
-
-	/**
-	 * Whether this connection is currently inside the connect() handshake.
-	 */
-	isPendingConnect = (): boolean => this._pendingConnect !== null;
-
-	/**
-	 * Whether a getheaders request is currently awaiting a response.
-	 */
-	isPendingGetHeaders = (): boolean => this._pendingGetHeaders !== null;
-
-	/**
-	 * Whether a getaddr request is currently awaiting a response.
-	 */
-	isPendingGetAddr = (): boolean => this._pendingGetAddr !== null;
 
 	private _setPingInterval = (): void => {
 		if (this._pingIntervalId !== null) {

@@ -74,22 +74,13 @@ describe('peerRoutes', () => {
 		expect(mockClient.getPeersInfoConnected).not.toHaveBeenCalled();
 	});
 
-	test('admin + dashboard header → includes liveState with primitive fields', async () => {
+	test('admin + dashboard header → includes liveState with tipHashHex', async () => {
 		mockConfig.BYPASS_ADMIN_AUTH = true;
 		const mockPeers = [
 			{
 				ip: '1.2.3.4', port: 8333, rating: 0.5, metrics: { lastSeenTimeMs: 1 },
 				liveState: {
-					numPendingPongs: 0,
-					syncingHeaders: false,
-					numSyncHeadersQueued: 0,
 					tipHashHex: 'abc',
-					wasConnected: true,
-					verackSent: true,
-					pendingConnect: false,
-					pendingGetHeaders: false,
-					pendingGetAddr: false,
-					connected: true,
 				},
 			},
 		];
@@ -99,9 +90,6 @@ describe('peerRoutes', () => {
 		const data: any = await res.json();
 		expect(data).toEqual(mockPeers);
 		expect(data[0].liveState).toBeDefined();
-		expect(typeof data[0].liveState.numPendingPongs).toBe('number');
-		expect(typeof data[0].liveState.syncingHeaders).toBe('boolean');
-		expect(typeof data[0].liveState.pendingConnect).toBe('boolean');
 		expect(typeof data[0].liveState.tipHashHex).toBe('string');
 	});
 
@@ -155,10 +143,7 @@ describe('peerRoutes', () => {
 			{
 				ip: '1.2.3.4', port: 8333, rating: 0.5, metrics: { lastSeenTimeMs: 1 },
 				liveState: {
-					numPendingPongs: 0, syncingHeaders: false, numSyncHeadersQueued: 0,
-					tipHashHex: 'abc', wasConnected: true, verackSent: true,
-					pendingConnect: false, pendingGetHeaders: false, pendingGetAddr: false,
-					connected: true,
+					tipHashHex: 'abc',
 				},
 			},
 		];

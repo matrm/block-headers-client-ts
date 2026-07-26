@@ -1430,13 +1430,6 @@
 			}
 			if (liveState) {
 				html += '<div class="metric-section"><div class="metric-section-title">State</div>';
-				html += metricRow('Verack Sent', liveState.verackSent ? 'yes' : 'no');
-				html += metricRow('Pending Connect', liveState.pendingConnect ? 'yes' : 'no');
-				html += metricRow('Pending GetHeaders', liveState.pendingGetHeaders ? 'yes' : 'no');
-				html += metricRow('Pending GetAddr', liveState.pendingGetAddr ? 'yes' : 'no');
-				html += metricRow('Syncing Headers', liveState.syncingHeaders ? 'yes' : 'no');
-				html += metricRow('Sync Headers Queued', liveState.numSyncHeadersQueued);
-				html += metricRow('Pending Pongs', liveState.numPendingPongs);
 				html += '<div class="metric-row"><span class="metric-label">Node Tip Hash:</span> <span class="metric-value" data-field="tipHash" style="font-family:\'SF Mono\',monospace;font-size:.72rem;word-break:break-all;">' + (liveState.tipHashHex || '-') + '</span></div>';
 				html += '</div>';
 			}

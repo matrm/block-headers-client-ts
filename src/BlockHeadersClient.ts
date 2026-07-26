@@ -1439,16 +1439,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		rating: number;
 		metrics: NodeConnectionMetrics;
 		liveState: {
-			numPendingPongs: number;
-			syncingHeaders: boolean;
-			numSyncHeadersQueued: number;
 			tipHashHex: string;
-			wasConnected: boolean;
-			verackSent: boolean;
-			pendingConnect: boolean;
-			pendingGetHeaders: boolean;
-			pendingGetAddr: boolean;
-			connected: boolean;
 		};
 	}[] => {
 		const ratingToNode = new RedBlackMap<number, IpPort>(CompareNumbers);
@@ -1465,16 +1456,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				rating: this._nodesDatabase.getNodeRating(ipPort, timeMs)!,
 				metrics: this._nodesDatabase.getNodeConnectionMetricsCopy(ipPort)!,
 				liveState: {
-					numPendingPongs: nodeConnection.getNumPendingPongs(),
-					syncingHeaders: nodeConnection.isSyncingHeaders(),
-					numSyncHeadersQueued: nodeConnection.getNumSyncHeadersQueued(),
 					tipHashHex: nodeConnection.getTipHashHex(),
-					wasConnected: nodeConnection.wasConnected(),
-					verackSent: nodeConnection.isVerackSent(),
-					pendingConnect: nodeConnection.isPendingConnect(),
-					pendingGetHeaders: nodeConnection.isPendingGetHeaders(),
-					pendingGetAddr: nodeConnection.isPendingGetAddr(),
-					connected: nodeConnection.connected(),
 				},
 			};
 		});
