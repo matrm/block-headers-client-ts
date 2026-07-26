@@ -764,7 +764,18 @@
 		let wsAdmin = BYPASS_ADMIN_AUTH;
 		let verifyDebounceTimer = null;
 		let _lastPeersData = null;
+		let _lastHeadersDbInfo = null;
+		let _lastMemoryUsage = null;
 		let _eventLog = [];
+
+		let _throttleTimers = {};
+		function throttledCall(key, fn, minIntervalMs) {
+			if (_throttleTimers[key]) return;
+			fn();
+			_throttleTimers[key] = setTimeout(function () {
+				_throttleTimers[key] = null;
+			}, minIntervalMs);
+		}
 		const EVENT_LOG_MAX = 50000;
 		const EVENT_LOG_DISPLAY_MAX = 50;
 
@@ -1141,9 +1152,9 @@
 				setStatusBadge(CLIENT_STATUS_RUNNING);
 				dispatchStatusUpdate();
 				renderEventLog();
-				fetchMemoryUsage();
-				refreshPeers();
-				fetchHeadersDbInfo();
+				throttledCall('memory', fetchMemoryUsage, 2000);
+				throttledCall('peers', refreshPeers, 2000);
+				throttledCall('headers', fetchHeadersDbInfo, 2000);
 				return;
 			}
 
@@ -1173,11 +1184,13 @@
 					setStatusBadge(CLIENT_STATUS_RUNNING);
 					dispatchStatusUpdate();
 					fetchMemoryUsage();
+					fetchHeadersDbInfo();
 				}
 				if (ev.name === 'client_stop') {
 					setStatusBadge(CLIENT_STATUS_STOPPED);
 					dispatchStatusUpdate();
 					fetchMemoryUsage();
+					fetchHeadersDbInfo();
 				}
 			}
 
@@ -1309,7 +1322,12 @@
 
 		function renderHeadersDbInfo(info) {
 			const el = document.getElementById('headers-db-info');
-			if (!info) { el.innerHTML = '<div class="empty">Waiting for data...</div>'; return; }
+			if (!info) {
+				// Rate-limited responses return null; don't overwrite valid cached data.
+				if (!_lastHeadersDbInfo) { el.innerHTML = '<div class="empty">Waiting for data...</div>'; }
+				return;
+			}
+			_lastHeadersDbInfo = info;
 			let html = '';
 			html += '<div class="card-row"><span class="label">Longest chain headers</span><span class="value">' + info.numLongestChainHeaders + '</span></div>';
 			html += '<div class="card-row"><span class="label">All branches headers</span><span class="value">' + info.numAllHeaders + '</span></div>';
@@ -1345,7 +1363,12 @@
 
 		function renderMemoryUsage(data) {
 			const el = document.getElementById('memory-usage');
-			if (!data) { el.innerHTML = '<div class="empty">No data</div>'; return; }
+			if (!data) {
+				// Rate-limited responses return null; don't overwrite valid cached data.
+				if (!_lastMemoryUsage) { el.innerHTML = '<div class="empty">No data</div>'; }
+				return;
+			}
+			_lastMemoryUsage = data;
 			el.innerHTML =
 				'<div class="card-row"><span class="label">RSS</span><span class="value">' + data.rssMB.toFixed(3) + ' MB</span></div>' +
 				'<div class="card-row"><span class="label">Heap Total</span><span class="value">' + data.heapTotalMB.toFixed(3) + ' MB</span></div>' +
