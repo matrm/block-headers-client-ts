@@ -606,7 +606,299 @@ describe('BlockHeadersDatabase', () => {
 		expect(headersInvalidated.length).toBe(0);
 		expect(db.getHeaderTip().height).toBe(1);
 		expect(db.getHeaderTip().workTotal).toBe(genesisHeader.work + headersBeforeReorg[0].work);
-	})
+	});
+
+	describe('leaf hash set invariant', () => {
+		test('normal extension: chain tip is the only leaf after full sync', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const chain = buildChain(genesisHashHex, 5, 100);
+			db.addHeaders(chain);
+			const leavesSet = (db as any)._headersTreeLeafHashes as Set<string>;
+			expect(leavesSet.size).toBe(1);
+			expect(leavesSet.has(db.getHeaderTip().hashHex)).toBe(true);
+		});
+
+		test('two competing forks produce two leaf entries', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const mainChain = buildChain(genesisHashHex, 3, 100);
+			db.addHeaders(mainChain);
+
+			const forkParent = mainChain[0].hashHex;
+			const forkChain = buildChain(forkParent, 2, 200);// Same work per header, fork is shorter -> less total work.
+			db.addHeaders(forkChain);
+
+			const leavesSet = (db as any)._headersTreeLeafHashes as Set<string>;
+			expect(leavesSet.size).toBe(2);
+			expect(leavesSet.has(mainChain.at(-1)!.hashHex)).toBe(true);
+			expect(leavesSet.has(forkChain.at(-1)!.hashHex)).toBe(true);
+		});
+
+		test('fork point with 3 children: leaf set includes all 3 leaf tips', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const trunk = buildChain(genesisHashHex, 2, 100);
+			db.addHeaders(trunk);
+
+			const branchA = buildChain(trunk.at(-1)!.hashHex, 1, 200);
+			const branchB = buildChain(trunk.at(-1)!.hashHex, 1, 300);
+			const branchC = buildChain(trunk.at(-1)!.hashHex, 1, 400);
+			db.addHeaders(branchA);
+			db.addHeaders(branchB);
+			db.addHeaders(branchC);
+
+			const leavesSet = (db as any)._headersTreeLeafHashes as Set<string>;
+			expect(leavesSet.size).toBe(3);
+			expect(leavesSet.has(branchA.at(-1)!.hashHex)).toBe(true);
+			expect(leavesSet.has(branchB.at(-1)!.hashHex)).toBe(true);
+			expect(leavesSet.has(branchC.at(-1)!.hashHex)).toBe(true);
+
+			// The fork point should NOT be a leaf.
+			expect(leavesSet.has(trunk.at(-1)!.hashHex)).toBe(false);
+		});
+
+		test('pruneBranches collapses 3-fork back to single leaf', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const trunk = buildChain(genesisHashHex, 2, 100);
+			db.addHeaders(trunk);
+
+			const mainExtension = buildChain(trunk.at(-1)!.hashHex, 5, 100);
+			db.addHeaders(mainExtension);
+
+			const forkA = buildChain(trunk.at(-1)!.hashHex, 1, 200);
+			const forkB = buildChain(trunk.at(-1)!.hashHex, 1, 300);
+			db.addHeaders(forkA);
+			db.addHeaders(forkB);
+
+			const leavesSet = (db as any)._headersTreeLeafHashes as Set<string>;
+			expect(leavesSet.size).toBe(3);
+			expect(leavesSet.has(trunk.at(-1)!.hashHex)).toBe(false);
+
+			db.pruneBranches();
+
+			expect(leavesSet.size).toBe(1);
+			expect(leavesSet.has(db.getHeaderTip().hashHex)).toBe(true);
+			expect(leavesSet.has(mainExtension.at(-1)!.hashHex)).toBe(true);
+		});
+
+		test('pruneBranches restores leaf marker on a parent that lost all stale children', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const trunk = buildChain(genesisHashHex, 2, 100);
+			db.addHeaders(trunk);
+
+			const mainBranch = buildChain(trunk.at(-1)!.hashHex, 2, 100);
+			db.addHeaders(mainBranch);
+
+			const staleFork = buildChain(trunk.at(-1)!.hashHex, 1, 200);
+			db.addHeaders(staleFork);
+
+			const leavesSet = (db as any)._headersTreeLeafHashes as Set<string>;
+			expect(leavesSet.size).toBe(2);
+
+			db.pruneBranches();
+
+			expect(leavesSet.size).toBe(1);
+			expect(leavesSet.has(mainBranch.at(-1)!.hashHex)).toBe(true);
+
+			const headersTree = (db as any)._headersTree as Map<string, unknown>;
+			// The_parent of the pruned fork should not reappear in the leaf set (it still has mainBranch).
+			expect(leavesSet.has(trunk.at(-1)!.hashHex)).toBe(false);
+		});
+
+		test('Leaf-hash set survives removing and re-adding a child on a single-child parent', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const chain1 = buildChain(genesisHashHex, 2, 100);
+			db.addHeaders(chain1);
+
+			const leavesSet = (db as any)._headersTreeLeafHashes as Set<string>;
+			expect(leavesSet.size).toBe(1);
+			expect(leavesSet.has(chain1.at(-1)!.hashHex)).toBe(true);
+			expect(leavesSet.has(genesisHashHex)).toBe(false);
+		});
+
+		test('leafCount equals getNumCompetingTips after all operations', () => {
+			const genesisHashHex = db.getHeaderTip().hashHex;
+			const mainChain = buildChain(genesisHashHex, 3, 100);
+			db.addHeaders(mainChain);
+			expect(db.getNumCompetingTips()).toBe(1);
+
+			const forkA = buildChain(mainChain[1].hashHex, 2, 200);
+			db.addHeaders(forkA);
+			expect(db.getNumCompetingTips()).toBe(2);
+
+			const forkB = buildChain(mainChain[1].hashHex, 1, 300);
+			db.addHeaders(forkB);
+			expect(db.getNumCompetingTips()).toBe(3);
+
+			const forkC = buildChain(mainChain[0].hashHex, 1, 400);
+			db.addHeaders(forkC);
+			expect(db.getNumCompetingTips()).toBe(4);
+
+			db.pruneBranches();
+			expect(db.getNumCompetingTips()).toBe(1);
+		});
+	});
+
+	describe('_treeAddChild and _treeRemoveChild sentinel helpers', () => {
+		// Directly exercise the sentinel-state helpers to catch accidental
+		// regressions that the higher-level chain-extension tests might miss.
+
+		const helpers = (d: BlockHeadersDatabase) => ({
+			add: (d as any)._treeAddChild as (p: string, c: string) => void,
+			remove: (d as any)._treeRemoveChild as (p: string, c: string) => void,
+			tree: (d as any)._headersTree as Map<string, string | Set<string> | null>,
+			leaves: (d as any)._headersTreeLeafHashes as Set<string>,
+		});
+
+		// --- _treeRemoveChild on a string parent ---
+
+		test('removing a non-matching child from a string parent is a no-op', () => {
+			const { add, remove, tree, leaves } = helpers(db);
+			const parent = db.getHeaderTip().hashHex;
+			const child = createHeader(parent, 9000).hashHex;
+			add(parent, child);
+			expect(tree.get(parent)).toBe(child);// string
+			remove(parent, 'aaaa_not_a_real_child_bbbb');
+			expect(tree.get(parent)).toBe(child);// still a string, not demoted to null
+			expect(leaves.has(parent)).toBe(false);// parent still has its real child
+		});
+
+		test('removing the only child from a string parent demotes to leaf', () => {
+			const { add, remove, tree, leaves } = helpers(db);
+			const parent = db.getHeaderTip().hashHex;
+			const child = createHeader(parent, 9001).hashHex;
+			add(parent, child);
+			expect(tree.get(parent)).toBe(child);
+			remove(parent, child);
+			expect(tree.get(parent)).toBe(null);
+			expect(leaves.has(parent)).toBe(true);
+		});
+
+		test('removing a child from a string parent when that child is already missing is idempotent', () => {
+			const { add, remove, tree, leaves } = helpers(db);
+			const parent = db.getHeaderTip().hashHex;
+			const child = createHeader(parent, 9002).hashHex;
+			add(parent, child);
+			remove(parent, child);// first remove: demotes to null
+			remove(parent, 'another_fake_child');// second remove: null parent, should exit early
+			expect(tree.get(parent)).toBe(null);
+			expect(leaves.has(parent)).toBe(true);
+		});
+
+		// --- _treeRemoveChild on a Set parent ---
+
+		test('removing a non-matching child from a Set parent is a no-op', () => {
+			const { add, remove, tree } = helpers(db);
+			const parent = db.getHeaderTip().hashHex;
+			const c1 = createHeader(parent, 9100).hashHex;
+			const c2 = createHeader(parent, 9101).hashHex;
+			add(parent, c1);
+			add(parent, c2);
+			const entry = tree.get(parent);
+			expect(entry instanceof Set).toBe(true);
+			expect((entry as Set<string>).size).toBe(2);
+
+			remove(parent, 'not_a_child_oooo');
+			const after = tree.get(parent);
+			expect(after instanceof Set).toBe(true);
+			expect((after as Set<string>).size).toBe(2);
+		});
+
+		test('Set demotes to string when penultimate child is removed', () => {
+			const { add, remove, tree } = helpers(db);
+			const parent = db.getHeaderTip().hashHex;
+			const c1 = createHeader(parent, 9200).hashHex;
+			const c2 = createHeader(parent, 9201).hashHex;
+			add(parent, c1);
+			add(parent, c2);
+			expect(tree.get(parent) instanceof Set).toBe(true);
+
+			remove(parent, c1);
+			expect(tree.get(parent)).toBe(c2);// demoted to string, not a Set
+		});
+
+		test('Set with 3 children stays a Set after removing one child', () => {
+			const { add, remove, tree } = helpers(db);
+			const parent = db.getHeaderTip().hashHex;
+			const c1 = createHeader(parent, 9300).hashHex;
+			const c2 = createHeader(parent, 9301).hashHex;
+			const c3 = createHeader(parent, 9302).hashHex;
+			add(parent, c1);
+			add(parent, c2);
+			add(parent, c3);
+			expect((tree.get(parent) as Set<string>).size).toBe(3);
+
+			remove(parent, c1);
+			const after = tree.get(parent) as Set<string>;
+			expect(after.size).toBe(2);
+			expect(after.has(c2)).toBe(true);
+			expect(after.has(c3)).toBe(true);
+		});
+
+		// --- _treeRemoveChild on undefined / null parent ---
+
+		test('removing from a parent not in the tree (undefined) is a no-op', () => {
+			const { remove, tree, leaves } = helpers(db);
+			const fakeParent = 'bbbb000000000000000000000000000000000000000000000000000000000000';
+			remove(fakeParent, 'any_child');
+			expect(tree.get(fakeParent)).toBeUndefined();
+			expect(leaves.has(fakeParent)).toBe(false);
+		});
+
+		test('removing from a null (leaf) parent is a no-op', () => {
+			const { add, remove, tree, leaves } = helpers(db);
+			const parent = db.getHeaderTip().hashHex;
+			const child = createHeader(parent, 9400).hashHex;
+			add(parent, child);
+			remove(parent, child);// parent is now null (leaf)
+			expect(tree.get(parent)).toBe(null);
+			expect(leaves.has(parent)).toBe(true);
+
+			// Try to remove again
+			remove(parent, child);
+			expect(tree.get(parent)).toBe(null);
+			expect(leaves.has(parent)).toBe(true);
+		});
+
+		// --- _treeAddChild duplicate guard ---
+
+		test('adding a duplicate child to a string parent is a no-op', () => {
+			const { add, tree } = helpers(db);
+			const parent = db.getHeaderTip().hashHex;
+			const child = createHeader(parent, 9500).hashHex;
+			add(parent, child);
+			expect(tree.get(parent)).toBe(child);// string
+			add(parent, child);// duplicate
+			expect(tree.get(parent)).toBe(child);// still a string, not promoted to Set
+		});
+
+		test('adding a duplicate child to a Set parent is a no-op', () => {
+			const { add, tree } = helpers(db);
+			const parent = db.getHeaderTip().hashHex;
+			const c1 = createHeader(parent, 9600).hashHex;
+			const c2 = createHeader(parent, 9601).hashHex;
+			add(parent, c1);
+			add(parent, c2);
+			expect((tree.get(parent) as Set<string>).size).toBe(2);
+			add(parent, c1);// duplicate
+			expect((tree.get(parent) as Set<string>).size).toBe(2);
+		});
+
+		// --- _treeAddChild null → string promotion ---
+
+		test('adding a child to a leaf (null) parent promotes to string', () => {
+			const { add, remove, tree, leaves } = helpers(db);
+			const parent = db.getHeaderTip().hashHex;
+			const child = createHeader(parent, 9700).hashHex;
+			add(parent, child);
+			remove(parent, child);// parent back to null (leaf)
+			expect(tree.get(parent)).toBe(null);
+			expect(leaves.has(parent)).toBe(true);
+
+			const child2 = createHeader(parent, 9701).hashHex;
+			add(parent, child2);
+			expect(tree.get(parent)).toBe(child2);// promoted to string
+			expect(leaves.has(parent)).toBe(false);
+		});
+	});
 
 	describe('chain tip emit invariant', () => {
 		// The _syncHeaders loop emits new_chain_tip with headers.at(-1).hashHex.

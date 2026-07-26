@@ -37,8 +37,15 @@ const createLevelDbBatchArray = (removed: BlockHeaderMutable[], added: BlockHead
 export class BlockHeadersDatabase {
 	private readonly _invalidBlocks: Set<string> = new Set();
 	private _allHeaders: Map<string, BlockHeaderMutable>;
-	private _headersTree: Map<string, Set<string>>;// Computed tree of header hex hashes.
-	private _headersTreeLeafHashes: Set<string>;// Keys of _headersTree that map to an empty set.
+	// Computed tree of header hex hashes. Values use a sentinel scheme:
+	// - `undefined`: key is not in the map (broken chain / unknown parent).
+	// - `null`: key is a leaf (zero recorded children); also tracked in `_headersTreeLeafHashes`.
+	// - `string`: key has exactly one child (the overwhelmingly common case in production
+	//   data where each header has exactly one descendant). Stores the single child's hashHex.
+	// - `Set<string>`: key has two or more children (a fork point). When the Set collapses back to
+	//   one element it is demoted to a string to recover Set object overhead.
+	private _headersTree: Map<string, string | Set<string> | null>;
+	private _headersTreeLeafHashes: Set<string>;// Keys of _headersTree that map to `null` (zero children).
 	private _sortedHeaders: BlockHeaderMutable[] = [];// Longest chain of headers.
 	private _sortedHeadersIndex: Map<string, number> = new Map();
 	private _levelDbHeaders: LevelDbHeaders;
@@ -47,11 +54,51 @@ export class BlockHeadersDatabase {
 	private _lastTimeChainTipExtendedMs: number | undefined;
 	private readonly _enableConsoleDebugLog: boolean;
 
+	// Helpers for controlling the _headersTree.
+	// All non-leaf entries store at least one child hash; leaves are tracked separately in _headersTreeLeafHashes.
+	private _treeAddChild = (parentHashHex: string, childHashHex: string): void => {
+		const existing = this._headersTree.get(parentHashHex);
+		if (existing === undefined || existing === null) {
+			// Parent had zero recorded children until now (it was a leaf, or not yet in the tree).
+			// Store the single child directly as a string.
+			this._headersTree.set(parentHashHex, childHashHex);
+			this._headersTreeLeafHashes.delete(parentHashHex);
+			return;
+		}
+		if (typeof existing === 'string') {
+			// Promote single-child string to a Set when a second child arrives.
+			if (existing !== childHashHex) {
+				this._headersTree.set(parentHashHex, new Set<string>([existing, childHashHex]));
+			}
+			return;
+		}
+		existing.add(childHashHex);
+	};
+
+	private _treeRemoveChild = (parentHashHex: string, childHashHex: string): void => {
+		const existing = this._headersTree.get(parentHashHex);
+		if (existing === undefined || existing === null) return;
+		if (typeof existing === 'string') {
+			if (existing === childHashHex) {
+				// Demote single-child string back to a leaf marker.
+				this._headersTree.set(parentHashHex, null);
+				this._headersTreeLeafHashes.add(parentHashHex);
+			}
+			return;
+		}
+		existing.delete(childHashHex);
+		// If Set collapses back to 1 element, demote to string to recover Set overhead.
+		if (existing.size === 1) {
+			const remaining = existing.values().next().value as string;
+			this._headersTree.set(parentHashHex, remaining);
+		}
+	};
+
 	private constructor({ databasePath, invalidBlocks, headers, headersTree, headersTreeLeafHashes, sortedHeaders, sortedHeadersIndex, enableConsoleDebugLog }: {
 		databasePath: string;
 		invalidBlocks: Set<string>;
 		headers?: Map<string, BlockHeaderMutable>;
-		headersTree?: Map<string, Set<string>>;
+		headersTree?: Map<string, string | Set<string> | null>;
 		headersTreeLeafHashes?: Set<string>;
 		sortedHeaders?: BlockHeaderMutable[];
 		sortedHeadersIndex?: Map<string, number>;
@@ -66,7 +113,7 @@ export class BlockHeadersDatabase {
 			[genesisHeader.hashHex, genesisHeader]// Genesis block.
 		]);
 		this._headersTree = headersTree || new Map([
-			[genesisHeader.hashHex, new Set<string>()]
+			[genesisHeader.hashHex, null]// Genesis initially has zero children (tracked as a leaf).
 		]);
 		this._headersTreeLeafHashes = headersTreeLeafHashes || new Set([genesisHeader.hashHex]);
 		this._sortedHeaders = sortedHeaders || [this._allHeaders.get(genesisHeader.hashHex) as BlockHeaderMutable];
@@ -187,8 +234,9 @@ export class BlockHeadersDatabase {
 				// Broken chain.
 				break;// Still use all processed headers so far.
 			}
-			const prevHeaderChildren = this._headersTree.get(prevHeader.hashHex);
-			if (!prevHeaderChildren) {
+			// `undefined` means parent isn't in the tree at all (broken chain).
+			// `null` is a valid leaf marker: parent has zero children recorded.
+			if (this._headersTree.get(prevHeader.hashHex) === undefined) {
 				// Broken chain.
 				break;// Still use all processed headers so far.
 			}
@@ -210,9 +258,9 @@ export class BlockHeadersDatabase {
 			}
 
 			this._allHeaders.set(header.hashHex, header);
-			prevHeaderChildren.add(header.hashHex);
-			this._headersTreeLeafHashes.delete(prevHeader.hashHex);
-			this._headersTree.set(header.hashHex, new Set());
+			this._treeAddChild(prevHeader.hashHex, header.hashHex);
+			// New header starts as a leaf with zero children (`null` marker).
+			this._headersTree.set(header.hashHex, null);
 			this._headersTreeLeafHashes.add(header.hashHex);
 
 			(header as BlockHeaderMutable).setHeight(prevHeader.height + 1);
@@ -326,10 +374,11 @@ export class BlockHeadersDatabase {
 			assert(!this._sortedHeadersIndex.has(divergenceHeaderHash));
 			assert(this._sortedHeadersIndex.has(divergenceParentHeaderHash));
 			const children = this._headersTree.get(divergenceParentHeaderHash);
-			assert(children);
-			assert(children!.size);
-			children!.delete(divergenceHeaderHash);
-
+			// At a divergence parent there must be at least the one stale child being removed; the
+			// main-chain child remains. Asserting the parent is currently non-leaf (not undefined/null).
+			assert(children !== undefined);
+			assert(children !== null);
+			this._treeRemoveChild(divergenceParentHeaderHash, divergenceHeaderHash);
 		}
 		staleHeaderHashes.forEach(hashHex => {
 			this._allHeaders.delete(hashHex);
