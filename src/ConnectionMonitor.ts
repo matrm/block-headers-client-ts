@@ -2,7 +2,7 @@ import { abortableSleepMsThrow } from "./utils/util.js";
 import { assert, unixTime3Decimal, combineAbortControllers } from "./utils/util.js";
 
 export const DEFAULT_timeoutMs = 10000;
-export const DEFAULT_intervalMs = DEFAULT_timeoutMs * 2;
+export const DEFAULT_intervalMs = 60000;
 export const INIT_TIME_MS = performance.now();
 export const INIT_lastKnownConnectionTimeMs: number = Number.MIN_SAFE_INTEGER / 2;
 
@@ -46,6 +46,7 @@ export class ConnectionMonitor {
 	private _intervalId: NodeJS.Timeout | null = null;
 	private _intervalMs: number;
 	private _timeoutMs: number;
+	private _pingIntervalMs: number;
 	private readonly _enableConsoleDebugLog: boolean = false;
 	private _abortSignal: AbortSignal | null = null;
 	private _updateResolvers: Array<{ condition: () => boolean, resolver: () => void }> = [];
@@ -61,13 +62,20 @@ export class ConnectionMonitor {
 	private _lastReportedStatus: boolean | null = null;
 	private _onProbeResult: ((prev: boolean | null, isConnected: boolean) => void) | null = null;
 
-	constructor({ intervalMs, timeoutMs, enableConsoleDebugLog }: {
+	constructor({ intervalMs, timeoutMs, pingIntervalMs, enableConsoleDebugLog }: {
 		intervalMs?: number;
 		timeoutMs?: number;
+		pingIntervalMs?: number;
 		enableConsoleDebugLog?: boolean;
 	} = {}) {
 		this._intervalMs = intervalMs ?? DEFAULT_intervalMs;
 		this._timeoutMs = timeoutMs ?? DEFAULT_timeoutMs;
+		// Pings are the primary mechanism for keeping _lastKnownConnectionTimeMs fresh when
+		// peers go quiet. They must fire more often than the fallback-check's "recent data"
+		// skip window ((intervalMs - timeoutMs) * 0.9) so that a successful pong lands inside
+		// each window and suppresses the fallback. Derive the default from the configured
+		// interval/timeout so the invariant holds for any custom config.
+		this._pingIntervalMs = pingIntervalMs ?? Math.floor((this._intervalMs - this._timeoutMs) * 0.9 / 2);
 		this._enableConsoleDebugLog = !!enableConsoleDebugLog;
 
 		if (this._intervalMs <= 0) {
@@ -75,6 +83,9 @@ export class ConnectionMonitor {
 		}
 		if (this._intervalMs < this._timeoutMs) {
 			throw new Error('Interval must not be less than timeout');
+		}
+		if (this._pingIntervalMs <= 0) {
+			throw new Error('Ping interval must be greater than 0');
 		}
 	}
 
@@ -111,12 +122,16 @@ export class ConnectionMonitor {
 		this._lastReportedStatus = null;
 		this._abortSignal = signal;
 		this._intervalId = setInterval(this._intervalFunction, this._intervalMs);
-		// Allows the user to guarentee that this._lastKnownConnectionTimeMs has been set at least once.
-		await this._intervalFunction();
+		// No immediate probe here: the first interval tick fires at intervalMs, and
+		// _lastKnownConnectionTimeMs starts at INIT_lastKnownConnectionTimeMs so
+		// shouldSkipForRecentData() returns false until the first peer data arrives.
+		// Callers that need a fresh baseline (connectedToInternetCheapAsync) wait
+		// lazily on the next updateLastKnownConnectionTime() call rather than on a
+		// startup fetch. This avoids an unconditional fetch on every start().
 	}
 
 	private _intervalFunction = async (): Promise<void> => {
-		if (performance.now() - this._lastKnownConnectionTimeMs < (this._intervalMs - this._timeoutMs) * 0.9) {
+		if (this.shouldSkipForRecentData()) {
 			// Updated recently from updateLastKnownConnectionTime(). No need to check again until next interval.
 			return;
 		}
@@ -135,7 +150,7 @@ export class ConnectionMonitor {
 			}
 			this._enableConsoleDebugLog && console.log(unixTime3Decimal(), `- ${isConnected ? 'C' : 'Not c'}onnected to internet.`);
 			if (isConnected) {
-				this._lastKnownConnectionTimeMs = performance.now();
+				this.updateLastKnownConnectionTime();
 			}
 			if (this._onProbeResult) {
 				const prev = this._lastReportedStatus;
@@ -157,6 +172,21 @@ export class ConnectionMonitor {
 
 	getTimeoutMs = (): number => {
 		return this._timeoutMs;
+	}
+
+	getPingIntervalMs = (): number => {
+		return this._pingIntervalMs;
+	}
+
+	/**
+	 * Whether any updateLastKnownConnectionTime() call has arrived recently enough to
+	 * suppress the fallback check. This is the same condition _intervalFunction uses to
+	 * skip the fetch, exposed so callers (e.g. LegacyNodeConnection's ping scheduler) share
+	 * the definition of "recent peer data" with the fallback check rather than inventing
+	 * their own.
+	 */
+	shouldSkipForRecentData = (): boolean => {
+		return performance.now() - this._lastKnownConnectionTimeMs < (this._intervalMs - this._timeoutMs) * 0.9;
 	}
 
 	/**

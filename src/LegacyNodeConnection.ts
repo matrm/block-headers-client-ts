@@ -140,8 +140,8 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 			if (this._pingIntervalAbortController.signal.aborted) {
 				return;
 			}
-			if (this._connectionMonitor.getTimeSinceLastKnownConnectionMs() < 1000 &&
-				performance.now() - lastPingIntervalTimeMs < 10 * 60 * 1000) {// Still ping every 10 minutes to test connection.
+			if (this._connectionMonitor.shouldSkipForRecentData() &&
+				performance.now() - lastPingIntervalTimeMs < 30 * 60 * 1000) {// Still ping every 30 minutes to test connection.
 				// The main purpose of pinging is to update the last known connection time, so
 				// it isn't necessary to ping frequently if the last known connection time is recent enough.
 				return;
@@ -150,7 +150,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 				this._enableConsoleDebugLog && console.log('Failed to ping', this.getIpPort());
 			});
 			lastPingIntervalTimeMs = performance.now();
-		}, this._connectionMonitor.getIntervalMs());
+		}, this._connectionMonitor.getPingIntervalMs());
 	}
 
 	private _clearPingInterval = (): void => {

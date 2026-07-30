@@ -493,4 +493,179 @@ describe('LegacyNodeConnection', () => {
 			expect(c2r4).toBeUndefined();
 		});
 	});
+
+	describe('_setPingInterval (skip behavior)', () => {
+		let db: BlockHeadersDatabase;
+		let databasePath: string;
+		let connMonitor: ConnectionMonitor;
+
+		beforeEach(async () => {
+			vi.useFakeTimers();
+			databasePath = `tests/db/node-connection-ping-${getRandomHexString(16)}`;
+			await mkdir(databasePath, { recursive: true });
+			db = await createDbWithRetries(() => BlockHeadersDatabase.fromGenesis({
+				databasePath,
+				invalidBlocks: Array.from(getInvalidBlocks(chain))
+			}));
+			// Use a tight config so ping cadence under test is short.
+			// intervalMs=20000, timeoutMs=10000 -> skip window = 9000ms, derived ping = 4500ms.
+			connMonitor = new ConnectionMonitor({ intervalMs: 20000, timeoutMs: 10000 });
+		});
+
+		afterEach(async () => {
+			if (db) await db.close();
+			await removeDirectoryWithRetries(databasePath);
+			vi.useRealTimers();
+		});
+
+		// Helper: create a connection with `connected` mocked true and `ping` capturing calls.
+		// The `refreshOnPing` flag controls whether the mock ping calls updateLastKnownConnectionTime
+		// (default false so the cadence tests observe raw tick-by-tick pinging without the skip
+		// path suppressing them).
+		function makeConnectedConn(ip: string, refreshOnPing = false) {
+			const conn = new LegacyNodeConnection({
+				ip, port: 8333, chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+			// Override connected(): the real one checks _socket && !_pendingConnect; we bypass that.
+			(conn as any).connected = () => true;
+			(conn as any).ping = vi.fn(async () => {
+				if (refreshOnPing) connMonitor.updateLastKnownConnectionTime();
+				return 0;
+			});
+			return conn;
+		}
+
+		// Cleanup helper that bypasses [Symbol.dispose] (which would try to tear down a real
+		// socket we never created). Stops the ping timer and removes the static IP-dedup entry.
+		function teardownConn(conn: LegacyNodeConnection) {
+			(conn as any)._clearPingInterval();
+			(LegacyNodeConnection as any).existingNodeConnectionsStrings.delete(conn.getIpPortString());
+		}
+
+		test('first ping fires on the first pingIntervalMs tick, then on a fixed cadence', async () => {
+			// Derived pingIntervalMs for this config = floor((20000-10000)*0.9/2) = 4500ms.
+			// refreshOnPing=false so subsequent ticks aren't skipped by the recent-data rule.
+			const conn = makeConnectedConn('127.0.0.10');
+			(conn as any)._setPingInterval();
+
+			// setInterval does not fire on tick 0; the first ping is at the first pingIntervalMs mark.
+			expect((conn as any)._pingIntervalId).not.toBeNull();
+			expect((conn as any).ping).toHaveBeenCalledTimes(0);
+
+			await vi.advanceTimersByTimeAsync(4500);
+			expect((conn as any).ping).toHaveBeenCalledTimes(1);
+
+			await vi.advanceTimersByTimeAsync(4500);
+			expect((conn as any).ping).toHaveBeenCalledTimes(2);
+
+			await vi.advanceTimersByTimeAsync(4500);
+			expect((conn as any).ping).toHaveBeenCalledTimes(3);
+
+			teardownConn(conn);
+		});
+
+		test('ping tick is skipped when shouldSkipForRecentData() is true (recent peer data)', async () => {
+			// refreshOnPing=true so the first ping refreshes lastKnown; subsequent ticks within the
+			// skip window must suppress the ping.
+			const conn = makeConnectedConn('127.0.0.12', true);
+			(conn as any)._setPingInterval();
+
+			// First ping at the first tick (4500ms); the mock ping calls updateLastKnownConnectionTime
+			// -> shouldSkipForRecentData() becomes true for the next 9000ms (skip window).
+			await vi.advanceTimersByTimeAsync(4500);
+			expect((conn as any).ping).toHaveBeenCalledTimes(1);
+			expect(connMonitor.shouldSkipForRecentData()).toBe(true);
+
+			// Next pingIntervalMs (4500ms) tick: lastKnown is 4.5s old; skip window = 9s -> within
+			// window -> ping tick is skipped.
+			await vi.advanceTimersByTimeAsync(4500);
+			expect((conn as any).ping).toHaveBeenCalledTimes(1);
+			expect(connMonitor.shouldSkipForRecentData()).toBe(true);
+
+			teardownConn(conn);
+		});
+
+		test('30-minute floor still forces a ping even when shouldSkipForRecentData() is true', async () => {
+			// refreshOnPing=false so the skip path doesn't auto-trigger from pings themselves.
+			// We feed external updateLastKnownConnectionTime() calls to simulate other peer data
+			// arriving, keeping shouldSkipForRecentData() true across many ping ticks.
+			const conn = makeConnectedConn('127.0.0.13', false);
+			(conn as any)._setPingInterval();
+
+			const pingIntervalMs = connMonitor.getPingIntervalMs(); // 4500ms
+			// First ping fires at the first tick (4500ms) since lastPingIntervalTimeMs is INIT and
+			// shouldSkipForRecentData() is false (no peer data yet). Capture its time as the floor
+			// reference.
+			await vi.advanceTimersByTimeAsync(pingIntervalMs);
+			const firstPingTimeMs = performance.now();
+			expect((conn as any).ping).toHaveBeenCalledTimes(1);
+
+			const floorMs = 30 * 60 * 1000;
+			// Tick the ping interval, supplying fresh peer data each time, until JUST BEFORE the
+			// 30-minute floor would trigger on a tick. ticksBeforeFloor = ceil(1800000/4500) - 1 = 399.
+			// After 399 more ticks (1795500ms past firstPingTime), the next tick crosses the 1800000ms floor.
+			const ticksBeforeFloor = Math.ceil(floorMs / pingIntervalMs) - 1; // 399
+			for (let i = 0; i < ticksBeforeFloor; i++) {
+				connMonitor.updateLastKnownConnectionTime();
+				await vi.advanceTimersByTimeAsync(pingIntervalMs);
+			}
+			// State check: total elapsed since the initial ping is still < 30 min -> no floor yet.
+			expect(performance.now() - firstPingTimeMs).toBeLessThan(floorMs);
+			// Pings should still have been skipped across all those ticks (only the initial fired)
+			// because each external refresh keeps shouldSkipForRecentData() true.
+			expect((conn as any).ping).toHaveBeenCalledTimes(1);
+
+			// Now feed one more fresh update and advance one more tick: the floor forces a ping
+			// even though data is still recent.
+			connMonitor.updateLastKnownConnectionTime(); // data still recent
+			await vi.advanceTimersByTimeAsync(pingIntervalMs);
+			expect((conn as any).ping).toHaveBeenCalledTimes(2);
+
+			teardownConn(conn);
+		});
+
+		test('_clearPingInterval clears the interval id', async () => {
+			const conn = makeConnectedConn('127.0.0.14');
+			(conn as any)._setPingInterval();
+			expect((conn as any)._pingIntervalId).not.toBeNull();
+
+			(conn as any)._clearPingInterval();
+			expect((conn as any)._pingIntervalId).toBeNull();
+			// Advancing time past the would-be first tick fires nothing.
+			await vi.advanceTimersByTimeAsync(5000);
+			expect((conn as any).ping).toHaveBeenCalledTimes(0);
+
+			teardownConn(conn);
+		});
+
+		test('_setPingInterval is idempotent (no double-scheduling if already started)', () => {
+			const conn = makeConnectedConn('127.0.0.15');
+			(conn as any)._setPingInterval();
+			const intervalIdBefore = (conn as any)._pingIntervalId;
+			(conn as any)._setPingInterval(); // no-op
+			expect((conn as any)._pingIntervalId).toBe(intervalIdBefore);
+			teardownConn(conn);
+		});
+
+		test('ping tick is skipped when the node is not connected', async () => {
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.16',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+			(conn as any).connected = () => false;
+			(conn as any).ping = vi.fn(async () => 0);
+			(conn as any)._setPingInterval();
+
+			// Several ping intervals pass without a connected socket; no pings are sent.
+			await vi.advanceTimersByTimeAsync(connMonitor.getPingIntervalMs() * 3);
+			expect((conn as any).ping).toHaveBeenCalledTimes(0);
+
+			teardownConn(conn);
+		});
+	});
 });
