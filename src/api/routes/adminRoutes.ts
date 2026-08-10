@@ -36,7 +36,7 @@ export const createAdminRoutes = (client: BlockHeadersClient) => {
 		res.json(getMemoryUsageMB());
 	});
 
-	// GET /verify is the dashboard's admin-key probe: it returns 200 if the
+	// GET /verify is the dashboard's admin-key validation check: it returns 200 if the
 	// caller's x-admin-api-key header validates (or BYPASS_ADMIN_AUTH is true),
 	// and 403 otherwise. It carries no body: the dashboard reuses the same
 	// long-lived admin API key inside its encrypted WS subscribe frame.

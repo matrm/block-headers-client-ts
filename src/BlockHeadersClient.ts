@@ -64,9 +64,10 @@ interface DashboardEmitterEvents {
 	'client_start': [];
 	'client_stop': [];
 	// The four connection-monitor classifications cover both pieces of information: whether
-	// the fallback probe ran at all (every probe emits one of these four), and whether the
-	// status transitioned. Null previous status (first probe after start or dispose) is
-	// treated as the matching no-transition event (online_to_online or offline_to_offline).
+	// a connectivity check ran at all, and whether the status transitioned. Every reported
+	// result after the first emits one of these four events: the first report after start
+	// or dispose has prev === null, which emits nothing since there is no previous status
+	// to compare against.
 	'connection_monitor_online_to_online': [];
 	'connection_monitor_online_to_offline': [];
 	'connection_monitor_offline_to_online': [];
@@ -119,6 +120,16 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	// and it is the last part of a connection test so the tested node is most likely
 	// going to pass the test successfully.
 	private _nodesCurrentlyRunningGetAddr: number = 0;
+	// Whether the stuck-detection purge has already fired during the current _connectToNodes()
+	// run (each run resets the budget). The purge runs at most once per run so the
+	// client gracefully settles at fewer than TARGET_NUM_CONNECTIONS connections when the
+	// node pool is flooded with fake/unreachable nodes from hardcoded seeds,
+	// whatsonchain, and getAddr. After one wipe + re-seed, the pool is left to
+	// degrade naturally (failures accumulate blacklists) until workers run out of
+	// nodes. The budget does not apply while zero nodes are connected, since
+	// nothing is protected by the purge there and each wipe re-adds fresh seed
+	// candidates so the workers keep searching for nodes.
+	private _stuckDetectionPurgedThisStart: boolean = false;
 	private constructor({ chain, nodesDatabase, blockHeadersDatabase, seedNodes, enableConsoleDebugLog }: {
 		chain: Chain;
 		nodesDatabase: NodesDatabase;
@@ -320,6 +331,50 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		nodeConnection[Symbol.dispose]();
 	}
 
+	// Last ping time per connected node, used by _pingHandler to ping the node that has
+	// been pinged least recently. Kept small by pruning entries for disconnected nodes.
+	private readonly _lastPingTimesMs: Map<string, number> = new Map();
+
+	// Pings the connected node that has been pinged least recently and reports whether a
+	// pong was received (null when there are no connected nodes to ping). Used by the
+	// connection monitor as a fallback before fetching.
+	// The rotation spreads the pings across the connected nodes so that no single node
+	// receives every ping (on top of its own scheduled pings) and gets rate limited.
+	// A node can never be pinged by a check that its own disconnect triggered: every
+	// connectedToInternetCheapAsync caller removes the triggering node from
+	// _nodeConnectionsConnected synchronously before awaiting the check, and this handler
+	// only ever selects from the current map.
+	// Note: a ping that times out disconnects the node (see LegacyNodeConnection.ping),
+	// so concurrent pings are combined into a single in-flight ping.
+	private _pingHandler = async (timeoutMs: number, signal?: AbortSignal): Promise<boolean | null> => {
+		let bestConnection: NodeConnection | null = null;
+		let bestLastPingTime = Infinity;
+		for (const [ipPortString, connection] of this._nodeConnectionsConnected) {
+			const lastPingTime = this._lastPingTimesMs.get(ipPortString) ?? -Infinity;
+			if (lastPingTime < bestLastPingTime) {
+				bestLastPingTime = lastPingTime;
+				bestConnection = connection;
+			}
+		}
+		// Prune the entries for disconnected nodes so the map stays small; the entries
+		// for connected nodes are kept so the least-recently-pinged rotation continues.
+		for (const ipPortString of this._lastPingTimesMs.keys()) {
+			if (!this._nodeConnectionsConnected.has(ipPortString)) {
+				this._lastPingTimesMs.delete(ipPortString);
+			}
+		}
+		if (!bestConnection) {
+			return null;// No connected nodes to ping.
+		}
+		this._lastPingTimesMs.set(bestConnection.getIpPortString(), performance.now());
+		try {
+			await bestConnection.ping({ timeoutMs, signal });
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
 	private _createNodeConnection = (ipPort: IpPort, clientStopSignal: AbortSignal): NodeConnection => {
 		const ipPortString = ipPortToString(ipPort);
 
@@ -353,7 +408,10 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 
 		const timeoutController = new AbortController();
 		const timeoutId = setTimeout(() => timeoutController.abort(), 10000);
-		const combinedSignal = signal ? combineAbortControllers(signal, timeoutController.signal).signal : timeoutController.signal;
+		// A missing signal is replaced with a never-aborting signal so the controller is
+		// always disposable via `using`.
+		using combinedAbortController = combineAbortControllers(signal ?? new AbortController().signal, timeoutController.signal);
+		const combinedSignal = combinedAbortController.signal;
 
 		const peers = await fetch('https://api.whatsonchain.com/v1/bsv/main/peer/info', {
 			signal: combinedSignal
@@ -621,6 +679,15 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				//  - disableStuckDetection is true (e.g. health monitor)
 				//  - another worker is inside a getAddr() call (can take several minutes)
 				//  - a seed re-add is already in progress (_seedReAddPromise !== null)
+				//  - the purge has already fired during this _connectToNodes() run while at
+				//    least one node is connected. One wipe + re-seed is the recovery attempt
+				//    for a polluted database. If the pool is genuinely flooded with fake
+				//    nodes, repeatedly purging would churn the database forever, so the
+				//    client instead gracefully settles at fewer than TARGET_NUM_CONNECTIONS
+				//    connections. The once-per-run budget does not apply while zero nodes
+				//    are connected, since nothing is protected by the purge there and each
+				//    wipe re-adds fresh seed candidates so the workers keep searching for
+				//    nodes.
 				//
 				// The timer is reset by _lastConnectionProgressTime, which is updated
 				// on successful connection, getAddr start, stuck-detection purge,
@@ -631,6 +698,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				if (
 					connectedToInternetAndNotAborted &&
 					this._nodeConnectionsConnected.size < TARGET_NUM_CONNECTIONS &&
+					(!this._stuckDetectionPurgedThisStart || this._nodeConnectionsConnected.size === 0) &&
 					performance.now() - this._lastConnectionProgressTime > effectiveTimeoutMs &&
 					!this._seedReAddPromise &&
 					!disableStuckDetection &&
@@ -655,7 +723,8 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 						// Run getAddr on the currently connected nodes to fill up the database again.
 						// Race the getAddr calls and abort the rest after the first one completes.
 						const raceAbortController = new AbortController();
-						const combinedSignal = combineAbortControllers(clientStopSignal, raceAbortController.signal).signal;
+						using combinedAbortController = combineAbortControllers(clientStopSignal, raceAbortController.signal);
+						const combinedSignal = combinedAbortController.signal;
 						const getAddrPromises: Array<Promise<void>> = [];
 						for (const connectedNodeConnection of this._nodeConnectionsConnected.values()) {
 							const getAddrPromise = connectedNodeConnection.getAddr({ signal: combinedSignal })
@@ -686,6 +755,18 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 						// null assignment could be at the inner end of the async function it is chained to.
 						this._seedReAddPromise = null;
 					});
+					// Consume the once-per-run purge budget only after the purge body has
+					// launched (the block above is synchronous, so no other worker can fire
+					// another purge in the meantime). A throw in that synchronous launch part
+					// (e.g. the dashboard emit) leaves the budget available so the next timeout
+					// cycle can retry the recovery; a failure later inside the async seed re-add
+					// still consumes the budget because the wipe itself already happened.
+					// The budget only applies to purges fired with at least one node connected:
+					// a zero-node purge is the recovery loop for a poisoned database, so it
+					// leaves the budget intact for a later connected purge in the same run.
+					if (this._nodeConnectionsConnected.size > 0) {
+						this._stuckDetectionPurgedThisStart = true;
+					}
 				}
 
 				if (!connectedToInternetAndNotAborted) {
@@ -975,7 +1056,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			}
 
 			const internetConnectionCheckAbortController = new AbortController();
-			const combinedAbortControllers = combineAbortControllers(clientStopSignal, internetConnectionCheckAbortController.signal);
+			using combinedAbortControllers = combineAbortControllers(clientStopSignal, internetConnectionCheckAbortController.signal);
 			const internetConnectionCheckPromise = this._connectionMonitor.connectedToInternetCheapAsync(combinedAbortControllers.signal).catch(() => {
 				return false;
 			});
@@ -1247,12 +1328,21 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 
 		// Initialize the stuck-detection timer at the moment workers begin connecting.
 		this._lastConnectionProgressTime = performance.now();
+		// Each _connectToNodes() run gets one stuck-detection purge budget. The budget
+		// resets here (rather than on every worker retry), so within a single run a
+		// flooded pool is wiped at most once while any node is connected. Note that
+		// disconnect-triggered reconnections launch a fresh _connectToNodes() run, so
+		// each such run gets its own wipe.
+		this._stuckDetectionPurgedThisStart = false;
 
 		const timeBeforeMs = performance.now();
 		// For aborting when finished connecting to nodes.
 		const localAbortController = new AbortController();
 		// For aborting when finished connecting to nodes or when this.stop() is called.
-		const combinedAbortControllers = combineAbortControllers(clientStopSignal, localAbortController.signal);
+		// `using` detaches the abort listeners when the function exits (including when a
+		// worker throws), so the long-lived client stop signal does not accumulate one
+		// listener per _connectToNodes() call.
+		using combinedAbortControllers = combineAbortControllers(clientStopSignal, localAbortController.signal);
 
 		const onTargetReached = (workerId: number | string) => {
 			if (this._nodeConnectionsConnected.size >= TARGET_NUM_CONNECTIONS) {
@@ -1353,15 +1443,21 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			}
 			const abortController = this._abortController;
 			this._enableConsoleDebugLog && console.log(unixTime3Decimal(), '- Starting connection monitor and opening databases.');
-			this._connectionMonitor.setOnProbeResult((prev: boolean | null, isConnected: boolean) => {
-				// Classify the probe result into one of four dashboard events. prev === null
-				// (first probe after start or dispose) collapses to the matching no-transition
-				// event so the dashboard gets a heartbeat row without a spurious transition.
-				const eventName = (prev === null || prev === isConnected)
+			this._connectionMonitor.setOnCheckResult((prev: boolean | null, isConnected: boolean) => {
+				// The first report after start (or after a dispose) has prev === null:
+				// the status was unknown, so there is no transition to report and no prior
+				// status to compare against. Record it silently instead of emitting a
+				// spurious 'online, no change' heartbeat on every startup.
+				if (prev === null) {
+					return;
+				}
+				// Classify the check result into one of four dashboard events.
+				const eventName = (prev === isConnected)
 					? (isConnected ? 'connection_monitor_online_to_online' : 'connection_monitor_offline_to_offline')
 					: (isConnected ? 'connection_monitor_offline_to_online' : 'connection_monitor_online_to_offline');
 				this._dashboardEmitter.emit(eventName);
 			});
+			this._connectionMonitor.setPingHandler(this._pingHandler);
 			await this._connectionMonitor.start(abortController.signal);
 			await this._nodesDatabase.open();
 			await this._blockHeadersDatabase.open();

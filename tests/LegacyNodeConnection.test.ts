@@ -667,5 +667,21 @@ describe('LegacyNodeConnection', () => {
 
 			teardownConn(conn);
 		});
+
+		test('a failed ping tick does not stop the interval; subsequent ticks keep pinging', async () => {
+			const conn = makeConnectedConn('127.0.0.17');
+			(conn as any).ping = vi.fn().mockRejectedValue(new Error('Ping timed out'));
+			(conn as any)._setPingInterval();
+
+			// The first tick fails (e.g. a quiet-node timeout during an outage).
+			await vi.advanceTimersByTimeAsync(connMonitor.getPingIntervalMs());
+			expect((conn as any).ping).toHaveBeenCalledTimes(1);
+
+			// The catch in the tick keeps the interval alive: the next tick pings again.
+			await vi.advanceTimersByTimeAsync(connMonitor.getPingIntervalMs());
+			expect((conn as any).ping).toHaveBeenCalledTimes(2);
+
+			teardownConn(conn);
+		});
 	});
 });

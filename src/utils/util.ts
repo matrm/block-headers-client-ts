@@ -31,17 +31,23 @@ export const unixTimeMs3Decimal = () => Math.floor(Date.now() * 1000) / 1000;
 
 export const sleepMs = (delayMs: number) => new Promise((resolve) => setTimeout(resolve, delayMs));
 
-export const combineAbortControllers = (signal1: AbortSignal, signal2: AbortSignal): AbortController => {
+// A combined abort controller is Disposable: dispose it (via `using`, or a manual
+// [Symbol.dispose]() call where the operation's lifetime escapes a block) once the
+// operation using the combined signal settles, so long-lived source signals (e.g. a
+// client stop signal) don't accumulate one listener per short-lived operation.
+export type CombinedAbortController = AbortController & Disposable;
+
+export const combineAbortControllers = (signal1: AbortSignal, signal2: AbortSignal): CombinedAbortController => {
 	const controller = new AbortController();
 
 	// If a signal is already aborted, abort the new controller immediately.
 	if (signal1.aborted) {
 		controller.abort(signal1.reason);
-		return controller;
+		return Object.assign(controller, { [Symbol.dispose]: () => { /* No listeners attached. */ } });
 	}
 	if (signal2.aborted) {
 		controller.abort(signal2.reason);
-		return controller;
+		return Object.assign(controller, { [Symbol.dispose]: () => { /* No listeners attached. */ } });
 	}
 
 	const onAbort = () => {
@@ -53,7 +59,12 @@ export const combineAbortControllers = (signal1: AbortSignal, signal2: AbortSign
 	signal1.addEventListener('abort', onAbort);
 	signal2.addEventListener('abort', onAbort);
 
-	return controller;
+	return Object.assign(controller, {
+		[Symbol.dispose]: () => {
+			signal1.removeEventListener('abort', onAbort);
+			signal2.removeEventListener('abort', onAbort);
+		}
+	});
 }
 
 export const getMemoryUsageMB = (memoryUsage?: NodeJS.MemoryUsage) => {

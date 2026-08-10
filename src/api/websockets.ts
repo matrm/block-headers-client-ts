@@ -183,8 +183,10 @@ export const createWebSocketServer = (server: http.Server, client: BlockHeadersC
 		// 	listener: (ipPort: IpPort, timeMs: number) => queueDashboardEvent('peer_data_received', { ip: ipPort.ip, port: ipPort.port, timeMs }),
 		// },
 		// The four connection-monitor classifications cover both pieces of information: whether
-		// the fallback probe ran at all (every probe emits one of these four), and whether the
-		// status transitioned. No payload is carried because the event name encodes the status.
+		// a connectivity check ran at all, and whether the status transitioned. Every
+		// reported result after the first emits one of these four events (the first report
+		// after start or dispose has prev === null and emits nothing). No payload is carried
+		// because the event name encodes the status.
 		{ name: 'connection_monitor_online_to_online', adminOnly: true, listener: () => queueDashboardEvent('connection_monitor_online_to_online') },
 		{ name: 'connection_monitor_online_to_offline', adminOnly: false, listener: () => queueDashboardEvent('connection_monitor_online_to_offline') },
 		{ name: 'connection_monitor_offline_to_online', adminOnly: false, listener: () => queueDashboardEvent('connection_monitor_offline_to_online') },

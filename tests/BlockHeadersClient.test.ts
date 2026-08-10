@@ -461,6 +461,197 @@ describe('BlockHeadersClient queue recovery', () => {
 			expect(addSeedApiSpy).toHaveBeenCalledTimes(1);
 			expect(clientAny._seedReAddPromise).toBeNull();
 		});
+
+		// Creates a harness where every connection attempt fails and the stuck-detection
+		// path is reached (internet is up, timer is stale). Returns a runWorker() that
+		// simulates one failed connection run within the same _connectToNodes().
+		async function createStuckDetectionHarness({ workerId, withConnectedNode }: { workerId: string, withConnectedNode: boolean }) {
+			const clientAny = client as any;
+			const fakeNode = { ip: '1.2.3.4', port: 8333 };
+			await nodesDb.addSeen(fakeNode, Date.now());
+
+			// Pretend the internet is up so the stuck path is reached instead of the offline sleep path.
+			clientAny._connectionMonitor.connectedToInternetCheapAsync = vi.fn().mockResolvedValue(true);
+
+			const deleteNodesSpy = vi.spyOn(nodesDb, 'deleteNodes');
+			vi.spyOn(clientAny, '_addSeedNodesFromEnvAndHardcoded').mockImplementation(() => { });
+			vi.spyOn(clientAny, '_addSeedNodesFromExternalApi').mockResolvedValue(new Set<string>());
+
+			const connectedNode = {
+				getIpPort: () => fakeNode,
+				getIpPortString: () => ipPortToString(fakeNode),
+				connect: vi.fn().mockRejectedValue(new Error('simulated connect failure')),
+				ping: vi.fn(),
+				onValidChain: vi.fn(),
+				syncHeaders: vi.fn(),
+				getAddr: vi.fn().mockResolvedValue([]),
+				removeAllListeners: vi.fn(),
+				on: vi.fn(),
+				[Symbol.dispose]: vi.fn(),
+			};
+			clientAny._createNodeConnection = vi.fn().mockImplementation((ipPort: { ip: string, port: number }) => {
+				const connection = withConnectedNode
+					? connectedNode
+					: {
+						getIpPort: () => ipPort,
+						getIpPortString: () => ipPortToString(ipPort),
+						connect: vi.fn().mockRejectedValue(new Error('simulated connect failure')),
+						ping: vi.fn(),
+						onValidChain: vi.fn(),
+						syncHeaders: vi.fn(),
+						getAddr: vi.fn(),
+						removeAllListeners: vi.fn(),
+						on: vi.fn(),
+						[Symbol.dispose]: vi.fn(),
+					};
+				clientAny._nodeConnections.set(ipPortToString(ipPort), connection);
+				return connection;
+			});
+			if (withConnectedNode) {
+				clientAny._nodeConnectionsConnected.set(ipPortToString(fakeNode), connectedNode);
+			}
+
+			const abort = new AbortController();
+			const runWorker = () => {
+				// Make the progress timer stale enough to satisfy the timeout for NUM_WORKERS workers.
+				clientAny._lastConnectionProgressTime = performance.now() - 100000;
+				// Simulate the disconnect callback destroying the failed connection between runs.
+				clientAny._nodeConnections.clear();
+				return clientAny._createConnectedNodeConnection({
+					prioritizeRating: true,
+					numTopNodesToRandomlySelect: 1,
+					alwaysGetAddr: false,
+					workerId,
+					numWorkers: 16,
+					signal: abort.signal,
+					clientStopSignal: abort.signal,
+					maxNumAttempts: 2,
+				});
+			};
+
+			return { clientAny, runWorker, deleteNodesSpy };
+		}
+
+		test('the purge fires only once per _connectToNodes() run while connections exist', async () => {
+			const { runWorker, deleteNodesSpy } = await createStuckDetectionHarness({ workerId: 'stuck-detection-once-per-start', withConnectedNode: true });
+
+			// First failing run within the same _connectToNodes(): the purge fires.
+			await runWorker();
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(1);
+
+			// Second failing run within the same _connectToNodes(): the purge is skipped so
+			// the client gracefully settles below the target connection count.
+			await runWorker();
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(1);
+		});
+
+		test('with zero connections the purge keeps firing across runs', async () => {
+			const { runWorker, deleteNodesSpy } = await createStuckDetectionHarness({ workerId: 'stuck-detection-zero-connections', withConnectedNode: false });
+
+			// With nothing connected, the database is the only hope of finding nodes, so the
+			// purge keeps running instead of settling.
+			await runWorker();
+			await runWorker();
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(2);
+		});
+
+		test('a zero-connection purge does not consume the once-per-run budget', async () => {
+			const { clientAny, runWorker, deleteNodesSpy } = await createStuckDetectionHarness({ workerId: 'stuck-detection-zero-connections-then-connected', withConnectedNode: false });
+
+			// With nothing connected, the purge fires without consuming the budget...
+			await runWorker();
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(1);
+			expect(clientAny._stuckDetectionPurgedThisStart).toBe(false);
+
+			// ...so when a node connects later in the same run and the pool stalls again,
+			// the first purge with at least one node connected is still allowed. It consumes
+			// the budget for the rest of the run.
+			const connectedNode = {
+				getIpPort: () => ({ ip: '1.2.3.4', port: 8333 }),
+				getIpPortString: () => ipPortToString({ ip: '1.2.3.4', port: 8333 }),
+				ping: vi.fn(),
+				getAddr: vi.fn().mockResolvedValue([]),
+				[Symbol.dispose]: vi.fn(),
+			};
+			clientAny._nodeConnectionsConnected.set(ipPortToString({ ip: '1.2.3.4', port: 8333 }), connectedNode);
+
+			await runWorker();
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(2);
+			expect(clientAny._stuckDetectionPurgedThisStart).toBe(true);
+
+			await runWorker();
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(2);
+		});
+
+		test('a purge aborted mid-way does not consume the once-per-run budget', async () => {
+			const { clientAny, runWorker, deleteNodesSpy } = await createStuckDetectionHarness({ workerId: 'stuck-detection-aborted-purge', withConnectedNode: true });
+
+			// A throwing dashboard listener aborts the purge body mid-way.
+			vi.spyOn(clientAny._dashboardEmitter, 'emit').mockImplementation(() => {
+				throw new Error('listener bug');
+			});
+
+			await expect(runWorker()).rejects.toThrow('listener bug');
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(1);
+			expect(clientAny._stuckDetectionPurgedThisStart).toBe(false);
+
+			// The budget is still available, so the next run retries the purge.
+			(clientAny._dashboardEmitter.emit as any).mockRestore();
+			await runWorker();
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(2);
+		});
+
+		test('the purge is skipped while another worker is inside getAddr()', async () => {
+			const { runWorker, deleteNodesSpy } = await createStuckDetectionHarness({ workerId: 'stuck-detection-getaddr-in-progress', withConnectedNode: false });
+			const clientAny = client as any;
+			// getAddr can take minutes, so an in-flight call blocks stuck detection entirely.
+			clientAny._nodesCurrentlyRunningGetAddr = 1;
+
+			await runWorker();
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(0);
+			expect(clientAny._stuckDetectionPurgedThisStart).toBe(false);
+		});
+
+		test('the purge is skipped while a seed re-add is in progress', async () => {
+			const { runWorker, deleteNodesSpy } = await createStuckDetectionHarness({ workerId: 'stuck-detection-seed-readd-in-progress', withConnectedNode: false });
+			const clientAny = client as any;
+			let releaseSeedReAdd!: () => void;
+			clientAny._seedReAddPromise = new Promise<void>((resolve) => { releaseSeedReAdd = resolve; });
+
+			const workerPromise = runWorker();
+			// The worker blocks on the seed re-add await before reaching node selection.
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(0);
+
+			releaseSeedReAdd();
+			await workerPromise;
+			// The purge was skipped even after the re-add completed because _seedReAddPromise
+			// stayed non-null through the worker's stuck-detection check.
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(0);
+		});
+
+		test('a failed internet check resets the progress timer so recovery does not purge immediately', async () => {
+			const { runWorker, deleteNodesSpy } = await createStuckDetectionHarness({ workerId: 'stuck-detection-offline-path', withConnectedNode: false });
+			const clientAny = client as any;
+			// The offline path: the cheap check reports no internet.
+			clientAny._connectionMonitor.connectedToInternetCheapAsync = vi.fn().mockResolvedValue(false);
+
+			vi.useFakeTimers();
+			try {
+				const workerPromise = runWorker();// Attempt fails; the offline sleep begins.
+				await vi.advanceTimersByTimeAsync(0);
+				expect(deleteNodesSpy).toHaveBeenCalledTimes(0);
+
+				// The worker resets the timer after the offline sleep, so a stale timestamp cannot
+				// trigger a database purge the moment connectivity returns.
+				await vi.advanceTimersByTimeAsync(1000);
+				await workerPromise;
+				expect(performance.now() - clientAny._lastConnectionProgressTime).toBeLessThanOrEqual(1000);
+				expect(deleteNodesSpy).toHaveBeenCalledTimes(0);
+				expect(clientAny._stuckDetectionPurgedThisStart).toBe(false);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
 	});
 
 	// Helper that creates a mock NodeConnection whose _tipHashHex is updated
@@ -561,6 +752,150 @@ describe('BlockHeadersClient queue recovery', () => {
 			expect(dashboardTipAtEmit).toBe(block1HashHex);
 
 			clientAny._dashboardEmitter.off('peer_block_hashes_received', onPeerBlockHashes);
+		});
+	});
+
+	describe('_pingHandler', () => {
+		function createConnectedNodeMock(ip: string, port: number) {
+			const node = { ip, port };
+			return {
+				node,
+				connection: {
+					getIpPortString: () => ipPortToString(node),
+					ping: vi.fn().mockResolvedValue(1),
+					[Symbol.dispose]: vi.fn(),
+				}
+			};
+		}
+
+		test('pings the connected node that was pinged least recently (round-robin)', async () => {
+			const clientAny = client as any;
+			const mockA = createConnectedNodeMock('1.1.1.1', 8333);
+			const mockB = createConnectedNodeMock('2.2.2.2', 8333);
+			clientAny._nodeConnectionsConnected.set(ipPortToString(mockA.node), mockA.connection);
+			clientAny._nodeConnectionsConnected.set(ipPortToString(mockB.node), mockB.connection);
+
+			// A successful ping marks the node, so the next call moves on to the other one.
+			expect(await clientAny._pingHandler(5000)).toBe(true);
+			expect(mockA.connection.ping).toHaveBeenCalledTimes(1);
+			expect(mockB.connection.ping).toHaveBeenCalledTimes(0);
+
+			expect(await clientAny._pingHandler(5000)).toBe(true);
+			expect(mockB.connection.ping).toHaveBeenCalledTimes(1);
+			expect(mockA.connection.ping).toHaveBeenCalledTimes(1);
+		});
+
+		test('rotates through every connected node with three nodes', async () => {
+			const clientAny = client as any;
+			const mocks = ['1.1.1.1', '2.2.2.2', '3.3.3.3'].map(ip => createConnectedNodeMock(ip, 8333));
+			mocks.forEach(mock => clientAny._nodeConnectionsConnected.set(ipPortToString(mock.node), mock.connection));
+
+			// Each call pings the least recently pinged node: A, then B, then C.
+			for (const mock of mocks) {
+				expect(await clientAny._pingHandler(5000)).toBe(true);
+				expect(mock.connection.ping).toHaveBeenCalledTimes(1);
+			}
+		});
+
+		test('passes the timeout and abort signal to the ping', async () => {
+			const clientAny = client as any;
+			const mock = createConnectedNodeMock('1.1.1.1', 8333);
+			const signal = new AbortController().signal;
+			clientAny._nodeConnectionsConnected.set(ipPortToString(mock.node), mock.connection);
+
+			expect(await clientAny._pingHandler(1234, signal)).toBe(true);
+			expect(mock.connection.ping).toHaveBeenCalledWith({ timeoutMs: 1234, signal });
+		});
+
+		test('returns null without pinging when no connected nodes exist', async () => {
+			const clientAny = client as any;
+			clientAny._nodeConnectionsConnected.clear();
+			expect(await clientAny._pingHandler(5000)).toBeNull();
+		});
+
+		test('returns false when the ping rejects', async () => {
+			const clientAny = client as any;
+			const mock = createConnectedNodeMock('1.1.1.1', 8333);
+			mock.connection.ping = vi.fn().mockRejectedValue(new Error('Ping timed out'));
+			clientAny._nodeConnectionsConnected.set(ipPortToString(mock.node), mock.connection);
+
+			expect(await clientAny._pingHandler(5000)).toBe(false);
+			expect(mock.connection.ping).toHaveBeenCalledTimes(1);
+		});
+
+		test('prunes last-ping entries for disconnected nodes', async () => {
+			const clientAny = client as any;
+			const mockA = createConnectedNodeMock('1.1.1.1', 8333);
+			const mockB = createConnectedNodeMock('2.2.2.2', 8333);
+			clientAny._nodeConnectionsConnected.set(ipPortToString(mockA.node), mockA.connection);
+			clientAny._nodeConnectionsConnected.set(ipPortToString(mockB.node), mockB.connection);
+			await clientAny._pingHandler(5000);// Marks connA as pinged.
+
+			// connA disconnects; the next handler call prunes its entry and pings connB.
+			clientAny._nodeConnectionsConnected.delete(ipPortToString(mockA.node));
+
+			expect(await clientAny._pingHandler(5000)).toBe(true);
+			expect(mockB.connection.ping).toHaveBeenCalledTimes(1);
+			expect(clientAny._lastPingTimesMs.has(ipPortToString(mockA.node))).toBe(false);
+			expect(clientAny._lastPingTimesMs.has(ipPortToString(mockB.node))).toBe(true);
+		});
+	});
+
+	describe('stuck-detection purge budget reset', () => {
+		test('_stuckDetectionPurgedThisStart resets at the start of a fresh _connectToNodes() run', async () => {
+			const clientAny = client as any;
+			clientAny._addedSeedNodesFromExternalAPI = true;
+			clientAny._addedSeedNodesFromEnvAndHardcoded = true;
+			clientAny._stuckDetectionPurgedThisStart = true;// Budget consumed by a previous run.
+
+			let workerCount = 0;
+			clientAny._createConnectedNodeConnection = vi.fn().mockImplementation(async () => {
+				workerCount++;
+			});
+
+			const abort = new AbortController();
+			await clientAny._connectToNodes({ clientStopSignal: abort.signal });
+
+			// The workers launched, and the fresh run re-armed the once-per-run purge budget.
+			expect(workerCount).toBeGreaterThan(0);
+			expect(clientAny._stuckDetectionPurgedThisStart).toBe(false);
+		});
+	});
+
+	describe('connection monitor check-result classification', () => {
+		test('classifies check results into the four dashboard events and stays silent for the first report', async () => {
+			const clientAny = client as any;
+			clientAny._connectionMonitor.start = async () => { };
+			clientAny._launchNodeConnectionsHealthMonitor = () => { };
+			clientAny._nodesDatabase.open = async () => { };
+			clientAny._blockHeadersDatabase.open = async () => { };
+			clientAny._connectToNodes = async () => { };
+
+			await clientAny._start();
+
+			const events: string[] = [];
+			clientAny._dashboardEmitter.on('connection_monitor_online_to_online', () => events.push('online_to_online'));
+			clientAny._dashboardEmitter.on('connection_monitor_online_to_offline', () => events.push('online_to_offline'));
+			clientAny._dashboardEmitter.on('connection_monitor_offline_to_online', () => events.push('offline_to_online'));
+			clientAny._dashboardEmitter.on('connection_monitor_offline_to_offline', () => events.push('offline_to_offline'));
+
+			const onCheckResult = clientAny._connectionMonitor._onCheckResult;
+			expect(typeof onCheckResult).toBe('function');
+
+			onCheckResult(null, true);// First report: status was unknown, so nothing is emitted.
+			expect(events).toEqual([]);
+
+			onCheckResult(true, true);
+			expect(events).toEqual(['online_to_online']);
+
+			onCheckResult(true, false);
+			expect(events).toEqual(['online_to_online', 'online_to_offline']);
+
+			onCheckResult(false, true);
+			expect(events).toEqual(['online_to_online', 'online_to_offline', 'offline_to_online']);
+
+			onCheckResult(false, false);
+			expect(events).toEqual(['online_to_online', 'online_to_offline', 'offline_to_online', 'offline_to_offline']);
 		});
 	});
 });
