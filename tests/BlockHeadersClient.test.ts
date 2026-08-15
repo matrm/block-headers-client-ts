@@ -8,6 +8,7 @@ import { removeDirectoryWithRetries, createDbWithRetries } from './testUtils';
 import { BlockHeaderMutable } from '../src/BlockHeader.js';
 import { BlockHeadersClient } from '../src/BlockHeadersClient.js';
 import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase.js';
+import { DEFAULT_peersReachableGraceMs, DEFAULT_unreachableDataWaitMs } from '../src/ConnectionMonitor.js';
 import { NodesDatabase } from '../src/NodesDatabase.js';
 import { Chain, getInvalidBlocks } from '../src/chainProtocol.js';
 import { getRandomHexString, ipPortToString } from '../src/utils/util.js';
@@ -415,7 +416,7 @@ describe('BlockHeadersClient queue recovery', () => {
 			await nodesDb.addSeen(fakeNode, Date.now());
 
 			// Pretend the internet is up so the stuck path is reached instead of the offline sleep path.
-			clientAny._connectionMonitor.connectedToInternetCheapAsync = vi.fn().mockResolvedValue(true);
+			clientAny._connectionMonitor.waitForInternetCheapAsync = vi.fn().mockResolvedValue(true);
 
 			const deleteNodesSpy = vi.spyOn(nodesDb, 'deleteNodes');
 			const addSeedEnvSpy = vi.spyOn(clientAny, '_addSeedNodesFromEnvAndHardcoded').mockImplementation(() => { });
@@ -471,7 +472,7 @@ describe('BlockHeadersClient queue recovery', () => {
 			await nodesDb.addSeen(fakeNode, Date.now());
 
 			// Pretend the internet is up so the stuck path is reached instead of the offline sleep path.
-			clientAny._connectionMonitor.connectedToInternetCheapAsync = vi.fn().mockResolvedValue(true);
+			clientAny._connectionMonitor.waitForInternetCheapAsync = vi.fn().mockResolvedValue(true);
 
 			const deleteNodesSpy = vi.spyOn(nodesDb, 'deleteNodes');
 			vi.spyOn(clientAny, '_addSeedNodesFromEnvAndHardcoded').mockImplementation(() => { });
@@ -633,7 +634,7 @@ describe('BlockHeadersClient queue recovery', () => {
 			const { runWorker, deleteNodesSpy } = await createStuckDetectionHarness({ workerId: 'stuck-detection-offline-path', withConnectedNode: false });
 			const clientAny = client as any;
 			// The offline path: the cheap check reports no internet.
-			clientAny._connectionMonitor.connectedToInternetCheapAsync = vi.fn().mockResolvedValue(false);
+			clientAny._connectionMonitor.waitForInternetCheapAsync = vi.fn().mockResolvedValue(false);
 
 			vi.useFakeTimers();
 			try {
@@ -648,6 +649,370 @@ describe('BlockHeadersClient queue recovery', () => {
 				expect(performance.now() - clientAny._lastConnectionProgressTime).toBeLessThanOrEqual(1000);
 				expect(deleteNodesSpy).toHaveBeenCalledTimes(0);
 				expect(clientAny._stuckDetectionPurgedThisStart).toBe(false);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		test('the purge is blocked when an outage happened inside the stuck window', async () => {
+			const { runWorker, deleteNodesSpy } = await createStuckDetectionHarness({ workerId: 'stuck-detection-outage-in-window', withConnectedNode: false });
+			const clientAny = client as any;
+			// A mass disconnect happened moments ago, so the stuck window is not
+			// outage-free and the purge must not fire, even with an online check and a
+			// stale progress timer.
+			clientAny._connectionMonitor.markMassDisconnect();
+
+			await runWorker();
+			expect(deleteNodesSpy).toHaveBeenCalledTimes(0);
+			expect(clientAny._stuckDetectionPurgedThisStart).toBe(false);
+		});
+
+		test('the purge fires once the whole stuck window is outage-free', async () => {
+			const { runWorker, deleteNodesSpy } = await createStuckDetectionHarness({ workerId: 'stuck-detection-outage-free-window', withConnectedNode: false });
+			const clientAny = client as any;
+
+			vi.useFakeTimers();
+			try {
+				clientAny._connectionMonitor.markMassDisconnect();
+				// The effective timeout for NUM_WORKERS workers is 60s. After an
+				// outage-free 60s window, the purge is allowed again.
+				await vi.advanceTimersByTimeAsync(60000);
+				await runWorker();
+				expect(deleteNodesSpy).toHaveBeenCalledTimes(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		test('each fresh mass-disconnect mark during recovery flapping re-arms the outage-free window, postponing the purge by a full effective timeout per flap', async () => {
+			const { runWorker, deleteNodesSpy } = await createStuckDetectionHarness({ workerId: 'stuck-detection-flapping-ream', withConnectedNode: false });
+			const clientAny = client as any;
+
+			vi.useFakeTimers();
+			try {
+				// An outage ends: the original mass-disconnect mark ages out of the
+				// stuck window, so the purge gate opens.
+				clientAny._connectionMonitor.markMassDisconnect();
+				await vi.advanceTimersByTimeAsync(60000);
+
+				// Recovery flapping: a burst of reconnects drops again, so the host
+				// re-marks the mass disconnect (disconnect_unintentional_after_connect
+				// with other disconnects while waiting). The new mark refreshes the
+				// unreachable timestamp and re-arms the suppression for another full
+				// effective timeout, even though the progress timer is stale and the
+				// internet check passes.
+				clientAny._connectionMonitor.markMassDisconnect();
+				await runWorker();
+				expect(deleteNodesSpy).toHaveBeenCalledTimes(0);
+				expect(clientAny._stuckDetectionPurgedThisStart).toBe(false);
+
+				// The gate reopens only a full effective timeout after the newest mark.
+				await vi.advanceTimersByTimeAsync(60000);
+				await runWorker();
+				expect(deleteNodesSpy).toHaveBeenCalledTimes(1);
+
+				// Another flap while the pool is still polluted repeats the delay: the
+				// purge stays suppressed for one more effective timeout, so flapping can
+				// postpone recovery indefinitely (the timestamp is never refreshed in
+				// the client's favor, only re-marked).
+				clientAny._connectionMonitor.markMassDisconnect();
+				await runWorker();
+				expect(deleteNodesSpy).toHaveBeenCalledTimes(1);
+				await vi.advanceTimersByTimeAsync(60000);
+				await runWorker();
+				expect(deleteNodesSpy).toHaveBeenCalledTimes(2);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	});
+
+	describe('disconnect penalties and peer reachability', () => {
+		function createDisconnectMockConnection(ip: string, port: number) {
+			const ipPort = { ip, port };
+			const conn = new EventEmitter() as any;
+			conn.getIpPort = () => ipPort;
+			conn.getIpPortString = () => ipPortToString(ipPort);
+			conn.connect = vi.fn().mockResolvedValue(undefined);
+			conn.ping = vi.fn().mockResolvedValue(1);
+			conn.syncHeaders = vi.fn().mockResolvedValue(undefined);
+			conn[Symbol.dispose] = vi.fn();
+			return conn;
+		}
+
+		async function registerDisconnectTestNode(clientAny: any, ipPort: IpPort, { connected = false } = {}) {
+			await nodesDb.addSeen(ipPort, Date.now());
+			const conn = createDisconnectMockConnection(ipPort.ip, ipPort.port);
+			clientAny._nodeConnections.set(ipPortToString(ipPort), conn);
+			if (connected) {
+				clientAny._nodeConnectionsConnected.set(ipPortToString(ipPort), conn);
+			}
+			clientAny._setupNodeConnectionCallbacks(conn, new AbortController().signal);
+			return conn;
+		}
+
+		const flushMicrotasks = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+		test('a before_connect failure while peers are unreachable is not penalized and skips the internet check', async () => {
+			const clientAny = client as any;
+			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
+			const checkSpy = vi.spyOn(clientAny._connectionMonitor, 'waitForInternetCheapAsync').mockResolvedValue(true);
+			clientAny._connectionMonitor.markMassDisconnect();
+
+			const ipPort = { ip: '10.0.0.1', port: 8333 };
+			const conn = await registerDisconnectTestNode(clientAny, ipPort);
+			conn.emit('disconnect_unintentional_before_connect');
+			await flushMicrotasks();
+
+			expect(penaltySpy).not.toHaveBeenCalled();
+			expect(checkSpy).not.toHaveBeenCalled();
+			expect(clientAny._nodeConnections.has(ipPortToString(ipPort))).toBe(false);
+		});
+
+		test('a before_connect failure while peers are reachable is penalized when the internet check says online', async () => {
+			const clientAny = client as any;
+			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
+			clientAny._connectionMonitor.waitForInternetCheapAsync = vi.fn().mockResolvedValue(true);
+			// Fresh peer data makes peers reachable (the grace has passed since INIT).
+			clientAny._connectionMonitor.updateLastKnownConnectionTime();
+
+			const ipPort = { ip: '10.0.0.2', port: 8333 };
+			const conn = await registerDisconnectTestNode(clientAny, ipPort);
+			conn.emit('disconnect_unintentional_before_connect');
+			await flushMicrotasks();
+
+			expect(penaltySpy).toHaveBeenCalledTimes(1);
+			expect(clientAny._nodeConnections.has(ipPortToString(ipPort))).toBe(false);
+		});
+
+		test('a before_connect failure while peers are reachable is not penalized when the internet check says offline', async () => {
+			const clientAny = client as any;
+			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
+			clientAny._connectionMonitor.waitForInternetCheapAsync = vi.fn().mockResolvedValue(false);
+			// Fresh peer data makes peers reachable (the grace has passed since INIT).
+			clientAny._connectionMonitor.updateLastKnownConnectionTime();
+
+			const ipPort = { ip: '10.0.0.3', port: 8333 };
+			const conn = await registerDisconnectTestNode(clientAny, ipPort);
+			conn.emit('disconnect_unintentional_before_connect');
+			await flushMicrotasks();
+
+			expect(penaltySpy).not.toHaveBeenCalled();
+		});
+
+		test('a cold start before_connect failure with no outage evidence is penalized when the internet check says online', async () => {
+			const clientAny = client as any;
+			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
+			const checkSpy = vi.spyOn(clientAny._connectionMonitor, 'waitForInternetCheapAsync').mockResolvedValue(true);
+			// No mass disconnect and no offline report: the unknown state counts as
+			// reachable, so the check runs and the failure is penalized by its verdict.
+			expect(clientAny._connectionMonitor.arePeersReachable()).toBe(true);
+
+			const ipPort = { ip: '10.0.0.6', port: 8333 };
+			const conn = await registerDisconnectTestNode(clientAny, ipPort);
+			conn.emit('disconnect_unintentional_before_connect');
+			await flushMicrotasks();
+
+			expect(checkSpy).toHaveBeenCalledTimes(1);
+			expect(penaltySpy).toHaveBeenCalledTimes(1);
+			expect(clientAny._nodeConnections.has(ipPortToString(ipPort))).toBe(false);
+		});
+
+		test('an after_connect failure while peers are unreachable skips the check but records the disconnect time and replaces the node immediately', async () => {
+			const clientAny = client as any;
+			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
+			const checkSpy = vi.spyOn(clientAny._connectionMonitor, 'waitForInternetCheapAsync').mockResolvedValue(true);
+			clientAny._start = vi.fn().mockResolvedValue(undefined);
+			clientAny._connectionMonitor.markMassDisconnect();
+
+			const ipPort = { ip: '10.0.0.7', port: 8333 };
+			const conn = await registerDisconnectTestNode(clientAny, ipPort, { connected: true });
+			conn.emit('disconnect_unintentional_after_connect');
+			await flushMicrotasks();
+
+			// No penalty and no check: the failure is network-caused.
+			expect(penaltySpy).not.toHaveBeenCalled();
+			expect(checkSpy).not.toHaveBeenCalled();
+			// The disconnect time is recorded so concurrent handlers' mass-disconnect
+			// detection still counts this drop.
+			expect(clientAny._nodeEventTimes_disconnect_unintentional_after_connect.get(ipPortToString(ipPort))).toBeGreaterThan(0);
+			// The node is replaced immediately with itself as the priority (not blacklisted).
+			expect(clientAny._start).toHaveBeenCalledWith({ priorityIpPort: ipPort });
+			expect(clientAny._nodeConnections.has(ipPortToString(ipPort))).toBe(false);
+		});
+
+		test('a mass disconnect makes peers unreachable and none of the nodes are penalized', async () => {
+			const clientAny = client as any;
+			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
+			clientAny._connectionMonitor.waitForInternetCheapAsync = vi.fn().mockResolvedValue(false);
+			clientAny._start = vi.fn().mockResolvedValue(undefined);
+			vi.useFakeTimers();
+			try {
+				// Fresh peer data makes peers reachable (the grace has passed since INIT).
+				clientAny._connectionMonitor.updateLastKnownConnectionTime();
+				expect(clientAny._connectionMonitor.arePeersReachable()).toBe(true);
+				// Eight connected nodes all drop at once, like an internet outage.
+				const conns: any[] = [];
+				for (let i = 0; i < 8; i++) {
+					conns.push(await registerDisconnectTestNode(clientAny, { ip: `10.0.1.${i + 1}`, port: 8333 }, { connected: true }));
+				}
+				// The outage also breaks the reconnects.
+				for (const conn of conns) {
+					conn.connect = vi.fn().mockRejectedValue(new Error('internet offline'));
+					conn.emit('disconnect_unintentional_after_connect');
+				}
+				await vi.advanceTimersByTimeAsync(1000);
+				await vi.advanceTimersByTimeAsync(0);
+
+				// The mass disconnect detection fired and marked peers unreachable.
+				expect(clientAny._connectionMonitor.arePeersReachable()).toBe(false);
+				expect(penaltySpy).not.toHaveBeenCalled();
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		test('an after_connect failure while peers are unreachable is not penalized even with no other disconnects', async () => {
+			const clientAny = client as any;
+			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
+			clientAny._connectionMonitor.waitForInternetCheapAsync = vi.fn().mockResolvedValue(true);
+			clientAny._start = vi.fn().mockResolvedValue(undefined);
+			vi.useFakeTimers();
+			try {
+				const ipPort = { ip: '10.0.0.4', port: 8333 };
+				const conn = await registerDisconnectTestNode(clientAny, ipPort, { connected: true });
+				// A previous mass disconnect made peers unreachable, and this node drops moments later.
+				clientAny._connectionMonitor.markMassDisconnect();
+
+				conn.emit('disconnect_unintentional_after_connect');
+				await vi.advanceTimersByTimeAsync(1000);
+				await vi.advanceTimersByTimeAsync(0);
+
+				expect(penaltySpy).not.toHaveBeenCalled();
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		test('an after_connect failure while peers are reachable is penalized when the internet check says online', async () => {
+			const clientAny = client as any;
+			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
+			clientAny._connectionMonitor.waitForInternetCheapAsync = vi.fn().mockResolvedValue(true);
+			clientAny._start = vi.fn().mockResolvedValue(undefined);
+			vi.useFakeTimers();
+			try {
+				// Fresh peer data makes peers reachable (the grace has passed since INIT).
+				clientAny._connectionMonitor.updateLastKnownConnectionTime();
+				const ipPort = { ip: '10.0.0.5', port: 8333 };
+				const conn = await registerDisconnectTestNode(clientAny, ipPort, { connected: true });
+
+				conn.emit('disconnect_unintentional_after_connect');
+				await vi.advanceTimersByTimeAsync(1000);
+				await vi.advanceTimersByTimeAsync(0);
+
+				expect(penaltySpy).toHaveBeenCalledTimes(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		test('outage scenario: a mass disconnect makes peers unreachable, outage failures are not penalized, and fresh data after the grace period makes peers reachable again', async () => {
+			const clientAny = client as any;
+			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
+			clientAny._connectionMonitor.waitForInternetCheapAsync = vi.fn().mockResolvedValue(false);
+			clientAny._start = vi.fn().mockResolvedValue(undefined);
+			vi.useFakeTimers();
+			try {
+				// Eight connected nodes all drop at once, like an internet outage.
+				const conns: any[] = [];
+				for (let i = 0; i < 8; i++) {
+					conns.push(await registerDisconnectTestNode(clientAny, { ip: `10.1.0.${i + 1}`, port: 8333 }, { connected: true }));
+				}
+				// The outage also breaks the reconnects.
+				for (const conn of conns) {
+					conn.connect = vi.fn().mockRejectedValue(new Error('internet offline'));
+					conn.emit('disconnect_unintentional_after_connect');
+				}
+				await vi.advanceTimersByTimeAsync(1000);
+				await vi.advanceTimersByTimeAsync(0);
+				expect(clientAny._connectionMonitor.arePeersReachable()).toBe(false);
+				expect(penaltySpy).not.toHaveBeenCalled();
+
+				// A worker connect attempt fails while the outage is ongoing, so there is no penalty.
+				const failingIpPort = { ip: '10.1.0.9', port: 8333 };
+				const failingConn = await registerDisconnectTestNode(clientAny, failingIpPort);
+				failingConn.emit('disconnect_unintentional_before_connect');
+				await vi.advanceTimersByTimeAsync(0);
+				expect(penaltySpy).not.toHaveBeenCalled();
+
+				// Stale or slow data inside the grace period must not reopen penalties.
+				await vi.advanceTimersByTimeAsync(DEFAULT_peersReachableGraceMs - 1000);
+				clientAny._connectionMonitor.updateLastKnownConnectionTime();
+				expect(clientAny._connectionMonitor.arePeersReachable()).toBe(false);
+				const staleDataIpPort = { ip: '10.1.0.10', port: 8333 };
+				const staleDataConn = await registerDisconnectTestNode(clientAny, staleDataIpPort);
+				staleDataConn.emit('disconnect_unintentional_before_connect');
+				await vi.advanceTimersByTimeAsync(0);
+				expect(penaltySpy).not.toHaveBeenCalled();
+
+				// Fresh data after the grace period proves peers are reachable again.
+				await vi.advanceTimersByTimeAsync(1000);
+				clientAny._connectionMonitor.updateLastKnownConnectionTime();
+				expect(clientAny._connectionMonitor.arePeersReachable()).toBe(true);
+
+				// With peers reachable, a failing connect attempt is penalized again.
+				clientAny._connectionMonitor.waitForInternetCheapAsync = vi.fn().mockResolvedValue(true);
+				const postOutageIpPort = { ip: '10.1.0.11', port: 8333 };
+				const postOutageConn = await registerDisconnectTestNode(clientAny, postOutageIpPort);
+				postOutageConn.emit('disconnect_unintentional_before_connect');
+				await vi.advanceTimersByTimeAsync(0);
+				expect(penaltySpy).toHaveBeenCalledTimes(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		test('a cold start with no internet makes peers unreachable after the first offline check and protects nodes', async () => {
+			const clientAny = client as any;
+			const monitor = clientAny._connectionMonitor;
+			await monitor.start(new AbortController().signal);
+			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
+			clientAny._start = vi.fn().mockResolvedValue(undefined);
+			vi.useFakeTimers();
+			try {
+				// The client starts with no internet. The first offline fetch check makes
+				// peers unreachable, even though no mass disconnect happened, and the
+				// short unreachable data wait means the verdict lands within seconds,
+				// not after the full data wait.
+				const fetchSpy = vi.spyOn(global, 'fetch').mockRejectedValue(new Error('Network error'));
+				const check = monitor.waitForInternetCheapAsync(new AbortController().signal);
+				await vi.advanceTimersByTimeAsync(DEFAULT_unreachableDataWaitMs);
+				await expect(check).resolves.toBe(false);
+				expect(fetchSpy).toHaveBeenCalledTimes(3);
+				expect(monitor.arePeersReachable()).toBe(false);
+				fetchSpy.mockRestore();
+
+				// An outage failure is skipped without an internet check and carries no penalty.
+				const checkSpy = vi.spyOn(monitor, 'waitForInternetCheapAsync').mockResolvedValue(true);
+				const failingIpPort = { ip: '10.2.0.1', port: 8333 };
+				const failingConn = await registerDisconnectTestNode(clientAny, failingIpPort);
+				failingConn.emit('disconnect_unintentional_before_connect');
+				await vi.advanceTimersByTimeAsync(0);
+				expect(penaltySpy).not.toHaveBeenCalled();
+				expect(checkSpy).not.toHaveBeenCalled();
+				expect(clientAny._nodeConnections.has(ipPortToString(failingIpPort))).toBe(false);
+
+				// Fresh data after the grace period makes peers reachable again.
+				await vi.advanceTimersByTimeAsync(DEFAULT_peersReachableGraceMs);
+				monitor.updateLastKnownConnectionTime();
+				expect(monitor.arePeersReachable()).toBe(true);
+
+				// With peers reachable, a failing connect attempt is penalized again.
+				const postIpPort = { ip: '10.2.0.2', port: 8333 };
+				const postConn = await registerDisconnectTestNode(clientAny, postIpPort);
+				postConn.emit('disconnect_unintentional_before_connect');
+				await vi.advanceTimersByTimeAsync(0);
+				expect(penaltySpy).toHaveBeenCalledTimes(1);
 			} finally {
 				vi.useRealTimers();
 			}
@@ -863,7 +1228,7 @@ describe('BlockHeadersClient queue recovery', () => {
 	});
 
 	describe('connection monitor check-result classification', () => {
-		test('classifies check results into the four dashboard events and stays silent for the first report', async () => {
+		test('classifies check results into the four dashboard events; a first report is classified against the assumed-online baseline', async () => {
 			const clientAny = client as any;
 			clientAny._connectionMonitor.start = async () => { };
 			clientAny._launchNodeConnectionsHealthMonitor = () => { };
@@ -882,20 +1247,23 @@ describe('BlockHeadersClient queue recovery', () => {
 			const onCheckResult = clientAny._connectionMonitor._onCheckResult;
 			expect(typeof onCheckResult).toBe('function');
 
-			onCheckResult(null, true);// First report: status was unknown, so nothing is emitted.
-			expect(events).toEqual([]);
-
-			onCheckResult(true, true);
+			onCheckResult(null, true);// An online first report means the internet is online from the start.
 			expect(events).toEqual(['online_to_online']);
 
-			onCheckResult(true, false);
+			onCheckResult(null, false);// An offline first report is a real transition into a known-down state.
 			expect(events).toEqual(['online_to_online', 'online_to_offline']);
 
+			onCheckResult(true, true);
+			expect(events).toEqual(['online_to_online', 'online_to_offline', 'online_to_online']);
+
+			onCheckResult(true, false);
+			expect(events).toEqual(['online_to_online', 'online_to_offline', 'online_to_online', 'online_to_offline']);
+
 			onCheckResult(false, true);
-			expect(events).toEqual(['online_to_online', 'online_to_offline', 'offline_to_online']);
+			expect(events).toEqual(['online_to_online', 'online_to_offline', 'online_to_online', 'online_to_offline', 'offline_to_online']);
 
 			onCheckResult(false, false);
-			expect(events).toEqual(['online_to_online', 'online_to_offline', 'offline_to_online', 'offline_to_offline']);
+			expect(events).toEqual(['online_to_online', 'online_to_offline', 'online_to_online', 'online_to_offline', 'offline_to_online', 'offline_to_offline']);
 		});
 	});
 });

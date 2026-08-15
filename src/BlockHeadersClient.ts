@@ -63,11 +63,10 @@ interface DashboardEmitterEvents {
 	// 'peer_data_received': [ipPort: IpPort, timeMs: number];
 	'client_start': [];
 	'client_stop': [];
-	// The four connection-monitor classifications cover both pieces of information: whether
-	// a connectivity check ran at all, and whether the status transitioned. Every reported
-	// result after the first emits one of these four events: the first report after start
-	// or dispose has prev === null, which emits nothing since there is no previous status
-	// to compare against.
+	// Every fetch() call that isn't aborted by ConnectionMonitor asyncDispose
+	// will emit one of the following four events. The two of these events that
+	// change the status will also be emit as soon as the connection status change
+	// is detected.
 	'connection_monitor_online_to_online': [];
 	'connection_monitor_online_to_offline': [];
 	'connection_monitor_offline_to_online': [];
@@ -341,7 +340,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	// The rotation spreads the pings across the connected nodes so that no single node
 	// receives every ping (on top of its own scheduled pings) and gets rate limited.
 	// A node can never be pinged by a check that its own disconnect triggered: every
-	// connectedToInternetCheapAsync caller removes the triggering node from
+	// waitForInternetCheapAsync caller removes the triggering node from
 	// _nodeConnectionsConnected synchronously before awaiting the check, and this handler
 	// only ever selects from the current map.
 	// Note: a ping that times out disconnects the node (see LegacyNodeConnection.ping),
@@ -655,7 +654,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				// database metric updates in _setupNodeConnectionCallbacks.
 
 				let aborted = false;
-				const connectedToInternetAndNotAborted = await this._connectionMonitor.connectedToInternetCheapAsync(signal).catch(() => {
+				const connectedToInternetAndNotAborted = await this._connectionMonitor.waitForInternetCheapAsync(signal).catch(() => {
 					aborted = true;
 					return false;
 				});
@@ -700,6 +699,11 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 					this._nodeConnectionsConnected.size < TARGET_NUM_CONNECTIONS &&
 					(!this._stuckDetectionPurgedThisStart || this._nodeConnectionsConnected.size === 0) &&
 					performance.now() - this._lastConnectionProgressTime > effectiveTimeoutMs &&
+					// The whole stuck window must be outage-free. The unreachable
+					// timestamp is refreshed by mass disconnects and offline check
+					// reports, so this also covers outages too short for a check to
+					// report offline and peer drops while HTTP keeps working.
+					this._connectionMonitor.getTimeSincePeersWereUnreachableMs() >= effectiveTimeoutMs &&
 					!this._seedReAddPromise &&
 					!disableStuckDetection &&
 					this._nodesCurrentlyRunningGetAddr === 0
@@ -1000,7 +1004,16 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				this._dashboardEmitter.emit('peer_disconnected', ipPort);
 			}
 
-			const connectedToInternetAndNotAborted = await this._connectionMonitor.connectedToInternetCheapAsync(clientStopSignal).catch(() => {
+			// A failure while peers are known unreachable is attributed to the network
+			// and not to this node. Skip the internet check and any rating penalty.
+			// An unknown (null) state counts as reachable, so a cold start still runs
+			// the check and penalizes by its verdict.
+			if (!this._connectionMonitor.arePeersReachable()) {
+				this._destroyNodeConnection(nodeConnection);
+				return;
+			}
+
+			const connectedToInternetAndNotAborted = await this._connectionMonitor.waitForInternetCheapAsync(clientStopSignal).catch(() => {
 				this._enableConsoleDebugLog && console.log('Node unintentionally disconnected before connecting: ABORTED', ipPort);
 				return false;
 			});
@@ -1033,6 +1046,11 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			// next (at least) RECENT_UNINTENTIONAL_DISCONNECT_TIME_THRESHOLD_MS milliseconds
 			// are assumed to be a part of a mass disconnect that should not be penalized.
 			const startTimeMs = performance.now();
+			// Capture the peer reachability state now: if peers are already known
+			// unreachable the failure is network-caused and the node is replaced
+			// immediately below, without a check or a penalty. The state may change
+			// again before the penalty decision of the reachable branch below.
+			const peersReachableAtDisconnect = this._connectionMonitor.arePeersReachable();
 			this._nodeEventTimes_disconnect_unintentional_after_connect.set(ipPortString, startTimeMs);
 			if (this._enableConsoleDebugLog) {
 				console.log('nodeEventTimes_disconnect_unintentional_after_connect:');
@@ -1055,9 +1073,30 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				this._dashboardEmitter.emit('peer_disconnected', ipPort);
 			}
 
+			// A failure while peers are already known unreachable is attributed to the
+			// network, so the node gets no rating penalty and is replaced immediately
+			// instead of running the internet check, which would only re-confirm the
+			// known outage. The disconnect time is still recorded above so concurrent
+			// handlers' mass-disconnect detection sees this drop. When peers were
+			// reachable at the disconnect, the full check still runs below.
+			if (!peersReachableAtDisconnect) {
+				this._destroyNodeConnection(nodeConnection);
+				if (clientStopSignal.aborted) {
+					return;
+				}
+				if (!wasConnectedAndTested) {
+					// The worker loop that created this connection is still running and
+					// will pick a new node; nothing to replace here.
+					return;
+				}
+				this._enableConsoleDebugLog && console.log('About to replace nodeConnection if not already running _connectToNodes:', ipPort);
+				this._start({ priorityIpPort: this._nodesDatabase.isBlacklisted(ipPort, Date.now()) ? undefined : ipPort });
+				return;
+			}
+
 			const internetConnectionCheckAbortController = new AbortController();
 			using combinedAbortControllers = combineAbortControllers(clientStopSignal, internetConnectionCheckAbortController.signal);
-			const internetConnectionCheckPromise = this._connectionMonitor.connectedToInternetCheapAsync(combinedAbortControllers.signal).catch(() => {
+			const internetConnectionCheckPromise = this._connectionMonitor.waitForInternetCheapAsync(combinedAbortControllers.signal).catch(() => {
 				return false;
 			});
 
@@ -1110,15 +1149,22 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			// 8 -> 4: 4 + 3 < 8 = true
 			// 8 -> 5: 5 + 3 < 8 = false
 			// TLDR: When the normal 7 other nodes are connected, at least 3 other nodes need to disconnect to avoid
-			// being penalized or blacklisted while awaiting this._connectionMonitor.connectedToInternetCheapAsync().
+			// being penalized or blacklisted while awaiting this._connectionMonitor.waitForInternetCheapAsync().
 			if (otherDisconnectsWhileWaiting) {
 				this._enableConsoleDebugLog && console.log(numOtherConnectedNodesBeforeWaiting - numOtherConnectedNodesAfterWaiting, 'other nodes disconnected recently after being connected', ipPort);
+				// A large portion of the connected nodes dropped. Tell the connection
+				// monitor so disconnect failures during the outage carry no rating
+				// impact.
+				this._connectionMonitor.markMassDisconnect();
 				internetConnectionCheckAbortController.abort();
 			}
 
 			const connectedToInternetAndNotAborted = await internetConnectionCheckPromise;
 
 			const timeMs = Date.now();
+			// peersReachableAtDisconnect is always true here (the unreachable case
+			// returned above), so the penalty is decided by the check verdict and the
+			// mass-disconnect detection alone.
 			if (connectedToInternetAndNotAborted && !otherDisconnectsWhileWaiting) {
 				assert(this._nodesDatabase.has(ipPort));
 				const ratingBefore = this._nodesDatabase.getNodeRating(ipPort, timeMs);
@@ -1444,15 +1490,19 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			const abortController = this._abortController;
 			this._enableConsoleDebugLog && console.log(unixTime3Decimal(), '- Starting connection monitor and opening databases.');
 			this._connectionMonitor.setOnCheckResult((prev: boolean | null, isConnected: boolean) => {
-				// The first report after start (or after a dispose) has prev === null:
-				// the status was unknown, so there is no transition to report and no prior
-				// status to compare against. Record it silently instead of emitting a
-				// spurious 'online, no change' heartbeat on every startup.
-				if (prev === null) {
-					return;
-				}
+				// The first report after start (or after a dispose) has prev === null,
+				// which means the status was unknown and there is no prior status to
+				// compare against. It is classified against the assumed-online
+				// baseline, because online is the expected startup state: an online
+				// first report emits connection_monitor_online_to_online and an
+				// offline first report emits connection_monitor_online_to_offline.
+				// The unknown baseline only surfaces when the first check of a
+				// session is a fetch before any peer data arrived; peer data normally
+				// fills the status in silently first (see
+				// ConnectionMonitor.updateLastKnownConnectionTime).
+				const prevStatus = prev === null ? true : prev;
 				// Classify the check result into one of four dashboard events.
-				const eventName = (prev === isConnected)
+				const eventName = (prevStatus === isConnected)
 					? (isConnected ? 'connection_monitor_online_to_online' : 'connection_monitor_offline_to_offline')
 					: (isConnected ? 'connection_monitor_offline_to_online' : 'connection_monitor_online_to_offline');
 				this._dashboardEmitter.emit(eventName);

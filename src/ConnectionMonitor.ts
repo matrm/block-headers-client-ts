@@ -2,7 +2,7 @@ import { abortableSleepMsThrow, assert, combineAbortControllers, unixTime3Decima
 
 export const DEFAULT_timeoutMs = 10000;
 export const DEFAULT_intervalMs = 60000;
-// How long connectedToInternetCheapAsync waiters wait for fresh peer data (invs, headers,
+// How long waitForInternetCheapAsync waiters wait for fresh peer data (invs, headers,
 // pongs) before falling back to a ping and, failing that, a fetch. Connected nodes send
 // data frequently, so most waiters resolve within this window without any network I/O.
 // Concurrent waiters share the same fetch because a fetch completing during a wait is
@@ -21,12 +21,37 @@ export const DEFAULT_dataWaitMs = 20000;
 // arming the cooldown.
 export const DEFAULT_pingCooldownMs = DEFAULT_intervalMs;
 // Safety margin added to the worst-case verdict time (data wait + ping timeout + fetch
-// timeout) for the timer that guarantees a connectedToInternetCheapAsync waiter settles
+// timeout) for the timer that guarantees a waitForInternetCheapAsync waiter settles
 // even if the ping and fetch both take their full timeouts.
 export const DEFAULT_verdictSafetyNetMarginMs = 1000;
 // Incoming data must be received this long into the future for the connection to be
 // considered active. Must be >= 0.
 export const INCOMING_DATA_THRESHOLD_MS = 100;
+// After a mass disconnect or an offline check report, peer data must arrive this long
+// afterwards before it counts as proof that peers are reachable again. This grace
+// period keeps stale or slow data (delayed packets around an outage, or nodes
+// reconnecting slowly after one) from reopening rating penalties for nodes that the
+// outage disconnected. Derived from the timeout and margin: the grace must exceed the
+// time in-flight pre-recovery pings and connect attempts (both bounded by the
+// ping/fetch timeout) take to settle after recovery, plus timer jitter.
+export const DEFAULT_peersReachableGraceMs = DEFAULT_timeoutMs + DEFAULT_verdictSafetyNetMarginMs;
+// While peers are not known to be reachable, waiters only wait this long for peer
+// data before falling back to a ping or fetch, instead of the full data wait. Peer
+// data is not expected while peers are known to be unreachable, so the full wait only
+// delays the verdict. The short wait still gives data a brief chance to arrive first,
+// which keeps a healthy cold start fetch-free, because the initial handshakes deliver
+// data within about a second.
+export const DEFAULT_unreachableDataWaitMs = 2000;
+// While peers are known to be unreachable, fetch checks are throttled to at most one
+// per this window. Without the throttle, the short unreachable data wait would start
+// a new fetch as soon as the previous one settled, which is too frequent during a
+// long outage. Waiters inside the window share a single scheduled fetch that runs
+// when the window expires, so every waiter still gets fresh evidence from a fetch
+// that completed after it registered. The effective window tracks the configured
+// timeout (a fetch takes up to the timeout to settle, so the window must be at
+// least that long or waiters would schedule a new fetch on top of a settled one);
+// this constant is the default window for the default timeout.
+export const DEFAULT_unreachableFetchThrottleMs = DEFAULT_timeoutMs;
 export const INIT_TIME_MS = performance.now();
 export const INIT_lastKnownConnectionTimeMs: number = Number.MIN_SAFE_INTEGER / 2;
 
@@ -70,7 +95,7 @@ async function checkInternetConnection(timeoutMs: number = DEFAULT_timeoutMs, ab
 export class ConnectionMonitor {
 	private _lastKnownConnectionTimeMs: number = INIT_lastKnownConnectionTimeMs;
 	// Time of the most recent fetch check completion (success or failure). Used by
-	// connectedToInternetCheapAsync to reuse a recent verdict without fetching again.
+	// waitForInternetCheapAsync to reuse a recent verdict without fetching again.
 	private _lastFetchTimeMs: number = INIT_lastKnownConnectionTimeMs;
 	// The in-flight fetch check, shared by concurrent waiters so only one fetch runs at
 	// a time.
@@ -100,10 +125,34 @@ export class ConnectionMonitor {
 	// neither happened within the data wait. The callback receives the previous and the
 	// new isConnected status so the host can distinguish transitions (online↔offline)
 	// from no-op reports (online→online, offline→offline).
-	// `_lastReportedStatus` is null until the first report after a start() or dispose(); the
-	// host treats null as "status unknown, first discovery" and emits nothing for it.
+	// `_lastReportedStatus` is null until the first check report after a start() or
+	// dispose(), but fresh peer data fills it in silently beforehand (see
+	// updateLastKnownConnectionTime). The host classifies a null previous status
+	// against the assumed-online baseline so every report emits an event.
 	private _lastReportedStatus: boolean | null = null;
 	private _onCheckResult: ((prev: boolean | null, isConnected: boolean) => void) | null = null;
+	// Whether peers are currently considered reachable. Tri-state: null means no
+	// evidence yet (a fresh start), false means peers are known unreachable (a mass
+	// disconnect marked by the host, or an offline check report), and true means
+	// fresh peer data arrived after the grace period. Peers start out unknown: no
+	// peer data has arrived yet, but there is also no reason to assume an outage, so
+	// arePeersReachable() treats null as reachable (the assumed-online baseline) and
+	// the host only skips rating penalties once unreachability is actually known. A
+	// successful fetch does not prove peers are reachable, because the peer network
+	// may still be blocked while HTTP works.
+	private _peersReachable: boolean | null = null;
+	// When peers were last known to be unreachable (a mass disconnect or an offline
+	// check report). Fresh data only sets _peersReachable back to true once the grace
+	// period has passed since this time.
+	private _lastPeersUnreachableTimeMs: number = INIT_lastKnownConnectionTimeMs;
+	// While peers are unreachable and inside the fetch throttle window, waiters share
+	// a single scheduled fetch that runs when the window expires. Waiters get their
+	// verdict from that future fetch, which completes after they registered, so the
+	// verdict is never based on past data. The schedule collapses concurrent waiters
+	// into one fetch.
+	private _throttledFetchQueue: Promise<boolean> | null = null;
+	private _throttledFetchResolve: ((isConnected: boolean | Promise<boolean>) => void) | null = null;
+	private _throttledFetchTimeout: NodeJS.Timeout | null = null;
 
 	constructor({ intervalMs, timeoutMs, pingIntervalMs, enableConsoleDebugLog }: {
 		intervalMs?: number;
@@ -115,7 +164,7 @@ export class ConnectionMonitor {
 		this._timeoutMs = timeoutMs ?? DEFAULT_timeoutMs;
 		// Pings are the primary mechanism for keeping _lastKnownConnectionTimeMs fresh when
 		// peers go quiet: a pong arrives as socket data and updates the time, which resolves
-		// connectedToInternetCheapAsync waiters and makes shouldSkipForRecentData() suppress
+		// waitForInternetCheapAsync waiters and makes shouldSkipForRecentData() suppress
 		// the next scheduled ping. The default ping interval must be shorter than the skip
 		// window ((intervalMs - timeoutMs) * 0.9) so a successful pong always lands inside
 		// it; derive the default from the configured interval/timeout so the invariant holds
@@ -149,9 +198,25 @@ export class ConnectionMonitor {
 			await this._pingQueue;
 			this._pingQueue = null;
 		}
+		// Cancel the throttled fetch schedule and settle its waiters so shutdown never
+		// waits for the throttle window.
+		if (this._throttledFetchTimeout !== null) {
+			clearTimeout(this._throttledFetchTimeout);
+			this._throttledFetchTimeout = null;
+		}
+		if (this._throttledFetchResolve !== null) {
+			this._throttledFetchResolve(false);
+			this._throttledFetchResolve = null;
+			this._throttledFetchQueue = null;
+		}
 		// Reset so the first check after the next start() is classified fresh instead of
-		// comparing against the stale pre-dispose status.
+		// comparing against the stale pre-dispose status. The fetch time reset also
+		// keeps the previous session's fetch from throttling the first check after a
+		// restart, and stops past fetch verdicts from being reused.
 		this._lastReportedStatus = null;
+		this._lastFetchTimeMs = INIT_lastKnownConnectionTimeMs;
+		this._peersReachable = null;
+		this._lastPeersUnreachableTimeMs = INIT_lastKnownConnectionTimeMs;
 	}
 
 	stop = async (): Promise<void> => {
@@ -175,14 +240,17 @@ export class ConnectionMonitor {
 		// since the internet state did not reset between reconnections.
 		this._lastReportedStatus = null;
 		this._pingCooldownUntilMs = INIT_lastKnownConnectionTimeMs;
+		this._peersReachable = null;
+		this._lastPeersUnreachableTimeMs = INIT_lastKnownConnectionTimeMs;
 		this._abortSignal = signal;
 		this._started = true;
 	}
 
-	// Runs the fetch-based internet check and records the outcome: on success it updates
-	// the last known connection time, and in non-aborted cases it notes the check time
-	// and reports the result via the host callback. Returns false if the monitor signal
-	// was aborted mid-check (aborted checks record and report nothing).
+	// Runs the fetch-based internet check and records the outcome. A successful fetch
+	// updates the fetch time and reported status but does NOT mark peers as reachable,
+	// because HTTP can work while the peer network is still blocked. An offline report
+	// marks peers as unreachable. Returns false if the monitor signal was aborted
+	// mid-check (aborted checks record and report nothing).
 	private _runCheck = async (signal: AbortSignal): Promise<boolean> => {
 		const isConnected = await checkInternetConnection(this._timeoutMs, signal);
 		if (signal.aborted) {
@@ -190,7 +258,17 @@ export class ConnectionMonitor {
 		}
 		this._enableConsoleDebugLog && console.log(unixTime3Decimal(), `- ${isConnected ? 'C' : 'Not c'}onnected to internet.`);
 		if (isConnected) {
-			this.updateLastKnownConnectionTime();
+			// A successful fetch refreshes the data timer so pending waiters settle
+			// early and scheduled pings see recent data. It must not mark peers
+			// reachable, because the peer network may still be blocked while HTTP
+			// works, so the reachability side effect stays in
+			// updateLastKnownConnectionTime().
+			this._recordLastKnownConnectionTime();
+		} else {
+			// The internet is down, so treat peers as unreachable too. Fresh peer data
+			// after the grace period will mark them reachable again.
+			this._lastPeersUnreachableTimeMs = performance.now();
+			this._peersReachable = false;
 		}
 		this._lastFetchTimeMs = performance.now();
 		const prev = this._lastReportedStatus;
@@ -225,6 +303,13 @@ export class ConnectionMonitor {
 		if (!this._started) {
 			return false;
 		}
+		// While peers are not known to be reachable, throttle fetches to one per
+		// throttle window (which tracks the configured timeout). Waiters inside the
+		// window share a scheduled future fetch instead of reusing a past verdict, so
+		// the fresh-evidence rule is preserved.
+		if (this._peersReachable !== true && performance.now() - this._lastFetchTimeMs < this._timeoutMs) {
+			return this._getOrCreateThrottledFetch();
+		}
 		assert(this._abortSignal);
 		const signal = this._abortSignal!;
 		this._fetchCheckQueue = (async () => {
@@ -233,6 +318,31 @@ export class ConnectionMonitor {
 			return isConnected;
 		})();
 		return this._fetchCheckQueue;
+	}
+
+	// Creates (or returns) the single scheduled fetch that runs when the throttle
+	// window expires. The fetch uses the monitor-level abort signal, so it aborts
+	// instantly when the host stops. dispose() clears the timer and resolves the
+	// queue so pending waiters settle immediately on shutdown.
+	private _getOrCreateThrottledFetch = (): Promise<boolean> => {
+		if (this._throttledFetchQueue !== null) {
+			return this._throttledFetchQueue;
+		}
+		const delayMs = Math.max(0, this._lastFetchTimeMs + this._timeoutMs - performance.now());
+		this._throttledFetchQueue = new Promise<boolean>((resolve) => {
+			this._throttledFetchResolve = resolve;
+			this._throttledFetchTimeout = setTimeout(() => {
+				this._throttledFetchTimeout = null;
+				const resolveQueue = this._throttledFetchResolve!;
+				this._throttledFetchResolve = null;
+				this._throttledFetchQueue = null;
+				// The window has expired, so this call passes the throttle gate and runs
+				// a real fetch. Waiters await this promise, so their verdicts come from
+				// the future fetch, never from a past one.
+				resolveQueue(this._runFetchCheck());
+			}, delayMs);
+		});
+		return this._throttledFetchQueue;
 	}
 
 	// Obtains a verdict by pinging a connected node first, then falls back to the fetch
@@ -247,11 +357,11 @@ export class ConnectionMonitor {
 				this._pingQueue = this._pingHandler(this._timeoutMs, this._abortSignal!)
 					.catch(() => false)// A throwing handler is a ping failure, not an abort.
 					.then((success) => {
-					// A ping timeout disconnects the pinged node (see
-					// LegacyNodeConnection.ping), so after a failed ping waiters skip
-					// pinging for one cooldown period and fall back to the shared fetch.
-					// This rate-limits outage disconnects to one monitor ping per cooldown
-					// window. A null result (no node available to ping) arms nothing.
+						// A ping timeout disconnects the pinged node (see
+						// LegacyNodeConnection.ping), so after a failed ping waiters skip
+						// pinging for one cooldown period and fall back to the shared fetch.
+						// This rate-limits outage disconnects to one monitor ping per cooldown
+						// window. A null result (no node available to ping) arms nothing.
 						if (success === false) {
 							this._pingCooldownUntilMs = performance.now() + DEFAULT_pingCooldownMs;
 						}
@@ -281,17 +391,20 @@ export class ConnectionMonitor {
 	}
 
 	/**
-	 * The longest a connectedToInternetCheapAsync() verdict can take: the data wait, a
-	 * ping timeout, a fetch timeout, plus a safety margin for timer jitter.
+	 * The longest a waitForInternetCheapAsync() verdict can take: the data wait, a
+	 * ping timeout, the unreachable fetch throttle window, a fetch timeout, plus a
+	 * safety margin for timer jitter. The throttle window is included because it can
+	 * sit between the ping and the fetch (see _runFetchCheck); with the window
+	 * tracking the configured timeout this is dataWait + 3 * timeout + margin.
 	 */
 	getDisconnectThresholdMs = (): number => {
-		return DEFAULT_dataWaitMs + 2 * this._timeoutMs + DEFAULT_verdictSafetyNetMarginMs;
+		return DEFAULT_dataWaitMs + 3 * this._timeoutMs + DEFAULT_verdictSafetyNetMarginMs;
 	}
 
 	/**
 	 * Whether an updateLastKnownConnectionTime() call has arrived recently enough for
 	 * the per-node ping scheduler (LegacyNodeConnection) to skip its scheduled ping.
-	 * This is a global recency window, independent of connectedToInternetCheapAsync's
+	 * This is a global recency window, independent of waitForInternetCheapAsync's
 	 * per-waiter fresh-evidence rule.
 	 */
 	shouldSkipForRecentData = (): boolean => {
@@ -325,7 +438,9 @@ export class ConnectionMonitor {
 		this._pingHandler = handler;
 	}
 
-	updateLastKnownConnectionTime = (): void => {
+	// Records fresh evidence and resolves waiting waiters. Called on peer data and,
+	// with no reachability side effect, on fetch successes.
+	private _recordLastKnownConnectionTime = (): void => {
 		this._lastKnownConnectionTimeMs = performance.now();
 
 		// Check and resolve any waiting promises.
@@ -338,8 +453,59 @@ export class ConnectionMonitor {
 		});
 	}
 
+	updateLastKnownConnectionTime = (): void => {
+		this._recordLastKnownConnectionTime();
+		// Fresh peer data proves that peers are reachable, but only once the grace
+		// period has passed since the last mass disconnect or offline report. Stale
+		// or slow data (delayed packets around an outage, or nodes reconnecting
+		// slowly after one) must not reopen rating penalties for nodes that the
+		// outage disconnected.
+		if (this._lastKnownConnectionTimeMs - this._lastPeersUnreachableTimeMs >= DEFAULT_peersReachableGraceMs) {
+			this._peersReachable = true;
+			// Fresh peer data also fills in an unknown reported status as a silent
+			// initial value, so a later check report compares against an accurate
+			// previous status instead of null. Only null is overwritten: a false
+			// status from an offline check report must survive until a check
+			// confirms recovery, otherwise data arriving after an outage would
+			// silently flip it back to true and the recovery check would emit
+			// online_to_online instead of offline_to_online. No callback is called
+			// and no event is emitted here: events only ever fire from check
+			// reports (failure-triggered checks or fetches).
+			if (this._lastReportedStatus === null) {
+				this._lastReportedStatus = true;
+			}
+		}
+	}
+
 	getTimeSinceLastKnownConnectionMs = (): number => {
 		return performance.now() - this._lastKnownConnectionTimeMs;
+	}
+
+	// Marks a mass disconnect (a large portion of the connected peers dropping
+	// nearly simultaneously, as detected by the host) and treats peers as
+	// unreachable until fresh data after the grace period proves otherwise. Called
+	// by the host when its mass-disconnect detection fires. The host still needs to
+	// tell the monitor about this event, because a mass disconnect is invisible to
+	// the monitor's own data and fetch signals.
+	markMassDisconnect = (): void => {
+		this._lastPeersUnreachableTimeMs = performance.now();
+		this._peersReachable = false;
+	}
+
+	// Whether peers are currently considered reachable. A null (unknown) state counts
+	// as reachable, matching the assumed-online baseline used for the first check
+	// report after a start. The host skips rating penalties and blacklisting for
+	// disconnect failures only while peers are known unreachable, since the network
+	// is the likely cause.
+	arePeersReachable = (): boolean => {
+		return this._peersReachable !== false;
+	}
+
+	// How long ago peers were last known to be unreachable (a mass disconnect or an
+	// offline check report). The host uses this to require an outage-free window
+	// before running recoveries like the stuck-detection purge.
+	getTimeSincePeersWereUnreachableMs = (): number => {
+		return performance.now() - this._lastPeersUnreachableTimeMs;
 	}
 
 	/**
@@ -353,7 +519,7 @@ export class ConnectionMonitor {
 	// when pings fail; without connected nodes, fetches run directly. Concurrent waiters share
 	// a single ping and a single fetch: a fetch completing during a wait is reused instead of
 	// fetching again.
-	connectedToInternetCheapAsync = async (signal: AbortSignal): Promise<boolean> => {
+	waitForInternetCheapAsync = async (signal: AbortSignal): Promise<boolean> => {
 		if (!this._started) {
 			throw new Error('Not started');
 		}
@@ -373,11 +539,25 @@ export class ConnectionMonitor {
 		const condition = () => lastKnownConnectionTimeMsBefore + INCOMING_DATA_THRESHOLD_MS <= this._lastKnownConnectionTimeMs;
 		this._updateResolvers.push({ condition, resolver: updateResolver! });
 
+		// While peers are not known to be reachable (unknown or unreachable), only
+		// wait briefly for peer data. Peer data is not expected while peers are known
+		// to be unreachable, so the full wait only delays the verdict, and a short
+		// outage could end before a check ever ran. The brief wait still lets a
+		// healthy cold start resolve from its first handshake data without fetching.
+		const dataWaitMs = this._peersReachable === true ? DEFAULT_dataWaitMs : DEFAULT_unreachableDataWaitMs;
+
 		using combinedAbortController = combineAbortControllers(this._abortSignal!, signal);
 		try {
+			// Tracks whether the verdict came from peer data (as opposed to a ping or a
+			// fetch). Peer data inside the reachability grace period does not prove the
+			// outage ended (see the report gate below).
+			let resolvedByPeerData = false;
 			const verdict = await Promise.race([
-				updatePromise.then(() => true),
-				abortableSleepMsThrow(DEFAULT_dataWaitMs, combinedAbortController.signal).then(async () => {
+				updatePromise.then(() => {
+					resolvedByPeerData = true;
+					return true;
+				}),
+				abortableSleepMsThrow(dataWaitMs, combinedAbortController.signal).then(async () => {
 					// A fetch that completed during the wait is shared evidence, but like peer
 					// data it is only trusted once it lands INCOMING_DATA_THRESHOLD_MS past the
 					// fetch time observed at registration: a completion that close to the
@@ -389,14 +569,21 @@ export class ConnectionMonitor {
 					// nodes are connected, in which case the handler returns false).
 					return this._pingOrFetch();
 				}),
-				// Safety net: the ping takes up to timeoutMs and the fetch up to timeoutMs.
+				// Safety net: the ping takes up to timeoutMs, the throttle window up to
+				// timeoutMs, and the fetch up to timeoutMs (see getDisconnectThresholdMs).
 				abortableSleepMsThrow(this.getDisconnectThresholdMs(), combinedAbortController.signal).then(() => false)
 			]);
-			// Peer data and successful pings are fresh evidence of connectivity, so they
+			// Successful pings and peer data are fresh evidence of connectivity, so they
 			// report the offline-to-online transition here too. The fetch check is the only
 			// other source of reports, and it stops running once pings succeed again, so
 			// without this the reported status would stay stuck offline after a brief outage.
-			if (verdict && this._lastReportedStatus !== true) {
+			// Peer data is exempt while peers are known unreachable: data arriving inside
+			// the reachability grace period (delayed packets around an outage, or nodes
+			// reconnecting slowly after one) must not flip the status online, or the
+			// dashboard would show a false recovery blip that the next check contradicts.
+			// updateLastKnownConnectionTime() marks peers reachable again once the grace
+			// passes, and then peer-data verdicts report normally.
+			if (verdict && this._lastReportedStatus !== true && !(resolvedByPeerData && this._peersReachable === false)) {
 				const prev = this._lastReportedStatus;
 				this._lastReportedStatus = true;
 				this._callOnCheckResult(prev, true);
@@ -423,6 +610,9 @@ export class ConnectionMonitor {
 		// Await inside the using scope so the abort listeners stay attached for the whole
 		// check: an unawaited return would dispose the controller as soon as the body
 		// returns, leaving the in-flight fetch unresponsive to aborts.
-		return await checkInternetConnection(this._timeoutMs, combinedAbortController.signal);
+		// Runs through _runCheck so the fetch reports through the check-result
+		// callback (and the host's dashboard events) like every other fetch, and so
+		// an abort mid-check records and reports nothing.
+		return await this._runCheck(combinedAbortController.signal);
 	}
 }

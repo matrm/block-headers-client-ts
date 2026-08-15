@@ -760,6 +760,12 @@
 		let wsGen = 0;
 		let lastWsMsgTime = null;
 		let clientStartedAt = null;
+		// Whether the client is currently running, based on the client_start and
+		// client_stop events (a peer_connected or new_chain_tip event also proves
+		// the client is running). The variable starts as null because no event has
+		// arrived yet when the page loads, and until one does the connected-peer
+		// count is used to guess the status instead.
+		let clientRunning = null;
 		let adminVerified = BYPASS_ADMIN_AUTH;
 		let wsAdmin = BYPASS_ADMIN_AUTH;
 		let verifyDebounceTimer = null;
@@ -1109,6 +1115,9 @@
 				wsBadge.innerHTML = '<span class="dot"></span>Reconnecting to client...';
 				wsBadge.title = 'WebSocket disconnected; reconnecting.';
 				setStatusBadge(CLIENT_STATUS_UNKNOWN);
+				// The next connection may be to a restarted server whose client state we
+				// do not know, so stop trusting the old events until new ones arrive.
+				clientRunning = null;
 				wsReconnectTimer = setTimeout(connectWs, 5000);
 			};
 
@@ -1146,17 +1155,18 @@
 				// Drop other subacks (e.g. sub-nct); they are protocol-level
 				// confirmations and not user-visible events.
 
-			if (msg.type === 'new_chain_tip' && msg.data) {
-				addEventLogEntry('new_chain_tip', msg.data);
-				renderChainInfo(msg.data);
-				setStatusBadge(CLIENT_STATUS_RUNNING);
-				dispatchStatusUpdate();
-				renderEventLog();
-				throttledCall('memory', fetchMemoryUsage, 2000);
-				throttledCall('peers', refreshPeers, 2000);
-				throttledCall('headers', fetchHeadersDbInfo, 2000);
-				return;
-			}
+				if (msg.type === 'new_chain_tip' && msg.data) {
+					addEventLogEntry('new_chain_tip', msg.data);
+					renderChainInfo(msg.data);
+					clientRunning = true;
+					setStatusBadge(CLIENT_STATUS_RUNNING);
+					dispatchStatusUpdate();
+					renderEventLog();
+					throttledCall('memory', fetchMemoryUsage, 2000);
+					throttledCall('peers', refreshPeers, 2000);
+					throttledCall('headers', fetchHeadersDbInfo, 2000);
+					return;
+				}
 
 				if (msg.type === 'dashboard:event' && Array.isArray(msg.events)) {
 					for (let i = 0; i < msg.events.length; i++) {
@@ -1181,16 +1191,24 @@
 					updatePeerField(ev.data.ip, ev.data.port, 'tipHash', ev.data.hashHex);
 				}
 				if (ev.name === 'client_start') {
+					clientRunning = true;
 					setStatusBadge(CLIENT_STATUS_RUNNING);
 					dispatchStatusUpdate();
 					fetchMemoryUsage();
 					fetchHeadersDbInfo();
 				}
 				if (ev.name === 'client_stop') {
+					clientRunning = false;
 					setStatusBadge(CLIENT_STATUS_STOPPED);
 					dispatchStatusUpdate();
 					fetchMemoryUsage();
 					fetchHeadersDbInfo();
+				}
+				if (ev.name === 'peer_connected') {
+					// A peer can only connect while the client is running.
+					clientRunning = true;
+					setStatusBadge(CLIENT_STATUS_RUNNING);
+					dispatchStatusUpdate();
 				}
 			}
 
@@ -1455,19 +1473,13 @@
 		}
 
 		function updateStatus(peers) {
-			const btnStart = document.getElementById('btn-start');
-			const btnStop = document.getElementById('btn-stop');
-			if (peers && peers.length > 0) {
-				setStatusBadge(CLIENT_STATUS_RUNNING);
-				if (adminVerified) {
-					btnStart.disabled = true;
-					btnStop.disabled = false;
-				}
-			} else {
-				setStatusBadge(CLIENT_STATUS_STOPPED);
-				btnStart.disabled = false;
-				btnStop.disabled = true;
-			}
+			// The connected-peer count is only a fallback until the first
+			// running/stopping event is seen. The client keeps running with zero
+			// connected peers during an internet outage, so the peer count alone
+			// cannot decide the status.
+			const running = clientRunning !== null ? clientRunning : (peers && peers.length > 0);
+			setStatusBadge(running ? CLIENT_STATUS_RUNNING : CLIENT_STATUS_STOPPED);
+			dispatchStatusUpdate();
 		}
 
 		function dispatchStatusUpdate() {
@@ -1491,6 +1503,7 @@
 			try {
 				await apiFetch('/admin/start');
 				clientStartedAt = Date.now();
+				clientRunning = true;
 				updateStartBtnTitle();
 				showToast('Client started', 'success');
 				btn.textContent = '\u25B6 Start Client';
@@ -1510,6 +1523,7 @@
 				await apiFetch('/admin/stop');
 				showToast('Client stopped', 'success');
 				clientStartedAt = null;
+				clientRunning = false;
 				updateStartBtnTitle();
 				btn.textContent = '\u25A0 Stop Client';
 				setStatusBadge(CLIENT_STATUS_STOPPED);

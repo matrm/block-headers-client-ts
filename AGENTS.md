@@ -132,7 +132,7 @@ npm run start-nobuild   # Run server without rebuilding (requires prior build)
 - Comment style: Use `/** ... */` JSDoc only for public method documentation describing the API contract (parameters, return values, purpose). All other comments, including internal implementation notes, design decisions, test documentation, benchmark comments, and section headers, must use the `// ` prefix. Inline single-word comments inside code blocks (e.g., `catch (e) { /* expected */ }`) are an exception and may remain `/* */` for readability.
 - Private class members use an underscore prefix (e.g., `_foo`) in addition to TypeScript's `private` keyword (not `#` private fields). Internal code (tests, API server) reaches privates via `as any` casting. Reasons: cleaner code, debuggability and testability via `as any` casting to reach internals, and the ability to add internal-only members (e.g., on `BlockHeadersClient`) that the API server can access without exposing them to library-mode consumers.
 - Do not declare variables with `var`.
-- The em dash character (—) must not be used anywhere in the codebase.
+- The em dash character (—) must not be used anywhere in the codebase. Do not simply replace the character with something else. If you feel the need to use it, you must rephrase the text.
 
 ## Logging Strategy
 
