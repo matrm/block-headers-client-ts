@@ -703,7 +703,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 			const headerChainTip = this._blockHeadersDatabase.getHeaderTip();
 			const heightChainTip = headerChainTip.height;
 			const heightDownloaded = this._blockHeadersDatabase.getHeaderFromHashHex(this._tipHashHex)!.height;
-			const downloadedTipInLongestChain = this._blockHeadersDatabase.getHeaderFromHeight(heightDownloaded)!.hashHex === this._blockHeadersDatabase.getHeaderFromHashHex(this._tipHashHex)!.hashHex;// To check for a known reorg.
+			const downloadedTipInLongestChain = this._blockHeadersDatabase.getHeaderFromHeight(heightDownloaded)?.hashHex === this._blockHeadersDatabase.getHeaderFromHashHex(this._tipHashHex)!.hashHex;// To check for a known reorg. A downloaded tip taller than the longest chain is never in it.
 
 			this._enableConsoleDebugLog && console.log({
 				cH: heightChainTip,

@@ -3,25 +3,59 @@ import { assert } from './utils/util.js';
 
 export const HEADER_BUFFER_LENGTH = 80;
 const GENESIS_PREV_HASH_HEX = '0000000000000000000000000000000000000000000000000000000000000000';
+const MAX_HASH = BigInt(2) ** BigInt(256);
 
 function decodeTargetFromBitsBuffer(bitsBuffer: Buffer): bigint {
 	const bits = bitsBuffer.readUInt32BE(0);// Read as a 32-bit unsigned integer.
 	const exponent = (bits >>> 24) & 0xff;// Extract the first byte (exponent).
 	const coefficient = bits & 0xffffff;// Extract the lower 3 bytes (coefficient).
+	if (exponent < 3) {
+		throw new Error(`Invalid compact target exponent: ${exponent}`);
+	}
 	const target = BigInt(coefficient) * (BigInt(2) ** BigInt(8 * (exponent - 3)));
+	if (target > MAX_HASH) {
+		// A target above the 256-bit hash space is invalid because every hash would satisfy it
+		// and the header's work would be zero, which breaks work-based chain selection.
+		throw new Error('Invalid target: exceeds the maximum hash');
+	}
 	return target;
 }
 
 function calculateWorkFromTarget(target: bigint): bigint {
-	assert(target !== BigInt(0));
-	const maxHash = BigInt(2) ** BigInt(256);
-	return maxHash / target;
+	if (target === BigInt(0)) {
+		throw new Error('Invalid target: work cannot be calculated for a target of zero');
+	}
+	return MAX_HASH / target;
 }
 
 function verifyProofOfWork(hashHex: string, target: bigint): boolean {
 	assert(!hashHex.startsWith('0x'));
 	const hashValue: bigint = BigInt(`0x${hashHex}`);
 	return hashValue <= target;
+}
+
+export function getPrevHashHexFromBuffer(buffer: Buffer): string {
+	return Buffer.from(buffer.subarray(4, 36)).reverse().toString('hex');
+}
+
+export function getWorkFromBuffer(buffer: Buffer): bigint {
+	const target = decodeTargetFromBitsBuffer(Buffer.from(buffer.subarray(72, 76)).reverse());
+	return calculateWorkFromTarget(target);
+}
+
+/**
+ * Verifies the proof of work of a header buffer against its hash and returns its work.
+ * @param buffer - The 80-byte block header buffer.
+ * @param hashHex - The header's hash in display hex format.
+ * @returns The work of the header.
+ * @throws If the target is invalid or the hash does not satisfy the proof of work.
+ */
+export function getVerifiedWorkFromBuffer(buffer: Buffer, hashHex: string): bigint {
+	const target = decodeTargetFromBitsBuffer(Buffer.from(buffer.subarray(72, 76)).reverse());
+	if (!verifyProofOfWork(hashHex, target)) {
+		throw new Error('Invalid proof of work');
+	}
+	return calculateWorkFromTarget(target);
 }
 
 // Immutable interface with all properties.
@@ -68,7 +102,7 @@ export class BlockHeaderMutable implements BlockHeader {
 		}
 
 		this.buffer = buffer;
-		this.prevHashHex = Buffer.from(buffer.subarray(4, 36)).reverse().toString('hex');
+		this.prevHashHex = getPrevHashHexFromBuffer(buffer);
 		this.hashHex = sha256sha256(buffer).reverse().toString('hex');
 
 		if (!skipProofOfWorkCheck) {
@@ -135,8 +169,7 @@ export class BlockHeaderMutable implements BlockHeader {
 	}
 
 	get work(): bigint {
-		const target = decodeTargetFromBitsBuffer(this.bitsBuffer);
-		return calculateWorkFromTarget(target);
+		return getWorkFromBuffer(this.buffer);
 	}
 
 	get workHex(): string {

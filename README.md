@@ -6,13 +6,13 @@ A typescript bitcoin sv block headers client.
 
 - Follows the longest chain by proof of work.
 - Distinguishes between forks by using invalid blocks.
-- Efficiently re-orgs headers at a rate of 700k headers per second.
+- Efficiently re-orgs headers at a rate of hundreds of thousands of headers per second.
 - Multiple protections against sybil attacks.
 - Uses a reputation network for selecting the best nodes when connecting.
 
 ## System Requirements
 
-- 1GB of RAM per 1 million block headers.
+- 350MB of RAM per 1 million block headers.
 
 ## Library / Client Mode
 

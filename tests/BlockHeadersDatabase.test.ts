@@ -1,13 +1,15 @@
 /// <reference types="node" />
 import { mkdir } from 'node:fs/promises';
 
+import { Level } from 'level';
 import { expect, test, describe, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { removeDirectoryWithRetries, createDbWithRetries } from './testUtils';
 
-import { BlockHeaderMutable } from '../src/BlockHeader.js';
-import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase.js';
+import { BlockHeaderMutable, getPrevHashHexFromBuffer, getWorkFromBuffer } from '../src/BlockHeader.js';
+import { BlockHeadersDatabase, HEADERS_PER_CHUNK, WORK_CHECKPOINT_INTERVAL } from '../src/BlockHeadersDatabase.js';
 import { Chain, getInvalidBlocks } from '../src/chainProtocol.js';
 import { DEFAULT_DATABASE_PATH } from '../src/constants.js';
+import { sha256sha256 } from '../src/utils/crypto.js';
 import { getRandomHexString } from '../src/utils/util.js';
 
 const chain = 'bsv';
@@ -138,6 +140,171 @@ function buildChain(parentHashHex: string, count: number, startNonce: number, bi
 		prev = h.hashHex;
 	}
 	return headers;
+}
+
+// Low-difficulty bits (target 0x7fffff * 2^232) so synthetic headers can satisfy proof of work.
+const EASY_BITS_HEX = 'ffff7f20';
+// Higher-work variants of EASY_BITS_HEX (roughly 4x and 8x the work) for building winning forks.
+const HARDER_BITS_HEX = 'ffff3f20';
+const HARDEST_BITS_HEX = 'ffff1f20';
+// Compact bits with a target of exactly 2^256 so every hash satisfies proof of work on the
+// first nonce (work 1). Used for large chains where mining would otherwise dominate test time.
+const ALWAYS_VALID_BITS_HEX = '00000121';
+// Compact bits with a target of 2^248 (work 256 per header) for short, heavy winning forks.
+const WORK_256_BITS_HEX = '00000120';
+
+// Create a BlockHeaderMutable with a valid proof of work by trying successive nonces.
+function createValidHeader(prevHashHex: string, nonce: number, bitsHex: string = EASY_BITS_HEX): BlockHeaderMutable {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return BlockHeaderMutable.fromBuffer(createHeaderBuffer(prevHashHex, nonce + attempt, bitsHex));// Throws until a nonce produces a valid proof of work.
+		} catch { /* Invalid proof of work: try the next nonce. */ }
+	}
+}
+
+// Build a linear chain of headers with valid proof of work on top of an existing parent hash.
+function buildValidChain(parentHashHex: string, count: number, startNonce: number, bitsHex?: string): BlockHeaderMutable[] {
+	const headers: BlockHeaderMutable[] = [];
+	let prev = parentHashHex;
+	for (let i = 0; i < count; i++) {
+		const h = createValidHeader(prev, startNonce + i, bitsHex);
+		headers.push(h);
+		prev = h.hashHex;
+	}
+	return headers;
+}
+
+// A chain long enough to cross the HEADERS_PER_CHUNK boundary. Built once and shared by the
+// chunk-boundary tests because the headers are immutable and heights/work totals are
+// deterministic, so adding the same objects to different databases yields the same state.
+let cachedBulkChain: BlockHeaderMutable[] | undefined;
+function getBulkChain(): BlockHeaderMutable[] {
+	if (!cachedBulkChain) {
+		cachedBulkChain = buildValidChain(genesisHeader.hashHex, HEADERS_PER_CHUNK + 50, 900000, ALWAYS_VALID_BITS_HEX);
+	}
+	return cachedBulkChain;
+}
+
+// Reads the raw height keys stored in the LevelDB header database.
+async function getRawDatabaseHeights(databasePath: string): Promise<number[]> {
+	const level = new Level<number, Buffer>(databasePath, { keyEncoding: 'json', valueEncoding: 'buffer' });
+	await level.open();
+	const heights: number[] = [];
+	for await (const height of level.keys()) {
+		heights.push(height);
+	}
+	await level.close();
+	return heights.sort((a, b) => a - b);
+}
+
+// Asserts the internal data-structure invariants that the packed-chunk storage relies on:
+// the main chain height/hash bijection, packed buffer continuity, work checkpoints, the tip
+// work total, the fork map and the leaf set. Linear in the number of stored headers so tests
+// can call it after every mutating operation. packedHashCheckStep lets large-chain tests check
+// the packed bytes hash to the stored hash on only every Nth height instead of all of them.
+function assertDatabaseInvariants(db: BlockHeadersDatabase, options?: { packedHashCheckStep?: number; checkForkGetters?: boolean }): void {
+	const internal = db as any;
+	const packedHashCheckStep = options?.packedHashCheckStep ?? 1;
+	const checkForkGetters = options?.checkForkGetters ?? true;
+	const heightToHash = internal._heightToHash as string[];
+	const hashToHeight = internal._hashToHeight as Map<string, number>;
+	const forkHeaders = internal._forkHeaders as Map<string, { buffer: Buffer; height: number; workTotal: bigint }>;
+	const leafHashes = internal._headersTreeLeafHashes as Set<string>;
+	const chunks = internal._chunks as Buffer[];
+	const workCheckpoints = internal._workCheckpoints as bigint[];
+	const tipHeight = heightToHash.length - 1;
+
+	// Checks that would otherwise run per header are aggregated into a single error so the helper
+	// stays fast on chains with tens of thousands of headers.
+	let invariantError: string | undefined;
+	const recordError = (message: string): void => {
+		invariantError ??= message;
+	};
+
+	// The main chain hash<->height mappings are bijective.
+	expect(hashToHeight.size).toBe(heightToHash.length);
+	for (let height = 0; height < heightToHash.length; height++) {
+		if (typeof heightToHash[height] !== 'string' || hashToHeight.get(heightToHash[height]) !== height) {
+			recordError(`Main chain hash/height mapping is broken at height ${height}.`);
+		}
+	}
+
+	// Packed chunk buffers hold exactly the main chain headers and work checkpoints hold the
+	// cumulative work at each interval boundary.
+	expect(chunks.length).toBeGreaterThanOrEqual(Math.floor(tipHeight / HEADERS_PER_CHUNK) + 1);
+	expect(workCheckpoints.length).toBe(Math.floor(tipHeight / WORK_CHECKPOINT_INTERVAL) + 1);
+	expect(workCheckpoints[0]).toBe(genesisHeader.work);
+	let cumulativeWork = workCheckpoints[0];
+	for (let height = 1; height <= tipHeight; height++) {
+		const buffer = internal._getHeaderBufferFromHeight(height) as Buffer;
+		if (getPrevHashHexFromBuffer(buffer) !== heightToHash[height - 1]) {
+			recordError(`Packed header continuity is broken at height ${height}.`);
+		}
+		if ((height % packedHashCheckStep === 0 || height === tipHeight) && sha256sha256(buffer).reverse().toString('hex') !== heightToHash[height]) {
+			recordError(`Packed header bytes do not hash to the stored hash at height ${height}.`);
+		}
+		cumulativeWork += getWorkFromBuffer(buffer);
+		if (height % WORK_CHECKPOINT_INTERVAL === 0 && workCheckpoints[height / WORK_CHECKPOINT_INTERVAL] !== cumulativeWork) {
+			recordError(`Work checkpoint is wrong at height ${height}.`);
+		}
+	}
+
+	// Fork headers are disjoint from the main chain and carry the correct buffer size.
+	for (const [hashHex, forkHeader] of forkHeaders) {
+		if (hashToHeight.has(hashHex)) recordError(`Fork header ${hashHex} is also in the main chain.`);
+		if (forkHeader.buffer.length !== 80) recordError(`Fork header ${hashHex} has an invalid buffer length.`);
+		if (checkForkGetters) {
+			const headerFromHashHex = db.getHeaderFromHashHex(hashHex);
+			if (!headerFromHashHex || headerFromHashHex.height !== forkHeader.height || headerFromHashHex.workTotal !== forkHeader.workTotal) {
+				recordError(`Fork header getter does not match the stored fork header ${hashHex}.`);
+			}
+		}
+	}
+	expect(invariantError).toBeUndefined();
+
+	// The tip work total equals the recomputed cumulative work and is the maximum leaf work.
+	expect(db.getHeaderTip().workTotal).toBe(cumulativeWork);
+	let maxLeafWorkTotal = 0n;
+	for (const leafHashHex of leafHashes) {
+		const leafWorkTotal = leafHashHex === heightToHash[tipHeight] ? cumulativeWork : forkHeaders.get(leafHashHex)!.workTotal;
+		if (leafWorkTotal > maxLeafWorkTotal) maxLeafWorkTotal = leafWorkTotal;
+	}
+	expect(cumulativeWork).toBe(maxLeafWorkTotal);
+
+	// The leaf set is exactly the set of known headers with no known children.
+	const childCounts = new Map<string, number>();
+	for (let height = 1; height <= tipHeight; height++) {
+		const prevHashHex = getPrevHashHexFromBuffer(internal._getHeaderBufferFromHeight(height) as Buffer);
+		childCounts.set(prevHashHex, (childCounts.get(prevHashHex) ?? 0) + 1);
+	}
+	for (const forkHeader of forkHeaders.values()) {
+		const prevHashHex = getPrevHashHexFromBuffer(forkHeader.buffer);
+		childCounts.set(prevHashHex, (childCounts.get(prevHashHex) ?? 0) + 1);
+	}
+	const expectedLeafHashes = new Set<string>();
+	for (const hashHex of heightToHash) if (!childCounts.has(hashHex)) expectedLeafHashes.add(hashHex);
+	for (const hashHex of forkHeaders.keys()) if (!childCounts.has(hashHex)) expectedLeafHashes.add(hashHex);
+	expect(leafHashes).toEqual(expectedLeafHashes);
+
+	// The main chain tip must always be tracked as a leaf. A positive-work child of the tip
+	// always takes over the chain, and zero-work children are impossible because targets above
+	// 2^256 are rejected, so only a bookkeeping bug could displace the tip from the leaf set.
+	expect(leafHashes.has(heightToHash[tipHeight])).toBe(true);
+
+	// The block locator follows the exponential-backoff height schedule from the tip.
+	const expectedLocatorHashes: string[] = [];
+	let step = 1;
+	for (let height = tipHeight; height > 0; height -= step) {
+		if (expectedLocatorHashes.length >= 10) step *= 2;
+		expectedLocatorHashes.push(heightToHash[height]);
+	}
+	expectedLocatorHashes.push(heightToHash[0]);
+	expect(db.getBlockLocatorHashBuffers().map(buffer => buffer.toString('hex'))).toEqual(expectedLocatorHashes);
+
+	// Public counts are consistent with the internal structures.
+	expect(db.getNumLongestChainHeaders()).toBe(heightToHash.length);
+	expect(db.getNumAllHeaders()).toBe(heightToHash.length + forkHeaders.size);
+	expect(db.getNumCompetingTips()).toBe(leafHashes.size);
 }
 
 // --- Tests for BlockHeadersDatabase ---
@@ -427,9 +594,14 @@ describe('BlockHeadersDatabase', () => {
 			expect(headersRemovedFromLongestChain.length).toBe(0);
 			expect(headersAddedToLongestChain.length).toBe(0);
 			expect(headersInvalidated.length).toBe(2);// 9 and 10 of the reorg are invalidated.
+			expect(headersInvalidated.map(header => header.hashHex)).toEqual([headersReorg[1].hashHex, headersReorg[2].hashHex]);
 		}
 		expect(db.getHeaderTip().height).toBe(headersBeforeReorg.length);
 		expect(db.getHeaderTip().hashHex).toBe(headersBeforeReorg.at(-1)?.hashHex);
+		// Invalid headers and their descendants must never be stored, even as forks.
+		expect(db.getHeaderFromHashHex(headersReorg[1].hashHex)).toBeUndefined();
+		expect(db.getHeaderFromHashHex(headersReorg[2].hashHex)).toBeUndefined();
+		assertDatabaseInvariants(db);
 	});
 
 	test('2 connected invalid blocks', async () => {
@@ -608,6 +780,75 @@ describe('BlockHeadersDatabase', () => {
 		expect(db.getHeaderTip().workTotal).toBe(genesisHeader.work + headersBeforeReorg[0].work);
 	});
 
+	test('a duplicate ancestor header inside one batch must not corrupt the leaf set', () => {
+		const chain = buildChain(db.getHeaderTip().hashHex, 3, 1000);
+		const [a, b, c] = chain;
+
+		// A appears again after its descendants appeared in the same batch. The repeat is already
+		// known by the time it is reached, so it must be ignored.
+		const result = db.addHeaders([a, b, c, a]);
+		expect(result.headersRemovedFromLongestChain.length).toBe(0);
+		expect(result.headersAddedToLongestChain.length).toBe(3);
+		expect(result.headersInvalidated.length).toBe(0);
+		expect(db.getHeaderTip().hashHex).toBe(c.hashHex);
+
+		// The repeated A used to be re-added as a leaf even though B is its child, so the database
+		// reported a phantom competing tip.
+		expect(db.getNumCompetingTips()).toBe(1);
+
+		// The phantom leaf used to make the next addHeaders throw because A was neither the chain
+		// tip nor in _forkHeaders.
+		const [d] = buildChain(c.hashHex, 1, 2000);
+		db.addHeaders([d]);
+		expect(db.getHeaderTip().hashHex).toBe(d.hashHex);
+
+		// The phantom leaf also used to fail the pruneBranches leaf-set assertion.
+		expect(db.pruneBranches()).toBe(0);
+		expect(db.getNumCompetingTips()).toBe(1);
+		assertDatabaseInvariants(db);
+	});
+
+	test('a duplicate header in the middle of a batch does not stop the later headers from being added', () => {
+		const chain = buildChain(db.getHeaderTip().hashHex, 4, 3000);
+		const [a, b, c, d] = chain;
+
+		// A repeats in the middle of the batch. All non-duplicate headers must still be added.
+		const result = db.addHeaders([a, b, a, c, d]);
+		expect(result.headersRemovedFromLongestChain.length).toBe(0);
+		expect(result.headersAddedToLongestChain.length).toBe(4);
+		expect(result.headersInvalidated.length).toBe(0);
+		expect(db.getHeaderTip().hashHex).toBe(d.hashHex);
+		expect(db.getNumCompetingTips()).toBe(1);
+		assertDatabaseInvariants(db);
+	});
+
+	test('getHeaderFromHeight rejects out-of-range and non-integer heights', () => {
+		db.addHeaders(buildValidChain(db.getHeaderTip().hashHex, 3, 500));
+		expect(db.getHeaderFromHeight(-1)).toBeUndefined();
+		expect(db.getHeaderFromHeight(0.5)).toBeUndefined();
+		expect(db.getHeaderFromHeight(4)).toBeUndefined();
+		expect(db.getHeaderFromHeight(NaN)).toBeUndefined();
+		expect(db.getHeaderFromHeight(Infinity)).toBeUndefined();
+		expect(db.getHeaderFromHashHex('00'.repeat(32))).toBeUndefined();
+	});
+
+	test('getTimeSinceLastChainTipExtensionThisSessionMs only advances on main chain changes', () => {
+		expect(db.getTimeSinceLastChainTipExtensionThisSessionMs()).toBeUndefined();
+
+		const mainChain = buildValidChain(db.getHeaderTip().hashHex, 10, 600);
+		db.addHeaders(mainChain);
+		const lastExtensionMsAfterAdd = (db as any)._lastTimeChainTipExtendedMs as number;
+		expect(lastExtensionMsAfterAdd).toBeDefined();
+
+		// A losing fork does not change the longest chain, so the last extension time is unchanged.
+		db.addHeaders(buildValidChain(mainChain[5].hashHex, 1, 700));
+		expect((db as any)._lastTimeChainTipExtendedMs).toBe(lastExtensionMsAfterAdd);
+
+		// A reorg counts as a main chain change.
+		db.addHeaders(buildValidChain(mainChain[5].hashHex, 30, 800, HARDER_BITS_HEX));
+		expect((db as any)._lastTimeChainTipExtendedMs).not.toBe(lastExtensionMsAfterAdd);
+	});
+
 	describe('leaf hash set invariant', () => {
 		test('normal extension: chain tip is the only leaf after full sync', () => {
 			const genesisHashHex = db.getHeaderTip().hashHex;
@@ -679,7 +920,7 @@ describe('BlockHeadersDatabase', () => {
 			expect(leavesSet.has(mainExtension.at(-1)!.hashHex)).toBe(true);
 		});
 
-		test('pruneBranches restores leaf marker on a parent that lost all stale children', () => {
+		test('pruneBranches keeps a parent with a remaining child out of the leaf set', () => {
 			const genesisHashHex = db.getHeaderTip().hashHex;
 			const trunk = buildChain(genesisHashHex, 2, 100);
 			db.addHeaders(trunk);
@@ -698,8 +939,7 @@ describe('BlockHeadersDatabase', () => {
 			expect(leavesSet.size).toBe(1);
 			expect(leavesSet.has(mainBranch.at(-1)!.hashHex)).toBe(true);
 
-			const headersTree = (db as any)._headersTree as Map<string, unknown>;
-			// The_parent of the pruned fork should not reappear in the leaf set (it still has mainBranch).
+			// The parent of the pruned fork should not reappear in the leaf set (it still has mainBranch).
 			expect(leavesSet.has(trunk.at(-1)!.hashHex)).toBe(false);
 		});
 
@@ -734,169 +974,6 @@ describe('BlockHeadersDatabase', () => {
 
 			db.pruneBranches();
 			expect(db.getNumCompetingTips()).toBe(1);
-		});
-	});
-
-	describe('_treeAddChild and _treeRemoveChild sentinel helpers', () => {
-		// Directly exercise the sentinel-state helpers to catch accidental
-		// regressions that the higher-level chain-extension tests might miss.
-
-		const helpers = (d: BlockHeadersDatabase) => ({
-			add: (d as any)._treeAddChild as (p: string, c: string) => void,
-			remove: (d as any)._treeRemoveChild as (p: string, c: string) => void,
-			tree: (d as any)._headersTree as Map<string, string | Set<string> | null>,
-			leaves: (d as any)._headersTreeLeafHashes as Set<string>,
-		});
-
-		// --- _treeRemoveChild on a string parent ---
-
-		test('removing a non-matching child from a string parent is a no-op', () => {
-			const { add, remove, tree, leaves } = helpers(db);
-			const parent = db.getHeaderTip().hashHex;
-			const child = createHeader(parent, 9000).hashHex;
-			add(parent, child);
-			expect(tree.get(parent)).toBe(child);// string
-			remove(parent, 'aaaa_not_a_real_child_bbbb');
-			expect(tree.get(parent)).toBe(child);// still a string, not demoted to null
-			expect(leaves.has(parent)).toBe(false);// parent still has its real child
-		});
-
-		test('removing the only child from a string parent demotes to leaf', () => {
-			const { add, remove, tree, leaves } = helpers(db);
-			const parent = db.getHeaderTip().hashHex;
-			const child = createHeader(parent, 9001).hashHex;
-			add(parent, child);
-			expect(tree.get(parent)).toBe(child);
-			remove(parent, child);
-			expect(tree.get(parent)).toBe(null);
-			expect(leaves.has(parent)).toBe(true);
-		});
-
-		test('removing a child from a string parent when that child is already missing is idempotent', () => {
-			const { add, remove, tree, leaves } = helpers(db);
-			const parent = db.getHeaderTip().hashHex;
-			const child = createHeader(parent, 9002).hashHex;
-			add(parent, child);
-			remove(parent, child);// first remove: demotes to null
-			remove(parent, 'another_fake_child');// second remove: null parent, should exit early
-			expect(tree.get(parent)).toBe(null);
-			expect(leaves.has(parent)).toBe(true);
-		});
-
-		// --- _treeRemoveChild on a Set parent ---
-
-		test('removing a non-matching child from a Set parent is a no-op', () => {
-			const { add, remove, tree } = helpers(db);
-			const parent = db.getHeaderTip().hashHex;
-			const c1 = createHeader(parent, 9100).hashHex;
-			const c2 = createHeader(parent, 9101).hashHex;
-			add(parent, c1);
-			add(parent, c2);
-			const entry = tree.get(parent);
-			expect(entry instanceof Set).toBe(true);
-			expect((entry as Set<string>).size).toBe(2);
-
-			remove(parent, 'not_a_child_oooo');
-			const after = tree.get(parent);
-			expect(after instanceof Set).toBe(true);
-			expect((after as Set<string>).size).toBe(2);
-		});
-
-		test('Set demotes to string when penultimate child is removed', () => {
-			const { add, remove, tree } = helpers(db);
-			const parent = db.getHeaderTip().hashHex;
-			const c1 = createHeader(parent, 9200).hashHex;
-			const c2 = createHeader(parent, 9201).hashHex;
-			add(parent, c1);
-			add(parent, c2);
-			expect(tree.get(parent) instanceof Set).toBe(true);
-
-			remove(parent, c1);
-			expect(tree.get(parent)).toBe(c2);// demoted to string, not a Set
-		});
-
-		test('Set with 3 children stays a Set after removing one child', () => {
-			const { add, remove, tree } = helpers(db);
-			const parent = db.getHeaderTip().hashHex;
-			const c1 = createHeader(parent, 9300).hashHex;
-			const c2 = createHeader(parent, 9301).hashHex;
-			const c3 = createHeader(parent, 9302).hashHex;
-			add(parent, c1);
-			add(parent, c2);
-			add(parent, c3);
-			expect((tree.get(parent) as Set<string>).size).toBe(3);
-
-			remove(parent, c1);
-			const after = tree.get(parent) as Set<string>;
-			expect(after.size).toBe(2);
-			expect(after.has(c2)).toBe(true);
-			expect(after.has(c3)).toBe(true);
-		});
-
-		// --- _treeRemoveChild on undefined / null parent ---
-
-		test('removing from a parent not in the tree (undefined) is a no-op', () => {
-			const { remove, tree, leaves } = helpers(db);
-			const fakeParent = 'bbbb000000000000000000000000000000000000000000000000000000000000';
-			remove(fakeParent, 'any_child');
-			expect(tree.get(fakeParent)).toBeUndefined();
-			expect(leaves.has(fakeParent)).toBe(false);
-		});
-
-		test('removing from a null (leaf) parent is a no-op', () => {
-			const { add, remove, tree, leaves } = helpers(db);
-			const parent = db.getHeaderTip().hashHex;
-			const child = createHeader(parent, 9400).hashHex;
-			add(parent, child);
-			remove(parent, child);// parent is now null (leaf)
-			expect(tree.get(parent)).toBe(null);
-			expect(leaves.has(parent)).toBe(true);
-
-			// Try to remove again
-			remove(parent, child);
-			expect(tree.get(parent)).toBe(null);
-			expect(leaves.has(parent)).toBe(true);
-		});
-
-		// --- _treeAddChild duplicate guard ---
-
-		test('adding a duplicate child to a string parent is a no-op', () => {
-			const { add, tree } = helpers(db);
-			const parent = db.getHeaderTip().hashHex;
-			const child = createHeader(parent, 9500).hashHex;
-			add(parent, child);
-			expect(tree.get(parent)).toBe(child);// string
-			add(parent, child);// duplicate
-			expect(tree.get(parent)).toBe(child);// still a string, not promoted to Set
-		});
-
-		test('adding a duplicate child to a Set parent is a no-op', () => {
-			const { add, tree } = helpers(db);
-			const parent = db.getHeaderTip().hashHex;
-			const c1 = createHeader(parent, 9600).hashHex;
-			const c2 = createHeader(parent, 9601).hashHex;
-			add(parent, c1);
-			add(parent, c2);
-			expect((tree.get(parent) as Set<string>).size).toBe(2);
-			add(parent, c1);// duplicate
-			expect((tree.get(parent) as Set<string>).size).toBe(2);
-		});
-
-		// --- _treeAddChild null → string promotion ---
-
-		test('adding a child to a leaf (null) parent promotes to string', () => {
-			const { add, remove, tree, leaves } = helpers(db);
-			const parent = db.getHeaderTip().hashHex;
-			const child = createHeader(parent, 9700).hashHex;
-			add(parent, child);
-			remove(parent, child);// parent back to null (leaf)
-			expect(tree.get(parent)).toBe(null);
-			expect(leaves.has(parent)).toBe(true);
-
-			const child2 = createHeader(parent, 9701).hashHex;
-			add(parent, child2);
-			expect(tree.get(parent)).toBe(child2);// promoted to string
-			expect(leaves.has(parent)).toBe(false);
 		});
 	});
 
@@ -1038,5 +1115,926 @@ describe('BlockHeadersDatabase', () => {
 				}
 			}
 		});
+	});
+
+	describe('fromDatabase persistence', () => {
+		test('persists the longest chain and reloads it with identical headers, work totals and locator', async () => {
+			expect(db.getHeaderTip().height).toBe(0);
+			const chainFromGenesis = buildValidChain(db.getHeaderTip().hashHex, 300, 10000);
+			db.addHeaders(chainFromGenesis);
+			expect(db.getHeaderTip().height).toBe(300);
+			expect(db.getHeaderTip().hashHex).toBe(chainFromGenesis.at(-1)!.hashHex);
+
+			const expectedHeaders: { hashHex: string; height: number; workTotal: bigint }[] = [];
+			for (let h = 0; h <= db.getHeaderTip().height; h++) {
+				const header = db.getHeaderFromHeight(h)!;
+				expectedHeaders.push({ hashHex: header.hashHex, height: header.height, workTotal: header.workTotal });
+			}
+			const expectedNumLongestChainHeaders = db.getNumLongestChainHeaders();
+			const expectedLocator = db.getBlockLocatorHashBuffers().map(buffer => buffer.toString('hex'));
+
+			await db.close();
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: Array.from(getInvalidBlocks(chain)) });
+			await db.open();
+
+			// Only the longest chain is persisted; in-memory forks are not recovered.
+			expect(db.getHeaderTip().height).toBe(expectedHeaders.length - 1);
+			expect(db.getHeaderTip().hashHex).toBe(expectedHeaders.at(-1)!.hashHex);
+			expect(db.getNumLongestChainHeaders()).toBe(expectedNumLongestChainHeaders);
+			expect(db.getNumAllHeaders()).toBe(expectedNumLongestChainHeaders);
+			expect(db.getNumCompetingTips()).toBe(1);
+			for (let h = 0; h < expectedHeaders.length; h++) {
+				const header = db.getHeaderFromHeight(h)!;
+				expect(header.hashHex).toBe(expectedHeaders[h].hashHex);
+				expect(header.height).toBe(expectedHeaders[h].height);
+				expect(header.workTotal).toBe(expectedHeaders[h].workTotal);
+			}
+			expect(db.getBlockLocatorHashBuffers().map(buffer => buffer.toString('hex'))).toEqual(expectedLocator);
+		});
+
+		test('persists a reorged longest chain and drops the losing branch on reload', async () => {
+			const mainChain = buildValidChain(db.getHeaderTip().hashHex, 5, 20000);
+			db.addHeaders(mainChain);
+			const forkChain = buildValidChain(mainChain[1].hashHex, 6, 30000);// Longer than the main chain, so it wins.
+			db.addHeaders(forkChain);
+			expect(db.getHeaderTip().height).toBe(8);
+			expect(db.getHeaderTip().hashHex).toBe(forkChain.at(-1)!.hashHex);
+			expect(db.getHeaderFromHashHex(mainChain.at(-1)!.hashHex)).toBeDefined();
+
+			await db.close();
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(8);
+			expect(db.getHeaderTip().hashHex).toBe(forkChain.at(-1)!.hashHex);
+			expect(db.getHeaderFromHashHex(mainChain.at(-1)!.hashHex)).toBeUndefined();// The losing branch is not persisted.
+			const expectedChain = [genesisHeader, ...mainChain.slice(0, 2), ...forkChain];
+			let expectedWorkTotal = genesisHeader.work;
+			for (let h = 1; h < expectedChain.length; h++) {
+				expectedWorkTotal += expectedChain[h].work;
+				const header = db.getHeaderFromHeight(h)!;
+				expect(header.hashHex).toBe(expectedChain[h].hashHex);
+				expect(header.workTotal).toBe(expectedWorkTotal);
+			}
+		});
+
+		test('loads an empty database as genesis only', async () => {
+			await db.close();
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(0);
+			expect(db.getHeaderTip().hashHex).toBe(genesisHeader.hashHex);
+			expect(db.getNumAllHeaders()).toBe(1);
+			expect(db.getNumLongestChainHeaders()).toBe(1);
+			expect(db.getNumCompetingTips()).toBe(1);
+		});
+
+		test('truncates at a chain continuity break, deletes the stale entries and can extend on top afterwards', async () => {
+			const chainFromGenesis = buildValidChain(db.getHeaderTip().hashHex, 10, 500);
+			db.addHeaders(chainFromGenesis);
+			expect(db.getHeaderTip().height).toBe(10);
+			await db.close();
+
+			// Append stale headers at heights 11 and 12 whose parent does not match the height 10 header.
+			const level = new Level<number, Buffer>(databasePath, { keyEncoding: 'json', valueEncoding: 'buffer' });
+			await level.open();
+			const disconnectedHeader = createValidHeader('11'.repeat(32), 999999);
+			const disconnectedHeader2 = createValidHeader(disconnectedHeader.hashHex, 1000000);
+			await level.batch([
+				{ type: 'put', key: 11, value: disconnectedHeader.buffer },
+				{ type: 'put', key: 12, value: disconnectedHeader2.buffer },
+			]);
+			await level.close();
+
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(10);
+			expect(db.getHeaderTip().hashHex).toBe(chainFromGenesis.at(-1)!.hashHex);
+			expect(db.getHeaderFromHeight(11)).toBeUndefined();
+			expect(db.getHeaderFromHashHex(disconnectedHeader.hashHex)).toBeUndefined();
+			await db.close();
+			expect(await getRawDatabaseHeights(databasePath)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);// Stale entries were deleted.
+
+			// Extending on top of the truncated tip must write heights 11 and 12 again.
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			const extension = buildValidChain(chainFromGenesis.at(-1)!.hashHex, 2, 700);
+			const result = db.addHeaders(extension);
+			expect(result.headersAddedToLongestChain.length).toBe(2);
+			expect(db.getHeaderTip().height).toBe(12);
+			await db.close();
+			expect(await getRawDatabaseHeights(databasePath)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(12);
+			expect(db.getHeaderTip().hashHex).toBe(extension.at(-1)!.hashHex);
+		});
+
+		test('enforces invalid blocks on load and deletes the invalid tail', async () => {
+			const chainFromGenesis = buildValidChain(db.getHeaderTip().hashHex, 9, 40000);
+			db.addHeaders(chainFromGenesis);
+			await db.close();
+
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [chainFromGenesis[2].hashHex] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(2);
+			expect(db.getHeaderTip().hashHex).toBe(chainFromGenesis[1].hashHex);
+			expect(db.getHeaderFromHashHex(chainFromGenesis[2].hashHex)).toBeUndefined();
+			await db.close();
+			expect(await getRawDatabaseHeights(databasePath)).toEqual([1, 2]);
+		});
+
+		test('rejects a database containing a header with a zero target', async () => {
+			const chainFromGenesis = buildValidChain(db.getHeaderTip().hashHex, 10, 50000);
+			db.addHeaders(chainFromGenesis);
+			await db.close();
+
+			// A header that chains correctly but has compact bits with a zero coefficient (a zero target).
+			const level = new Level<number, Buffer>(databasePath, { keyEncoding: 'json', valueEncoding: 'buffer' });
+			await level.open();
+			const zeroTargetHeader = createHeader(chainFromGenesis.at(-1)!.hashHex, 123456, '0000001d');
+			await level.put(11, zeroTargetHeader.buffer);
+			await level.close();
+
+			await expect(BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] })).rejects.toThrow(/Invalid proof of work in database at height 11/);
+
+			// The failed load must release the LevelDB handle so the database can be reopened.
+			const levelAfterFailure = new Level<number, Buffer>(databasePath, { keyEncoding: 'json', valueEncoding: 'buffer' });
+			await levelAfterFailure.open();
+			await levelAfterFailure.del(11);
+			await levelAfterFailure.close();
+
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(10);
+			expect(db.getHeaderTip().hashHex).toBe(chainFromGenesis.at(-1)!.hashHex);
+		});
+
+		test('rejects a database containing a header with an invalid compact target exponent', async () => {
+			const chainFromGenesis = buildValidChain(db.getHeaderTip().hashHex, 10, 60000);
+			db.addHeaders(chainFromGenesis);
+			await db.close();
+
+			// A header that chains correctly but has compact bits with an exponent below 3 (fractional target).
+			const level = new Level<number, Buffer>(databasePath, { keyEncoding: 'json', valueEncoding: 'buffer' });
+			await level.open();
+			const invalidBitsHeader = createHeader(chainFromGenesis.at(-1)!.hashHex, 234567, '01000000');
+			await level.put(11, invalidBitsHeader.buffer);
+			await level.close();
+
+			await expect(BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] })).rejects.toThrow(/Invalid proof of work in database at height 11/);
+		});
+
+		test('truncates at a work-checkpoint boundary and can extend on top afterwards', async () => {
+			const chainFromGenesis = buildValidChain(db.getHeaderTip().hashHex, WORK_CHECKPOINT_INTERVAL + 36, 1600000);
+			db.addHeaders(chainFromGenesis);
+			expect(db.getHeaderTip().height).toBe(WORK_CHECKPOINT_INTERVAL + 36);
+			await db.close();
+
+			// Append a stale header whose parent does not match the height 64 header.
+			const level = new Level<number, Buffer>(databasePath, { keyEncoding: 'json', valueEncoding: 'buffer' });
+			await level.open();
+			const staleHeader = createValidHeader('11'.repeat(32), 1700000);
+			await level.put(WORK_CHECKPOINT_INTERVAL + 1, staleHeader.buffer);
+			await level.close();
+
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(WORK_CHECKPOINT_INTERVAL);
+			expect(db.getHeaderTip().hashHex).toBe(chainFromGenesis[WORK_CHECKPOINT_INTERVAL - 1].hashHex);
+			let expectedWorkTotal = genesisHeader.work;
+			for (let height = 1; height <= WORK_CHECKPOINT_INTERVAL; height++) expectedWorkTotal += chainFromGenesis[height - 1].work;
+			expect(db.getHeaderTip().workTotal).toBe(expectedWorkTotal);
+			assertDatabaseInvariants(db);
+
+			// Extending on top of the truncated tip must rebuild the checkpoint and write the heights again.
+			const extension = buildValidChain(chainFromGenesis[WORK_CHECKPOINT_INTERVAL - 1].hashHex, 5, 1800000, HARDER_BITS_HEX);
+			db.addHeaders(extension);
+			expect(db.getHeaderTip().height).toBe(WORK_CHECKPOINT_INTERVAL + 5);
+			await db.close();
+			expect(await getRawDatabaseHeights(databasePath)).toEqual(Array.from({ length: WORK_CHECKPOINT_INTERVAL + 5 }, (_, index) => index + 1));
+
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(WORK_CHECKPOINT_INTERVAL + 5);
+			expect(db.getHeaderTip().hashHex).toBe(extension.at(-1)!.hashHex);
+			expectedWorkTotal = genesisHeader.work;
+			for (let height = 1; height <= WORK_CHECKPOINT_INTERVAL; height++) expectedWorkTotal += chainFromGenesis[height - 1].work;
+			for (const header of extension) expectedWorkTotal += header.work;
+			expect(db.getHeaderTip().workTotal).toBe(expectedWorkTotal);
+			assertDatabaseInvariants(db);
+		}, 30000);
+
+		test('truncates at a chunk boundary and can extend on top afterwards', async () => {
+			const chainFromGenesis = getBulkChain();
+			db.addHeaders(chainFromGenesis);
+			expect(db.getHeaderTip().height).toBe(HEADERS_PER_CHUNK + 50);
+			await db.close();
+
+			// Append a stale header whose parent does not match the height 12500 header.
+			const level = new Level<number, Buffer>(databasePath, { keyEncoding: 'json', valueEncoding: 'buffer' });
+			await level.open();
+			const staleHeader = createValidHeader('22'.repeat(32), 2000000);
+			await level.put(HEADERS_PER_CHUNK + 1, staleHeader.buffer);
+			await level.close();
+
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(HEADERS_PER_CHUNK);
+			expect(db.getHeaderTip().hashHex).toBe(chainFromGenesis[HEADERS_PER_CHUNK - 1].hashHex);
+			expect(db.getHeaderFromHashHex(staleHeader.hashHex)).toBeUndefined();
+			assertDatabaseInvariants(db, { packedHashCheckStep: 1000 });
+
+			// Extending on top of the truncated tip must write into the second chunk again.
+			const extension = buildValidChain(chainFromGenesis[HEADERS_PER_CHUNK - 1].hashHex, 3, 2100000, HARDER_BITS_HEX);
+			db.addHeaders(extension);
+			expect(db.getHeaderTip().height).toBe(HEADERS_PER_CHUNK + 3);
+			expect(db.getHeaderTip().hashHex).toBe(extension.at(-1)!.hashHex);
+			assertDatabaseInvariants(db, { packedHashCheckStep: 1000 });
+			await db.close();
+			expect(await getRawDatabaseHeights(databasePath)).toEqual(Array.from({ length: HEADERS_PER_CHUNK + 3 }, (_, index) => index + 1));
+		}, 30000);
+
+		test('getters return distinct copies so callers cannot mutate stored headers', () => {
+			const chainFromGenesis = buildValidChain(db.getHeaderTip().hashHex, 3, 70000);
+			db.addHeaders(chainFromGenesis);
+			const first = db.getHeaderTip();
+			const second = db.getHeaderTip();
+			const fromHashHex = db.getHeaderFromHashHex(first.hashHex)!;
+			expect(first).not.toBe(second);
+			expect(fromHashHex).not.toBe(first);
+			expect(first.hashHex).toBe(second.hashHex);
+			expect(() => first.setHeight(first.height + 100)).toThrow();// Copies reject conflicting mutations like the originals.
+		});
+	});
+
+	describe('work checkpoints and chunk packing', () => {
+		test('work totals survive work-checkpoint and chunk boundaries in-session and across a reload', async () => {
+			// The chain crosses the WORK_CHECKPOINT_INTERVAL and HEADERS_PER_CHUNK boundaries.
+			const chainLength = HEADERS_PER_CHUNK + 100;
+			const chainFromGenesis = buildValidChain(db.getHeaderTip().hashHex, chainLength, 900000);
+			for (let i = 0; i < chainFromGenesis.length; i += 1000) {
+				db.addHeaders(chainFromGenesis.slice(i, i + 1000));
+			}
+			expect(db.getHeaderTip().height).toBe(chainLength);
+			expect(db.getHeaderTip().hashHex).toBe(chainFromGenesis.at(-1)!.hashHex);
+			expect(((db as any)._chunks as Buffer[]).length).toBe(Math.floor(chainLength / HEADERS_PER_CHUNK) + 1);
+
+			const heightsToCheck = new Set([
+				1,
+				WORK_CHECKPOINT_INTERVAL - 1,
+				WORK_CHECKPOINT_INTERVAL,
+				WORK_CHECKPOINT_INTERVAL + 1,
+				2 * WORK_CHECKPOINT_INTERVAL,
+				HEADERS_PER_CHUNK - 1,
+				HEADERS_PER_CHUNK,
+				HEADERS_PER_CHUNK + 1,
+				chainLength
+			]);
+			const expectedWorkTotals = new Map<number, bigint>();
+			let workTotal = genesisHeader.work;
+			for (let h = 1; h <= chainLength; h++) {
+				workTotal += chainFromGenesis[h - 1].work;
+				if (heightsToCheck.has(h)) {
+					expectedWorkTotals.set(h, workTotal);
+				}
+			}
+			const expectWorkTotals = () => {
+				for (const [h, expectedWorkTotal] of expectedWorkTotals) {
+					const header = db.getHeaderFromHeight(h)!;
+					expect(header.hashHex).toBe(chainFromGenesis[h - 1].hashHex);
+					expect(header.workTotal).toBe(expectedWorkTotal);
+				}
+			};
+			expectWorkTotals();
+			const middleHeight = 2 * WORK_CHECKPOINT_INTERVAL;
+			const middleHeader = db.getHeaderFromHashHex(chainFromGenesis[middleHeight - 1].hashHex)!;
+			expect(middleHeader.height).toBe(middleHeight);
+			expect(middleHeader.workTotal).toBe(expectedWorkTotals.get(middleHeight));
+
+			await db.close();
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(chainLength);
+			expectWorkTotals();
+		});
+
+		test('reorgs with the divergence at and just below a work-checkpoint boundary keep work totals correct', async () => {
+			const mainChain = buildValidChain(db.getHeaderTip().hashHex, WORK_CHECKPOINT_INTERVAL + 104, 100000);
+			db.addHeaders(mainChain);
+			expect(db.getHeaderTip().height).toBe(WORK_CHECKPOINT_INTERVAL + 104);
+
+			// This fork diverges exactly at the work checkpoint height.
+			const forkA = buildValidChain(mainChain[WORK_CHECKPOINT_INTERVAL - 1].hashHex, 200, 200000);
+			db.addHeaders(forkA);
+			expect(db.getHeaderTip().height).toBe(WORK_CHECKPOINT_INTERVAL + 200);
+			expect(db.getHeaderTip().hashHex).toBe(forkA.at(-1)!.hashHex);
+
+			// This fork diverges below the checkpoint height, forcing that checkpoint to be rebuilt.
+			const forkB = buildValidChain(mainChain[WORK_CHECKPOINT_INTERVAL - 2].hashHex, 250, 300000);
+			db.addHeaders(forkB);
+			expect(db.getHeaderTip().height).toBe(WORK_CHECKPOINT_INTERVAL + 249);
+			expect(db.getHeaderTip().hashHex).toBe(forkB.at(-1)!.hashHex);
+
+			const workPerHeader = mainChain[0].work;
+			const expectedWorkTotal = (h: number) => genesisHeader.work + BigInt(h) * workPerHeader;
+			const expectedHashHexAt = (h: number) => h <= WORK_CHECKPOINT_INTERVAL - 1 ? mainChain[h - 1].hashHex : forkB[h - WORK_CHECKPOINT_INTERVAL].hashHex;
+			const heightsToCheck = [
+				WORK_CHECKPOINT_INTERVAL - 1,
+				WORK_CHECKPOINT_INTERVAL,
+				WORK_CHECKPOINT_INTERVAL + 1,
+				WORK_CHECKPOINT_INTERVAL + 104,
+				WORK_CHECKPOINT_INTERVAL + 200,
+				WORK_CHECKPOINT_INTERVAL + 249
+			];
+			for (const h of heightsToCheck) {
+				const header = db.getHeaderFromHeight(h)!;
+				expect(header.hashHex).toBe(expectedHashHexAt(h));
+				expect(header.workTotal).toBe(expectedWorkTotal(h));
+			}
+			// The previous longest chain is retained as a fork with its work total.
+			const forkATip = db.getHeaderFromHashHex(forkA.at(-1)!.hashHex)!;
+			expect(forkATip.height).toBe(WORK_CHECKPOINT_INTERVAL + 200);
+			expect(forkATip.workTotal).toBe(expectedWorkTotal(WORK_CHECKPOINT_INTERVAL + 200));
+
+			await db.close();
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(WORK_CHECKPOINT_INTERVAL + 249);
+			expect(db.getHeaderTip().hashHex).toBe(forkB.at(-1)!.hashHex);
+			for (const h of heightsToCheck) {
+				const header = db.getHeaderFromHeight(h)!;
+				expect(header.hashHex).toBe(expectedHashHexAt(h));
+				expect(header.workTotal).toBe(expectedWorkTotal(h));
+			}
+		});
+
+		test('work totals remain correct when difficulty bits vary between headers', async () => {
+			const bitsSequence = [EASY_BITS_HEX, 'ffff7f1f'];// Both are easy to mine but have different work values.
+			const varyingWorkChain: BlockHeaderMutable[] = [];
+			let prevHashHex = db.getHeaderTip().hashHex;
+			for (let i = 0; i < 200; i++) {
+				const header = createValidHeader(prevHashHex, 500000 + i, bitsSequence[i % bitsSequence.length]);
+				varyingWorkChain.push(header);
+				prevHashHex = header.hashHex;
+			}
+			db.addHeaders(varyingWorkChain);
+			expect(db.getHeaderTip().height).toBe(200);
+
+			const expectedWorkTotal = (h: number) => genesisHeader.work + varyingWorkChain.slice(0, h).reduce((sum, header) => sum + header.work, 0n);
+			const heightsToCheck = [1, 50, 100, 199, 200];
+			for (const h of heightsToCheck) {
+				expect(db.getHeaderFromHeight(h)!.workTotal).toBe(expectedWorkTotal(h));
+			}
+
+			await db.close();
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			for (const h of heightsToCheck) {
+				expect(db.getHeaderFromHeight(h)!.workTotal).toBe(expectedWorkTotal(h));
+			}
+		});
+	});
+
+	describe('block locator and branch persistence', () => {
+		test('getBlockLocatorHashBuffers follows the height schedule down to genesis', () => {
+			expect(db.getBlockLocatorHashBuffers().map(buffer => buffer.toString('hex'))).toEqual([genesisHeader.hashBuffer.toString('hex')]);
+
+			const chainFromGenesis = buildChain(db.getHeaderTip().hashHex, 300, 400000);
+			db.addHeaders(chainFromGenesis);
+			const expectedHashes: Buffer[] = [];
+			let step = 1;
+			for (let i = 300; i > 0; i -= step) {
+				if (expectedHashes.length >= 10) {
+					step *= 2;
+				}
+				expectedHashes.push(chainFromGenesis[i - 1].hashBuffer);
+			}
+			expectedHashes.push(genesisHeader.hashBuffer);
+			expect(db.getBlockLocatorHashBuffers().map(buffer => buffer.toString('hex'))).toEqual(expectedHashes.map(buffer => buffer.toString('hex')));
+		});
+
+		test('fork headers are available in-session but are not persisted across a reload', async () => {
+			const mainChain = buildValidChain(db.getHeaderTip().hashHex, 4, 600000);
+			db.addHeaders(mainChain);
+			const forkHeader = buildValidChain(mainChain[1].hashHex, 1, 700000)[0];
+			db.addHeaders([forkHeader]);
+			expect(db.getHeaderFromHashHex(forkHeader.hashHex)?.height).toBe(3);
+			expect(db.getNumAllHeaders()).toBe(6);// Genesis + 4 main chain + 1 fork.
+			expect(db.getNumCompetingTips()).toBe(2);
+
+			await db.close();
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderFromHashHex(forkHeader.hashHex)).toBeUndefined();
+			expect(db.getNumAllHeaders()).toBe(5);
+			expect(db.getNumCompetingTips()).toBe(1);
+			expect(db.getHeaderTip().hashHex).toBe(mainChain.at(-1)!.hashHex);
+		});
+	});
+
+	describe('reorg edge cases', () => {
+		test('reorg across a chunk boundary rewrites packed chunks and survives a reload', async () => {
+			const mainChain = getBulkChain();
+			db.addHeaders(mainChain);
+			expect(db.getHeaderTip().height).toBe(HEADERS_PER_CHUNK + 50);
+
+			// The fork starts inside the first chunk and extends into the second one.
+			const forkParentHeight = HEADERS_PER_CHUNK - 9;
+			const forkStartHeight = forkParentHeight + 1;
+			const fork = buildValidChain(mainChain[forkParentHeight - 1].hashHex, 20, 1000000, HARDEST_BITS_HEX);
+			const result = db.addHeaders(fork);
+			expect(result.headersRemovedFromLongestChain.length).toBe(59);
+			expect(result.headersAddedToLongestChain.length).toBe(fork.length);
+			expect(db.getHeaderTip().hashHex).toBe(fork.at(-1)!.hashHex);
+			expect(db.getHeaderTip().height).toBe(forkStartHeight + fork.length - 1);
+
+			const expectedHeaderAtHeight = (height: number) => height < forkStartHeight ? mainChain[height - 1] : fork[height - forkStartHeight];
+			const selectedHeights = [1, HEADERS_PER_CHUNK - 10, HEADERS_PER_CHUNK - 9, forkStartHeight, forkStartHeight + 1, HEADERS_PER_CHUNK, HEADERS_PER_CHUNK + 1, db.getHeaderTip().height];
+			const selectedHeightsSet = new Set(selectedHeights);
+			const expectedWorkTotals = new Map<number, bigint>();
+			let expectedWorkTotal = genesisHeader.work;
+			for (let height = 1; height <= db.getHeaderTip().height; height++) {
+				expectedWorkTotal += expectedHeaderAtHeight(height).work;
+				if (selectedHeightsSet.has(height)) expectedWorkTotals.set(height, expectedWorkTotal);
+			}
+			for (const [height, workTotal] of expectedWorkTotals) {
+				const header = db.getHeaderFromHeight(height)!;
+				expect(header.hashHex).toBe(expectedHeaderAtHeight(height).hashHex);
+				expect(header.workTotal).toBe(workTotal);
+			}
+			assertDatabaseInvariants(db, { packedHashCheckStep: 1000 });
+
+			await db.close();
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().hashHex).toBe(fork.at(-1)!.hashHex);
+			expect(db.getHeaderTip().height).toBe(forkStartHeight + fork.length - 1);
+			assertDatabaseInvariants(db, { packedHashCheckStep: 1000 });
+		}, 30000);
+
+		test('reorg to a shorter but heavier chain keeps heights, work totals and forks correct', async () => {
+			const lightChain = buildValidChain(db.getHeaderTip().hashHex, 100, 1100000);
+			db.addHeaders(lightChain);
+			expect(db.getHeaderTip().height).toBe(100);
+
+			// 60 headers at ~8 work each beat the remaining 95 headers at ~2 work each.
+			const heavyChain = buildValidChain(lightChain[4].hashHex, 60, 1200000, HARDEST_BITS_HEX);
+			const result = db.addHeaders(heavyChain);
+			expect(result.headersRemovedFromLongestChain.length).toBe(95);
+			expect(result.headersAddedToLongestChain.length).toBe(heavyChain.length);
+			expect(db.getHeaderTip().hashHex).toBe(heavyChain.at(-1)!.hashHex);
+			expect(db.getHeaderTip().height).toBe(65);
+
+			let expectedWorkTotal = genesisHeader.work;
+			for (let height = 1; height <= 5; height++) {
+				expectedWorkTotal += lightChain[height - 1].work;
+				expect(db.getHeaderFromHeight(height)!.workTotal).toBe(expectedWorkTotal);
+			}
+			for (let i = 0; i < heavyChain.length; i++) {
+				expectedWorkTotal += heavyChain[i].work;
+				const header = db.getHeaderFromHeight(6 + i)!;
+				expect(header.hashHex).toBe(heavyChain[i].hashHex);
+				expect(header.workTotal).toBe(expectedWorkTotal);
+			}
+			expect(db.getHeaderFromHeight(66)).toBeUndefined();
+
+			// The losing chain is retained as a fork.
+			expect(db.getHeaderFromHashHex(lightChain.at(-1)!.hashHex)?.height).toBe(100);
+			assertDatabaseInvariants(db);
+
+			await db.close();
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(65);
+			expect(db.getHeaderTip().hashHex).toBe(heavyChain.at(-1)!.hashHex);
+			expect(db.getHeaderFromHashHex(lightChain.at(-1)!.hashHex)).toBeUndefined();
+			assertDatabaseInvariants(db);
+		}, 30000);
+
+		test('a longer but lighter fork does not replace the longest chain', () => {
+			const mainChain = buildValidChain(db.getHeaderTip().hashHex, 10, 1300000, HARDEST_BITS_HEX);
+			db.addHeaders(mainChain);
+			expect(db.getHeaderTip().height).toBe(10);
+
+			// This fork is taller (13 headers) but has less total work (13 * 2 < 5 * 8).
+			const lighterFork = buildValidChain(mainChain[4].hashHex, 13, 1400000, EASY_BITS_HEX);
+			const result = db.addHeaders(lighterFork);
+			expect(result.headersRemovedFromLongestChain.length).toBe(0);
+			expect(result.headersAddedToLongestChain.length).toBe(0);
+			expect(db.getHeaderTip().hashHex).toBe(mainChain.at(-1)!.hashHex);
+			expect(db.getHeaderTip().height).toBe(10);
+
+			const forkTip = db.getHeaderFromHashHex(lighterFork.at(-1)!.hashHex)!;
+			expect(forkTip.height).toBe(18);
+			expect(forkTip.workTotal).toBe(db.getHeaderFromHeight(5)!.workTotal + BigInt(lighterFork.length) * lighterFork[0].work);
+			// Fork heights beyond the longest chain tip are only reachable by hash, not by height.
+			expect(db.getHeaderFromHeight(18)).toBeUndefined();
+			expect(db.getNumCompetingTips()).toBe(2);
+			assertDatabaseInvariants(db);
+		});
+
+		test('reorg divergence sweep around work-checkpoint boundaries keeps all work totals correct', async () => {
+			const mainChainLength = 260;
+			const mainChain = buildValidChain(genesisHeader.hashHex, mainChainLength, 1500000);
+			const divergenceHeights = [63, 64, 65, 255, 256];
+			for (const divergenceHeight of divergenceHeights) {
+				if (db) {
+					await db.close();
+				}
+				await removeDirectoryWithRetries(databasePath);
+				await mkdir(databasePath);
+				db = await createDbWithRetries(() => BlockHeadersDatabase.fromGenesis({ databasePath, invalidBlocks: Array.from(getInvalidBlocks(chain)) }));
+
+				// Long enough to win on work despite the main chain being longer.
+				const forkLength = Math.ceil((mainChainLength - divergenceHeight) / 4) + 2;
+				const fork = buildValidChain(mainChain[divergenceHeight - 1].hashHex, forkLength, 1600000 + divergenceHeight * 10007, HARDEST_BITS_HEX);
+				db.addHeaders(mainChain);
+				const result = db.addHeaders(fork);
+				expect(result.headersRemovedFromLongestChain.length).toBe(mainChainLength - divergenceHeight);
+				expect(result.headersAddedToLongestChain.length).toBe(fork.length);
+				expect(db.getHeaderTip().hashHex).toBe(fork.at(-1)!.hashHex);
+				expect(db.getHeaderTip().height).toBe(divergenceHeight + fork.length);
+
+				// Every height's work total must be correct after the checkpoint at or below the divergence was rebuilt.
+				const internal = db as any;
+				const heightToHash = internal._heightToHash as string[];
+				const expectedWorkTotals = new Map<number, bigint>();
+				let expectedWorkTotal = genesisHeader.work;
+				for (let height = 1; height <= divergenceHeight; height++) {
+					expectedWorkTotal += mainChain[height - 1].work;
+					expect(heightToHash[height]).toBe(mainChain[height - 1].hashHex);
+					expect(internal._getWorkTotalFromHeight(height)).toBe(expectedWorkTotal);
+					expectedWorkTotals.set(height, expectedWorkTotal);
+				}
+				for (let i = 0; i < fork.length; i++) {
+					expectedWorkTotal += fork[i].work;
+					expect(heightToHash[divergenceHeight + 1 + i]).toBe(fork[i].hashHex);
+					expect(internal._getWorkTotalFromHeight(divergenceHeight + 1 + i)).toBe(expectedWorkTotal);
+					expectedWorkTotals.set(divergenceHeight + 1 + i, expectedWorkTotal);
+				}
+				// The public getter must agree with the internal work totals at the divergence and the tip.
+				for (const height of [divergenceHeight, divergenceHeight + 1, db.getHeaderTip().height]) {
+					const header = db.getHeaderFromHeight(height)!;
+					expect(header.workTotal).toBe(expectedWorkTotals.get(height));
+				}
+				assertDatabaseInvariants(db);
+			}
+		}, 60000);
+
+		test('a fork with equal total work does not replace the longest chain and pruneBranches keeps the chain tip', () => {
+			const mainChain = buildValidChain(genesisHeader.hashHex, 2, 2300000, ALWAYS_VALID_BITS_HEX);
+			db.addHeaders(mainChain);
+
+			// Every header has work 1, so both branches have exactly the same total work.
+			const equalFork = buildValidChain(genesisHeader.hashHex, 2, 2400000, ALWAYS_VALID_BITS_HEX);
+			const result = db.addHeaders(equalFork);
+			expect(result.headersRemovedFromLongestChain.length).toBe(0);
+			expect(result.headersAddedToLongestChain.length).toBe(0);
+			expect(db.getHeaderTip().hashHex).toBe(mainChain.at(-1)!.hashHex);
+			expect(db.getNumCompetingTips()).toBe(2);
+
+			expect(db.pruneBranches()).toBe(1);
+			expect(db.getNumCompetingTips()).toBe(1);
+			expect((db as any)._headersTreeLeafHashes.has(mainChain.at(-1)!.hashHex)).toBe(true);
+			assertDatabaseInvariants(db);
+		});
+
+		test('releases packed chunks that are no longer needed after a reorg to a shorter chain', () => {
+			const mainChain = getBulkChain();
+			db.addHeaders(mainChain);
+			expect(db.getHeaderTip().height).toBe(HEADERS_PER_CHUNK + 50);
+			expect(((db as any)._chunks as Buffer[]).length).toBe(Math.floor((HEADERS_PER_CHUNK + 50) / HEADERS_PER_CHUNK) + 1);
+
+			// This fork starts near the end of the first packed chunk and wins with 2 high work
+			// headers, so the new tip is shorter than the second chunk and it must be released.
+			const winningFork = buildValidChain(mainChain[HEADERS_PER_CHUNK - 101].hashHex, 2, 2600000, WORK_256_BITS_HEX);
+			const result = db.addHeaders(winningFork);
+			expect(result.headersRemovedFromLongestChain.length).toBe(HEADERS_PER_CHUNK + 50 - (HEADERS_PER_CHUNK - 100));
+			expect(result.headersAddedToLongestChain.length).toBe(winningFork.length);
+			expect(db.getHeaderTip().height).toBe(HEADERS_PER_CHUNK - 98);
+			expect(((db as any)._chunks as Buffer[]).length).toBe(1);
+			assertDatabaseInvariants(db, { packedHashCheckStep: 1000 });
+		}, 30000);
+	});
+
+	describe('compact target overflow protection', () => {
+		test('a zero work header must not exit pruneBranches', () => {
+			const zeroWorkHeader = createHeader(genesisHeader.hashHex, 100, 'ffffff21');
+			let addError: unknown;
+			try {
+				db.addHeaders([zeroWorkHeader]);
+			} catch (error) {
+				addError = error;
+			}
+
+			expect(db.getHeaderTip().hashHex).toBe(genesisHeader.hashHex);
+			// A zero work child of the chain tip displaces it from the leaf set, so pruning must
+			// not assume the chain tip is still tracked as a leaf.
+			expect(db.pruneBranches()).toBe(0);
+			expect(db.getNumCompetingTips()).toBe(1);
+			expect(addError).toBeInstanceOf(Error);
+			expect((addError as Error | undefined)?.message).toBe('Invalid target: exceeds the maximum hash');
+			assertDatabaseInvariants(db, { checkForkGetters: false });
+		});
+
+		test('rejects a database containing a header with a compact target above 2^256', async () => {
+			const chainFromGenesis = buildValidChain(db.getHeaderTip().hashHex, 10, 2700000, ALWAYS_VALID_BITS_HEX);
+			db.addHeaders(chainFromGenesis);
+			await db.close();
+
+			// A header that chains correctly but has compact bits whose target overflows 2^256.
+			const level = new Level<number, Buffer>(databasePath, { keyEncoding: 'json', valueEncoding: 'buffer' });
+			await level.open();
+			const overflowHeader = createHeader(chainFromGenesis.at(-1)!.hashHex, 567890, 'ffffff21');
+			await level.put(11, overflowHeader.buffer);
+			await level.close();
+
+			await expect(BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] })).rejects.toThrow(/Invalid proof of work in database at height 11/);
+
+			// The failed load must release the LevelDB handle so the database can be reopened.
+			const levelAfterFailure = new Level<number, Buffer>(databasePath, { keyEncoding: 'json', valueEncoding: 'buffer' });
+			await levelAfterFailure.open();
+			await levelAfterFailure.del(11);
+			await levelAfterFailure.close();
+
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			expect(db.getHeaderTip().height).toBe(10);
+		});
+	});
+
+	describe('internal invariants', () => {
+		test('hold after creation, normal extension, forks, reorgs and pruneBranches', () => {
+			assertDatabaseInvariants(db);
+			const mainChain = buildValidChain(db.getHeaderTip().hashHex, 150, 2200000);
+			db.addHeaders(mainChain);
+			assertDatabaseInvariants(db);
+
+			// A losing fork and a winning fork.
+			db.addHeaders(buildValidChain(mainChain[100].hashHex, 5, 2300000));
+			assertDatabaseInvariants(db);
+			db.addHeaders(buildValidChain(mainChain[50].hashHex, 120, 2400000, HARDER_BITS_HEX));
+			assertDatabaseInvariants(db);
+
+			db.pruneBranches();
+			assertDatabaseInvariants(db);
+			expect(db.getNumCompetingTips()).toBe(1);
+			expect(db.getNumAllHeaders()).toBe(db.getNumLongestChainHeaders());
+		});
+
+		test('hold across a close and reload', async () => {
+			db.addHeaders(buildValidChain(db.getHeaderTip().hashHex, 200, 2500000));
+			db.addHeaders(buildValidChain(db.getHeaderFromHeight(100)!.hashHex, 150, 2600000, HARDER_BITS_HEX));
+			assertDatabaseInvariants(db);
+
+			await db.close();
+			db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+			await db.open();
+			assertDatabaseInvariants(db);
+			expect(db.getNumCompetingTips()).toBe(1);
+		});
+	});
+
+	describe('reference model fuzz', () => {
+		test('random chains, forks, prunes and reloads keep the database consistent with a reference model', async () => {
+			type ReferenceHeader = {
+				prevHashHex: string;
+				height: number;
+				workTotal: bigint;
+				childHashes: Set<string>;
+			};
+			const reference = new Map<string, ReferenceHeader>();
+			reference.set(genesisHeader.hashHex, {
+				prevHashHex: '0'.repeat(64),
+				height: 0,
+				workTotal: genesisHeader.work,
+				childHashes: new Set()
+			});
+			const everAddedHashes = new Set<string>([genesisHeader.hashHex]);
+
+			let rngState = 123456789;
+			const random = () => {
+				rngState = (Math.imul(rngState, 1664525) + 1013904223) >>> 0;
+				return rngState / 4294967296;
+			};
+			let nonceCounter = 2200000;
+			const bitsOptions = [EASY_BITS_HEX, HARDER_BITS_HEX, HARDEST_BITS_HEX];
+
+			const getReferenceLeaves = (): string[] => {
+				const leaves: string[] = [];
+				for (const [hashHex, referenceHeader] of reference) {
+					if (!referenceHeader.childHashes.size) leaves.push(hashHex);
+				}
+				return leaves;
+			};
+
+			const rebuildReferenceChildren = (): void => {
+				for (const referenceHeader of reference.values()) referenceHeader.childHashes.clear();
+				for (const [hashHex, referenceHeader] of reference) {
+					if (hashHex === genesisHeader.hashHex) continue;
+					reference.get(referenceHeader.prevHashHex)!.childHashes.add(hashHex);
+				}
+			};
+
+			const getReferenceMainChain = (): [string, ReferenceHeader][] => {
+				const chain: [string, ReferenceHeader][] = [];
+				let hashHex = db.getHeaderTip().hashHex;
+				while (true) {
+					const referenceHeader = reference.get(hashHex);
+					if (!referenceHeader) throw new Error(`Database tip ${hashHex} is not in the reference model`);
+					chain.push([hashHex, referenceHeader]);
+					if (hashHex === genesisHeader.hashHex) break;
+					hashHex = referenceHeader.prevHashHex;
+				}
+				chain.reverse();
+				return chain;
+			};
+
+			const validateAgainstReference = (): void => {
+				const internal = db as any;
+				const heightToHash = internal._heightToHash as string[];
+				const mainChain = getReferenceMainChain();
+				const leaves = getReferenceLeaves();
+				let maxLeafWorkTotal = 0n;
+				for (const leafHashHex of leaves) {
+					const leafWorkTotal = reference.get(leafHashHex)!.workTotal;
+					if (leafWorkTotal > maxLeafWorkTotal) maxLeafWorkTotal = leafWorkTotal;
+				}
+				expect(db.getHeaderTip().workTotal).toBe(maxLeafWorkTotal);
+				expect(db.getHeaderTip().height).toBe(mainChain.length - 1);
+				expect(heightToHash.length).toBe(mainChain.length);
+				let chainError: string | undefined;
+				for (let height = 0; height < mainChain.length; height++) {
+					if (heightToHash[height] !== mainChain[height][0]) {
+						chainError ??= `Main chain hash is wrong at height ${height}.`;
+					}
+				}
+				expect(chainError).toBeUndefined();
+				// Check the work totals and the public getters on a spread of sampled heights.
+				const sampledHeights = new Set([0, 1, 2, mainChain.length - 2, mainChain.length - 1]);
+				for (let height = 3; height < mainChain.length - 2; height += 32) sampledHeights.add(height);
+				for (const height of sampledHeights) {
+					if (height < 0 || height >= mainChain.length) continue;
+					const [hashHex, referenceHeader] = mainChain[height];
+					expect(internal._getWorkTotalFromHeight(height)).toBe(referenceHeader.workTotal);
+					const header = db.getHeaderFromHeight(height)!;
+					expect(header.hashHex).toBe(hashHex);
+					expect(header.height).toBe(height);
+					expect(header.workTotal).toBe(referenceHeader.workTotal);
+				}
+				const mainChainHashes = new Set(mainChain.map(([hashHex]) => hashHex));
+				const forkHeaders = internal._forkHeaders as Map<string, { height: number; workTotal: bigint }>;
+				let numForkHeaders = 0;
+				let forkError: string | undefined;
+				let forkGetterCheckCounter = 0;
+				for (const [hashHex, referenceHeader] of reference) {
+					if (mainChainHashes.has(hashHex)) continue;
+					numForkHeaders++;
+					const forkRecord = forkHeaders.get(hashHex);
+					if (!forkRecord || forkRecord.height !== referenceHeader.height || forkRecord.workTotal !== referenceHeader.workTotal) {
+						forkError ??= `Fork header ${hashHex} is missing or inconsistent.`;
+					}
+					if (forkGetterCheckCounter++ % 16 === 0) {
+						const forkHeader = db.getHeaderFromHashHex(hashHex)!;
+						expect(forkHeader.height).toBe(referenceHeader.height);
+						expect(forkHeader.workTotal).toBe(referenceHeader.workTotal);
+					}
+				}
+				expect(forkError).toBeUndefined();
+				expect(db.getNumAllHeaders()).toBe(mainChain.length + numForkHeaders);
+				expect(db.getNumCompetingTips()).toBe(leaves.length);
+				assertDatabaseInvariants(db, { packedHashCheckStep: 16, checkForkGetters: false });
+			};
+
+			const addReferenceHeader = (header: BlockHeaderMutable, parentHashHex: string, parentReferenceHeader: ReferenceHeader): void => {
+				reference.set(header.hashHex, {
+					prevHashHex: parentHashHex,
+					height: parentReferenceHeader.height + 1,
+					workTotal: parentReferenceHeader.workTotal + header.work,
+					childHashes: new Set()
+				});
+				parentReferenceHeader.childHashes.add(header.hashHex);
+				everAddedHashes.add(header.hashHex);
+			};
+
+			// The returned changes must exactly describe the main chain diff that LevelDB persistence
+			// and the new_chain_tip emit rely on.
+			const expectChainDiffMatches = (result: { headersRemovedFromLongestChain: { hashHex: string }[]; headersAddedToLongestChain: { hashHex: string }[] }, previousMainChainHashes: Set<string>): void => {
+				const newMainChainHashes = new Set(getReferenceMainChain().map(([hashHex]) => hashHex));
+				const expectedAdded = Array.from(newMainChainHashes).filter(hashHex => !previousMainChainHashes.has(hashHex)).sort();
+				const expectedRemoved = Array.from(previousMainChainHashes).filter(hashHex => !newMainChainHashes.has(hashHex)).sort();
+				expect(result.headersAddedToLongestChain.map(header => header.hashHex).sort()).toEqual(expectedAdded);
+				expect(result.headersRemovedFromLongestChain.map(header => header.hashHex).sort()).toEqual(expectedRemoved);
+			};
+
+			const addChain = (parentHashHex: string, length: number, options?: { forcedBitsHex?: string; oneAtATime?: boolean; duplicates?: boolean }): void => {
+				const headers: BlockHeaderMutable[] = [];
+				let prevHashHex = parentHashHex;
+				for (let i = 0; i < length; i++) {
+					const bitsHex = options?.forcedBitsHex ?? bitsOptions[Math.floor(random() * bitsOptions.length)];
+					const header = createValidHeader(prevHashHex, nonceCounter, bitsHex);
+					nonceCounter += 997;
+					headers.push(header);
+					prevHashHex = header.hashHex;
+				}
+				if (options?.oneAtATime || options?.duplicates) {
+					let currentParentHashHex = parentHashHex;
+					for (const header of headers) {
+						const parentReferenceHeader = reference.get(currentParentHashHex);
+						if (!parentReferenceHeader) {
+							// The parent is unknown (for example pruned): the database must ignore this header.
+							const ignoredResult = db.addHeaders([header]);
+							expect(ignoredResult.headersAddedToLongestChain.length).toBe(0);
+							expect(ignoredResult.headersRemovedFromLongestChain.length).toBe(0);
+							continue;
+						}
+						const previousMainChainHashes = new Set(getReferenceMainChain().map(([hashHex]) => hashHex));
+						const result = db.addHeaders(options.duplicates ? [header, header] : [header]);
+						addReferenceHeader(header, currentParentHashHex, parentReferenceHeader);
+						expectChainDiffMatches(result, previousMainChainHashes);
+						currentParentHashHex = header.hashHex;
+						if (options.oneAtATime) validateAgainstReference();
+					}
+				} else {
+					const previousMainChainHashes = new Set(getReferenceMainChain().map(([hashHex]) => hashHex));
+					const result = db.addHeaders(headers);
+					let currentParentHashHex = parentHashHex;
+					for (const header of headers) {
+						const parentReferenceHeader = reference.get(currentParentHashHex);
+						if (!parentReferenceHeader) break;
+						addReferenceHeader(header, currentParentHashHex, parentReferenceHeader);
+						currentParentHashHex = header.hashHex;
+					}
+					expectChainDiffMatches(result, previousMainChainHashes);
+				}
+			};
+
+			const prune = (): void => {
+				const mainChain = getReferenceMainChain();
+				const mainChainHashes = new Set(mainChain.map(([hashHex]) => hashHex));
+				const numLeavesBefore = getReferenceLeaves().length;
+				for (const hashHex of Array.from(reference.keys())) {
+					if (!mainChainHashes.has(hashHex)) reference.delete(hashHex);
+				}
+				rebuildReferenceChildren();
+				expect(db.pruneBranches()).toBe(Math.max(0, numLeavesBefore - 1));
+				validateAgainstReference();
+			};
+
+			const reload = async (): Promise<void> => {
+				const mainChain = getReferenceMainChain();
+				const mainChainHashes = new Set(mainChain.map(([hashHex]) => hashHex));
+				for (const hashHex of Array.from(reference.keys())) {
+					if (!mainChainHashes.has(hashHex)) reference.delete(hashHex);
+				}
+				rebuildReferenceChildren();
+				await db.close();
+				db = await BlockHeadersDatabase.fromDatabase({ databasePath, invalidBlocks: [] });
+				await db.open();
+				validateAgainstReference();
+			};
+
+			let prunedHashes: string[] = [];
+			const updatePrunedHashes = (): void => {
+				prunedHashes = Array.from(everAddedHashes).filter(hashHex => !reference.has(hashHex));
+			};
+
+			validateAgainstReference();
+			for (let operation = 0; operation < 100; operation++) {
+				const roll = random();
+				if (roll < 0.5) {
+					const hashes = Array.from(reference.keys());
+					addChain(hashes[Math.floor(random() * hashes.length)], 1 + Math.floor(random() * 6));
+				} else if (roll < 0.6) {
+					const hashes = Array.from(reference.keys());
+					addChain(hashes[Math.floor(random() * hashes.length)], 1 + Math.floor(random() * 4), { oneAtATime: true });
+				} else if (roll < 0.68) {
+					const hashes = Array.from(reference.keys());
+					addChain(hashes[Math.floor(random() * hashes.length)], 1 + Math.floor(random() * 3), { duplicates: true });
+				} else if (roll < 0.76) {
+					if (prunedHashes.length) {
+						addChain(prunedHashes[Math.floor(random() * prunedHashes.length)], 1 + Math.floor(random() * 3));
+					}
+				} else if (roll < 0.86) {
+					prune();
+					updatePrunedHashes();
+				} else if (roll < 0.95) {
+					await reload();
+					updatePrunedHashes();
+				} else {
+					// Extend an existing fork with high-work headers so it takes over the longest chain.
+					const mainChain = getReferenceMainChain();
+					const mainChainHashes = new Set(mainChain.map(([hashHex]) => hashHex));
+					const forkHashes = Array.from(reference.keys()).filter(hashHex => !mainChainHashes.has(hashHex));
+					if (forkHashes.length) {
+						addChain(forkHashes[0], 1 + Math.floor(random() * 4), { forcedBitsHex: HARDEST_BITS_HEX });
+					} else {
+						addChain(mainChain[Math.max(0, mainChain.length - 3)][0], 2, { forcedBitsHex: HARDEST_BITS_HEX });
+					}
+				}
+				validateAgainstReference();
+			}
+		}, 60000);
 	});
 });

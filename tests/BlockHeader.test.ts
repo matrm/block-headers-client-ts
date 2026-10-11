@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import { expect, test, describe } from 'vitest';
-import { BlockHeaderMutable } from '../src/BlockHeader.js';
+import { BlockHeaderMutable, getWorkFromBuffer, getVerifiedWorkFromBuffer } from '../src/BlockHeader.js';
 
 const GENESIS_HEADER_HEX = '0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c';
 const GENESIS_HASH_HEX = '000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f';
@@ -42,6 +42,46 @@ describe('BlockHeader', () => {
 		// Create a header with a valid structure but incorrect nonce (invalid PoW).
 		const invalidPowHeaderHex = '0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d00000000';
 		expect(() => BlockHeaderMutable.fromHex(invalidPowHeaderHex)).toThrow('Invalid proof of work');
+	});
+
+	test('getWorkFromBuffer should throw for a zero target instead of exiting the process', () => {
+		const buffer = Buffer.from(GENESIS_HEADER_HEX, 'hex');
+		Buffer.from('0000001d', 'hex').copy(buffer, 72);// Compact bits with exponent 0x1d and a zero coefficient.
+		expect(() => getWorkFromBuffer(buffer)).toThrow('Invalid target: work cannot be calculated for a target of zero');
+	});
+
+	test('getWorkFromBuffer should throw for a compact target exponent below 3', () => {
+		const buffer = Buffer.from(GENESIS_HEADER_HEX, 'hex');
+		Buffer.from('01000000', 'hex').copy(buffer, 72);// Reversed compact bits have exponent 0.
+		expect(() => getWorkFromBuffer(buffer)).toThrow('Invalid compact target exponent: 0');
+	});
+
+	test('getWorkFromBuffer should throw for a compact target above 2^256', () => {
+		const buffer = Buffer.from(GENESIS_HEADER_HEX, 'hex');
+		Buffer.from('ffffff21', 'hex').copy(buffer, 72);// Compact target 0x21ffffff overflows the 256-bit hash space.
+		expect(() => getWorkFromBuffer(buffer)).toThrow('Invalid target: exceeds the maximum hash');
+	});
+
+	test('getWorkFromBuffer should return work 1 for a compact target of exactly 2^256', () => {
+		const buffer = Buffer.from(GENESIS_HEADER_HEX, 'hex');
+		Buffer.from('00000121', 'hex').copy(buffer, 72);// Compact target 0x21010000 equals 2^256.
+		expect(getWorkFromBuffer(buffer)).toBe(BigInt(1));
+	});
+
+	test('BlockHeaderMutable should reject a compact target above 2^256 even though its proof of work would trivially pass', () => {
+		const buffer = Buffer.from(GENESIS_HEADER_HEX, 'hex');
+		Buffer.from('ffffff21', 'hex').copy(buffer, 72);
+		expect(() => BlockHeaderMutable.fromBuffer(buffer)).toThrow('Invalid target: exceeds the maximum hash');
+	});
+
+	test('getVerifiedWorkFromBuffer should verify the proof of work before returning work', () => {
+		const genesisBuffer = Buffer.from(GENESIS_HEADER_HEX, 'hex');
+		expect(getVerifiedWorkFromBuffer(genesisBuffer, GENESIS_HASH_HEX)).toBe(BigInt(4295032833));
+
+		const invalidPowHeaderHex = '0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d00000000';
+		const invalidPowBuffer = Buffer.from(invalidPowHeaderHex, 'hex');
+		const invalidPowHashHex = BlockHeaderMutable.fromHex(invalidPowHeaderHex, true).hashHex;
+		expect(() => getVerifiedWorkFromBuffer(invalidPowBuffer, invalidPowHashHex)).toThrow('Invalid proof of work');
 	});
 
 	test('should skip proof of work check if specified', () => {

@@ -1,22 +1,45 @@
 import { Level, BatchOperation } from 'level';
 
-import { BlockHeaderMutable, HEADER_BUFFER_LENGTH } from './BlockHeader.js';
+import { BlockHeaderMutable, HEADER_BUFFER_LENGTH, getPrevHashHexFromBuffer, getWorkFromBuffer, getVerifiedWorkFromBuffer } from './BlockHeader.js';
+import { sha256sha256 } from './utils/crypto.js';
 import { assert } from './utils/util.js';
 
 const BITCOIN_GENESIS_HEADER_HEX = '0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c';
 const BITCOIN_GENESIS_HEADER_HASH_HEX = BlockHeaderMutable.fromHex(BITCOIN_GENESIS_HEADER_HEX).hashHex;
 assert(BITCOIN_GENESIS_HEADER_HASH_HEX === '000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f');
 
+// A header that was removed from the longest chain. Kept lightweight because removed headers
+// are only used for LevelDB deletes (height) and chain-change reporting (hashHex). Constructing
+// full BlockHeaderMutable objects here would require re-hashing headers whose hash is already known.
+type RemovedHeader = {
+	height: number;
+	hashHex: string;
+};
+
 type AddHeadersChanges = {
-	headersRemovedFromLongestChain: BlockHeaderMutable[];// Headers that are newly added into the longest chain.
-	headersAddedToLongestChain: BlockHeaderMutable[];// Headers that were previously part of the longest chain but are no longer included due to a reorganization.
+	headersRemovedFromLongestChain: RemovedHeader[];// Headers that were previously part of the longest chain but are no longer included due to a reorganization.
+	headersAddedToLongestChain: BlockHeaderMutable[];// Headers that are newly added into the longest chain.
 	headersInvalidated: BlockHeaderMutable[];// Headers that are deemed invalid by being in this._invalidBlocks or after them.
+};
+
+type ForkHeader = {
+	buffer: Buffer;
+	height: number;
+	workTotal: bigint;
 };
 
 type LevelDbHeaders = Level<number, Buffer>;
 type LevelDbHeadersBatch = BatchOperation<LevelDbHeaders, number, Buffer>[];
 
-const createLevelDbBatchArray = (removed: BlockHeaderMutable[], added: BlockHeaderMutable[]): LevelDbHeadersBatch => {
+// Longest chain headers are packed into chunk buffers that each hold this many headers.
+// 12500 * 80 = 1,000,000 bytes per chunk.
+export const HEADERS_PER_CHUNK = 12500;
+// Cumulative work is checkpointed every this many longest chain heights. Lower values make
+// workTotal lookups faster and use more memory. Higher values trade the other way.
+// 64 keeps historical workTotal lookups well under 0.1ms and costs around 1MB per million headers.
+export const WORK_CHECKPOINT_INTERVAL = 64;
+
+const createLevelDbBatchArray = (removed: RemovedHeader[], added: BlockHeaderMutable[]): LevelDbHeadersBatch => {
 	const batch: LevelDbHeadersBatch = [];
 	removed.forEach((header) => {
 		batch.push({
@@ -35,94 +58,40 @@ const createLevelDbBatchArray = (removed: BlockHeaderMutable[], added: BlockHead
 }
 
 export class BlockHeadersDatabase {
-	private readonly _invalidBlocks: Set<string> = new Set();
-	private _allHeaders: Map<string, BlockHeaderMutable>;
-	// Computed tree of header hex hashes. Values use a sentinel scheme:
-	// - `undefined`: key is not in the map (broken chain / unknown parent).
-	// - `null`: key is a leaf (zero recorded children); also tracked in `_headersTreeLeafHashes`.
-	// - `string`: key has exactly one child (the overwhelmingly common case in production
-	//   data where each header has exactly one descendant). Stores the single child's hashHex.
-	// - `Set<string>`: key has two or more children (a fork point). When the Set collapses back to
-	//   one element it is demoted to a string to recover Set object overhead.
-	private _headersTree: Map<string, string | Set<string> | null>;
-	private _headersTreeLeafHashes: Set<string>;// Keys of _headersTree that map to `null` (zero children).
-	private _sortedHeaders: BlockHeaderMutable[] = [];// Longest chain of headers.
-	private _sortedHeadersIndex: Map<string, number> = new Map();
+	private readonly _invalidBlocks: Set<string>;
+	// Longest chain header bytes, packed at height * HEADER_BUFFER_LENGTH across fixed-size chunks.
+	// This avoids a per-header Buffer object.
+	private readonly _chunks: Buffer[] = [];
+	private readonly _hashToHeight: Map<string, number>;
+	private _heightToHash: string[];// Longest chain hash at each height. The index is the height.
+	// Headers that are not part of the longest chain. They are pruned by pruneBranches().
+	private readonly _forkHeaders: Map<string, ForkHeader> = new Map();
+	private readonly _headersTreeLeafHashes: Set<string>;// Hashes of headers without children (branch tips).
+	private readonly _workCheckpoints: bigint[];// Cumulative work of the longest chain at heights that are multiples of WORK_CHECKPOINT_INTERVAL.
+	private _tipWorkTotal: bigint;
 	private _levelDbHeaders: LevelDbHeaders;
 	private _levelDbHeadersSaveQueue: Promise<void> = Promise.resolve();
 	private _addHeadersChangesLevelDbSaveQueue: AddHeadersChanges[] = [];
 	private _lastTimeChainTipExtendedMs: number | undefined;
 	private readonly _enableConsoleDebugLog: boolean;
 
-	// Helpers for controlling the _headersTree.
-	// All non-leaf entries store at least one child hash; leaves are tracked separately in _headersTreeLeafHashes.
-	private _treeAddChild = (parentHashHex: string, childHashHex: string): void => {
-		const existing = this._headersTree.get(parentHashHex);
-		if (existing === undefined || existing === null) {
-			// Parent had zero recorded children until now (it was a leaf, or not yet in the tree).
-			// Store the single child directly as a string.
-			this._headersTree.set(parentHashHex, childHashHex);
-			this._headersTreeLeafHashes.delete(parentHashHex);
-			return;
-		}
-		if (typeof existing === 'string') {
-			// Promote single-child string to a Set when a second child arrives.
-			if (existing !== childHashHex) {
-				this._headersTree.set(parentHashHex, new Set<string>([existing, childHashHex]));
-			}
-			return;
-		}
-		existing.add(childHashHex);
-	};
-
-	private _treeRemoveChild = (parentHashHex: string, childHashHex: string): void => {
-		const existing = this._headersTree.get(parentHashHex);
-		if (existing === undefined || existing === null) return;
-		if (typeof existing === 'string') {
-			if (existing === childHashHex) {
-				// Demote single-child string back to a leaf marker.
-				this._headersTree.set(parentHashHex, null);
-				this._headersTreeLeafHashes.add(parentHashHex);
-			}
-			return;
-		}
-		existing.delete(childHashHex);
-		// If Set collapses back to 1 element, demote to string to recover Set overhead.
-		if (existing.size === 1) {
-			const remaining = existing.values().next().value as string;
-			this._headersTree.set(parentHashHex, remaining);
-		}
-	};
-
-	private constructor({ databasePath, invalidBlocks, headers, headersTree, headersTreeLeafHashes, sortedHeaders, sortedHeadersIndex, enableConsoleDebugLog }: {
+	private constructor({ databasePath, invalidBlocks, enableConsoleDebugLog }: {
 		databasePath: string;
 		invalidBlocks: Set<string>;
-		headers?: Map<string, BlockHeaderMutable>;
-		headersTree?: Map<string, string | Set<string> | null>;
-		headersTreeLeafHashes?: Set<string>;
-		sortedHeaders?: BlockHeaderMutable[];
-		sortedHeadersIndex?: Map<string, number>;
 		enableConsoleDebugLog?: boolean;
 	}) {
 		this._enableConsoleDebugLog = !!enableConsoleDebugLog;
-		const genesisHeader = BlockHeaderMutable.fromHex(BITCOIN_GENESIS_HEADER_HEX);
-		genesisHeader.setHeight(0);
-		genesisHeader.setWorkTotal(genesisHeader.work);
 		this._invalidBlocks = invalidBlocks;
-		this._allHeaders = headers || new Map([
-			[genesisHeader.hashHex, genesisHeader]// Genesis block.
-		]);
-		this._headersTree = headersTree || new Map([
-			[genesisHeader.hashHex, null]// Genesis initially has zero children (tracked as a leaf).
-		]);
-		this._headersTreeLeafHashes = headersTreeLeafHashes || new Set([genesisHeader.hashHex]);
-		this._sortedHeaders = sortedHeaders || [this._allHeaders.get(genesisHeader.hashHex) as BlockHeaderMutable];
-		this._sortedHeadersIndex = sortedHeadersIndex || new Map([
+
+		const genesisHeader = BlockHeaderMutable.fromHex(BITCOIN_GENESIS_HEADER_HEX);
+		this._writeHeaderBufferAtHeight(genesisHeader.buffer, 0);
+		this._hashToHeight = new Map([
 			[genesisHeader.hashHex, 0]
 		]);
-
-		// Expected hex conversion for genesis header's prevHashHex.
-		assert(this._sortedHeaders[0].prevHashHex === '0000000000000000000000000000000000000000000000000000000000000000');
+		this._heightToHash = [genesisHeader.hashHex];
+		this._headersTreeLeafHashes = new Set([genesisHeader.hashHex]);
+		this._workCheckpoints = [genesisHeader.work];
+		this._tipWorkTotal = genesisHeader.work;
 
 		this._levelDbHeaders = new Level(databasePath, { keyEncoding: 'json', valueEncoding: 'buffer' });
 	}
@@ -157,30 +126,87 @@ export class BlockHeadersDatabase {
 	}): Promise<BlockHeadersDatabase> => {
 		const blockHeadersDatabase = new BlockHeadersDatabase({ databasePath, invalidBlocks: new Set(invalidBlocks), enableConsoleDebugLog });
 
-		const startTimeMs = performance.now();
-		const headersMap = new Map<number, BlockHeaderMutable>();
-		for await (const [height, headerBuffer] of blockHeadersDatabase._levelDbHeaders.iterator()) {
-			const header = BlockHeaderMutable.fromBuffer(headerBuffer);
-			assert(Number.isSafeInteger(height));
-			headersMap.set(height, header);
-		}
-		const headers: BlockHeaderMutable[] = [];
-		const tipHeight = headersMap.size;
-		for (let i = 1; i <= tipHeight; i++) {// Skip genesis. It shouldn't be in the database.
-			const header = headersMap.get(i);
-			if (!header) {
-				throw new Error(`Missing header at height ${i}`);
+		try {
+			const startTimeMs = performance.now();
+			// First pass over only the keys to find the tip height, which the packed chunk storage
+			// must be sized for, and to verify that every height is present.
+			let numHeadersLoaded = 0;
+			let maxHeight = 0;
+			for await (const height of blockHeadersDatabase._levelDbHeaders.keys()) {
+				if (!Number.isSafeInteger(height) || height < 1) {
+					throw new Error(`Invalid header height in database: ${height}`);
+				}
+				if (height > maxHeight) {
+					maxHeight = height;
+				}
+				numHeadersLoaded++;
 			}
-			headers.push(header);
+			if (numHeadersLoaded !== maxHeight) {
+				throw new Error(`Missing header in database: loaded ${numHeadersLoaded} headers with a tip height of ${maxHeight}`);
+			}
+			// Chunk 0 already exists because the constructor wrote the genesis header into it.
+			for (let i = 1; i <= Math.floor(maxHeight / HEADERS_PER_CHUNK); i++) {
+				blockHeadersDatabase._chunks.push(Buffer.allocUnsafe(HEADERS_PER_CHUNK * HEADER_BUFFER_LENGTH));
+			}
+			blockHeadersDatabase._heightToHash.length = maxHeight + 1;// Keeps the genesis header at height 0.
+
+			for await (const [height, headerBuffer] of blockHeadersDatabase._levelDbHeaders.iterator()) {
+				if (headerBuffer.length !== HEADER_BUFFER_LENGTH) {
+					throw new Error(`Invalid header buffer length in database: ${headerBuffer.length}`);
+				}
+				blockHeadersDatabase._writeHeaderBufferAtHeight(headerBuffer, height);
+				const hashHex = sha256sha256(headerBuffer).reverse().toString('hex');
+				blockHeadersDatabase._heightToHash[height] = hashHex;
+				blockHeadersDatabase._hashToHeight.set(hashHex, height);
+			}
+			const databaseReadDurationMs = performance.now() - startTimeMs;
+
+			// Stored headers are not trusted: chain continuity, invalid blocks and proofs of work
+			// are all verified here. Stale entries past a truncation point are deleted from LevelDB.
+			const workStartTimeMs = performance.now();
+			let cumulativeWork = blockHeadersDatabase._workCheckpoints[0];
+			let tipHeight = maxHeight;
+			for (let height = 1; height <= maxHeight; height++) {
+				const buffer = blockHeadersDatabase._getHeaderBufferFromHeight(height)!;
+				if (getPrevHashHexFromBuffer(buffer) !== blockHeadersDatabase._heightToHash[height - 1]) {
+					console.error(`Headers database is missing chain continuity at height ${height}. Truncating at height ${height - 1}.`);
+					await blockHeadersDatabase._truncateFromHeight(height, maxHeight);
+					tipHeight = height - 1;
+					break;
+				}
+				const hashHex = blockHeadersDatabase._heightToHash[height];
+				if (blockHeadersDatabase._invalidBlocks.has(hashHex)) {
+					console.error(`Headers database contains invalid block ${hashHex} at height ${height}. Truncating at height ${height - 1}.`);
+					await blockHeadersDatabase._truncateFromHeight(height, maxHeight);
+					tipHeight = height - 1;
+					break;
+				}
+				let work: bigint;
+				try {
+					work = getVerifiedWorkFromBuffer(buffer, hashHex);
+				} catch {
+					throw new Error(`Invalid proof of work in database at height ${height} (hash ${hashHex})`);
+				}
+				cumulativeWork += work;
+				if (height % WORK_CHECKPOINT_INTERVAL === 0) {
+					blockHeadersDatabase._workCheckpoints.push(cumulativeWork);
+				}
+			}
+			blockHeadersDatabase._tipWorkTotal = cumulativeWork;
+			blockHeadersDatabase._headersTreeLeafHashes.clear();
+			blockHeadersDatabase._headersTreeLeafHashes.add(blockHeadersDatabase._heightToHash[tipHeight]);
+			blockHeadersDatabase._trimChunksToChainLength();
+
+			enableConsoleDebugLog && console.log(`Loaded ${tipHeight} headers from database file after ${databaseReadDurationMs}ms.`);
+			enableConsoleDebugLog && console.log(`Computed work totals for ${tipHeight} headers after ${performance.now() - workStartTimeMs}ms.`);
+			enableConsoleDebugLog && console.log(`Longest chain height: ${tipHeight}.`);
+			return blockHeadersDatabase;
+		} catch (error) {
+			// The LevelDB handle auto-opened during the load, so close it to avoid leaking
+			// the file lock when the load fails.
+			await blockHeadersDatabase._levelDbHeaders.close().catch(() => { /* Already closed or never opened. */ });
+			throw error;
 		}
-		const databaseReadDurationMs = performance.now() - startTimeMs;
-		enableConsoleDebugLog && console.log(`Loaded ${headers.length} headers from database file after ${databaseReadDurationMs}ms.`);
-		const sortStartTimeMs = performance.now();
-		blockHeadersDatabase._insert(headers);
-		const sortDurationMs = performance.now() - sortStartTimeMs;
-		enableConsoleDebugLog && console.log(`Added and sorted ${headers.length} headers from database file after ${sortDurationMs}ms.`);
-		enableConsoleDebugLog && console.log(`Longest chain height: ${blockHeadersDatabase._sortedHeaders.length - 1}.`);
-		return blockHeadersDatabase;
 	}
 
 	/**
@@ -208,13 +234,95 @@ export class BlockHeadersDatabase {
 		await this.close();
 	}
 
+	// Removes the in-memory chain and forks at and above fromHeight and deletes the
+	// corresponding LevelDB entries so stale data is not reloaded on the next startup.
+	private _truncateFromHeight = async (fromHeight: number, maxHeight: number): Promise<void> => {
+		for (let height = fromHeight; height <= maxHeight; height++) {
+			this._hashToHeight.delete(this._heightToHash[height]);
+		}
+		this._heightToHash.length = fromHeight;
+		if (fromHeight > maxHeight) {
+			return;
+		}
+		const batch: LevelDbHeadersBatch = [];
+		for (let height = fromHeight; height <= maxHeight; height++) {
+			batch.push({
+				type: 'del',
+				key: height
+			});
+		}
+		await this._levelDbHeaders.batch(batch);
+	};
+
+	private _writeHeaderBufferAtHeight = (buffer: Buffer, height: number): void => {
+		const chunkIndex = Math.floor(height / HEADERS_PER_CHUNK);
+		while (this._chunks.length <= chunkIndex) {
+			this._chunks.push(Buffer.allocUnsafe(HEADERS_PER_CHUNK * HEADER_BUFFER_LENGTH));
+		}
+		buffer.copy(this._chunks[chunkIndex], (height % HEADERS_PER_CHUNK) * HEADER_BUFFER_LENGTH);
+	};
+
+	private _getHeaderBufferFromHeight = (height: number): Buffer | undefined => {
+		if (height < 0 || height >= this._heightToHash.length) {
+			return undefined;
+		}
+		const chunk = this._chunks[Math.floor(height / HEADERS_PER_CHUNK)];
+		if (!chunk) {
+			return undefined;
+		}
+		const offset = (height % HEADERS_PER_CHUNK) * HEADER_BUFFER_LENGTH;
+		return chunk.subarray(offset, offset + HEADER_BUFFER_LENGTH);
+	};
+
+	// Releases packed chunks above the longest chain. A reorg to a shorter chain leaves the
+	// chunks for the abandoned heights allocated unless they are dropped here.
+	private _trimChunksToChainLength = (): void => {
+		const numChunksNeeded = Math.floor((this._heightToHash.length - 1) / HEADERS_PER_CHUNK) + 1;
+		if (this._chunks.length > numChunksNeeded) {
+			this._chunks.length = numChunksNeeded;
+		}
+	};
+
+	private _createHeaderFromBuffer = (buffer: Buffer, height: number, workTotal: bigint): BlockHeaderMutable => {
+		// Proof of work was already validated before the header entered the database.
+		const header = BlockHeaderMutable.fromBuffer(buffer, true);
+		header.setHeight(height);
+		header.setWorkTotal(workTotal);
+		return header;
+	};
+
+	private _getHeightFromHashHex = (hashHex: string): number | undefined => {
+		const height = this._hashToHeight.get(hashHex);
+		if (height !== undefined) {
+			return height;
+		}
+		return this._forkHeaders.get(hashHex)?.height;
+	};
+
+	private _getWorkTotalFromHashHex = (hashHex: string): bigint | undefined => {
+		const height = this._hashToHeight.get(hashHex);
+		if (height !== undefined) {
+			return this._getWorkTotalFromHeight(height);
+		}
+		return this._forkHeaders.get(hashHex)?.workTotal;
+	};
+
+	private _getWorkTotalFromHeight = (height: number): bigint => {
+		if (height === this._heightToHash.length - 1) {
+			return this._tipWorkTotal;
+		}
+		const checkpointIndex = Math.floor(height / WORK_CHECKPOINT_INTERVAL);
+		let workTotal = this._workCheckpoints[checkpointIndex];
+		for (let h = checkpointIndex * WORK_CHECKPOINT_INTERVAL + 1; h <= height; h++) {
+			workTotal += getWorkFromBuffer(this._getHeaderBufferFromHeight(h)!);
+		}
+		return workTotal;
+	};
+
 	// Assumes newHeaders are sorted but will not throw an error if they aren't.
 	private _insert = (newHeaders: BlockHeaderMutable[]): AddHeadersChanges => {
-		if (this._sortedHeaders.length > 1) {
-			// Prevent overriding with headers that don't have height and workTotal set.
-			newHeaders = newHeaders.filter(header => !this._allHeaders.has(header.hashHex));
-		}
 		const headersInvalidated: BlockHeaderMutable[] = [];
+		newHeaders = newHeaders.filter(header => !this._hashToHeight.has(header.hashHex) && !this._forkHeaders.has(header.hashHex));
 		if (!newHeaders.length) {
 			return {
 				headersRemovedFromLongestChain: [],
@@ -223,20 +331,23 @@ export class BlockHeadersDatabase {
 			};
 		}
 
+		const batchHeaders = new Map<string, BlockHeaderMutable>();
 		for (
 			let newHeadersIndex = 0;
 			newHeadersIndex < newHeaders.length;
 			newHeadersIndex++
 		) {
 			const header = newHeaders[newHeadersIndex];
-			const prevHeader = this._allHeaders.get(header.prevHashHex);
-			if (!prevHeader) {
-				// Broken chain.
-				break;// Still use all processed headers so far.
+			if (this._hashToHeight.has(header.hashHex) || this._forkHeaders.has(header.hashHex)) {
+				// A duplicate within this same batch. The filter above only removes headers that
+				// were known before the call, so repeats must be skipped here. Processing a
+				// repeated ancestor would re-add its hash to the leaf set and _forkHeaders even
+				// though it already has children recorded.
+				continue;
 			}
-			// `undefined` means parent isn't in the tree at all (broken chain).
-			// `null` is a valid leaf marker: parent has zero children recorded.
-			if (this._headersTree.get(prevHeader.hashHex) === undefined) {
+			const prevHashHex = header.prevHashHex;
+			const prevHeight = this._getHeightFromHashHex(prevHashHex);
+			if (prevHeight === undefined) {
 				// Broken chain.
 				break;// Still use all processed headers so far.
 			}
@@ -247,40 +358,39 @@ export class BlockHeadersDatabase {
 				headersInvalidated.push(lastHeaderChecked);
 				// Add all next headers until there there is a sort problem.
 				for (let i = newHeadersIndex + 1; i < newHeaders.length; i++) {
-					const header = newHeaders[i];
-					if (header.prevHashHex !== lastHeaderChecked.hashHex) {
+					const nextHeader = newHeaders[i];
+					if (nextHeader.prevHashHex !== lastHeaderChecked.hashHex) {
 						break;
 					}
-					lastHeaderChecked = header;
+					lastHeaderChecked = nextHeader;
 					headersInvalidated.push(lastHeaderChecked);
 				}
 				break;// Still use all processed headers so far.
 			}
 
-			this._allHeaders.set(header.hashHex, header);
-			this._treeAddChild(prevHeader.hashHex, header.hashHex);
-			// New header starts as a leaf with zero children (`null` marker).
-			this._headersTree.set(header.hashHex, null);
+			const height = prevHeight + 1;
+			const workTotal = this._getWorkTotalFromHashHex(prevHashHex)! + header.work;
+			header.setHeight(height);
+			header.setWorkTotal(workTotal);
+			this._forkHeaders.set(header.hashHex, { buffer: header.buffer, height, workTotal });
+			this._headersTreeLeafHashes.delete(prevHashHex);
 			this._headersTreeLeafHashes.add(header.hashHex);
-
-			(header as BlockHeaderMutable).setHeight(prevHeader.height + 1);
-			(header as BlockHeaderMutable).setWorkTotal(prevHeader.workTotal + header.work);
+			batchHeaders.set(header.hashHex, header);
 		}
 
 		// Find the leaf header with the highest work total.
-		let newChainTipHash = this._sortedHeaders.at(-1)!.hashHex;
-		{
-			let maxWorkTotal = this._sortedHeaders.at(-1)!.workTotal;
-			for (const leafHeaderHash of this._headersTreeLeafHashes) {
-				const leafHeader = this._allHeaders.get(leafHeaderHash)!;
-				if (leafHeader.workTotal > maxWorkTotal) {
-					maxWorkTotal = leafHeader.workTotal;
-					newChainTipHash = leafHeaderHash;
-				}
+		const currentChainTipHash = this._heightToHash[this._heightToHash.length - 1];
+		let newChainTipHash = currentChainTipHash;
+		let maxWorkTotal = this._tipWorkTotal;
+		for (const leafHeaderHash of this._headersTreeLeafHashes) {
+			const leafWorkTotal = leafHeaderHash === currentChainTipHash ? this._tipWorkTotal : this._forkHeaders.get(leafHeaderHash)!.workTotal;
+			if (leafWorkTotal > maxWorkTotal) {
+				maxWorkTotal = leafWorkTotal;
+				newChainTipHash = leafHeaderHash;
 			}
 		}
 
-		if (newChainTipHash === this._sortedHeaders.at(-1)!.hashHex) {
+		if (newChainTipHash === currentChainTipHash) {
 			// The chain has not been extended by any new headers.
 			return {
 				headersRemovedFromLongestChain: [],
@@ -289,28 +399,56 @@ export class BlockHeadersDatabase {
 			};
 		}
 
-		// Collect headers between the new chain tip and the divergence point and update this._sortedHeaders.
-		let currentHeader = this._allHeaders.get(newChainTipHash)!;
-		const headersToAdd: BlockHeaderMutable[] = [];
-		while (currentHeader && !this._sortedHeadersIndex.has(currentHeader.hashHex)) {
-			headersToAdd.push(currentHeader);
-			currentHeader = this._allHeaders.get(currentHeader.prevHashHex)!;
-			// currentHeader will end on the last header in common with the old chain.
+		// Collect headers between the new chain tip and the divergence point.
+		const headersToAddHashes: string[] = [];
+		let divergenceHash = newChainTipHash;
+		while (!this._hashToHeight.has(divergenceHash)) {
+			headersToAddHashes.push(divergenceHash);
+			divergenceHash = getPrevHashHexFromBuffer(this._forkHeaders.get(divergenceHash)!.buffer);
 		}
-		headersToAdd.reverse();
-		const newStartingHeight = currentHeader.height + 1;// Last header in common with the old chain + 1.
+		headersToAddHashes.reverse();
+		const newStartingHeight = this._hashToHeight.get(divergenceHash)! + 1;// Divergence point height + 1.
 
-		const headersRemoved = this._sortedHeaders.splice(newStartingHeight);
-		headersRemoved.forEach(header => this._sortedHeadersIndex.delete(header.hashHex));
-		headersToAdd.forEach((header, index) => {
-			this._sortedHeaders.push(header);
-			this._sortedHeadersIndex.set(header.hashHex, newStartingHeight + index);
-		});
-		assert(this._sortedHeadersIndex.size === this._sortedHeaders.length);
+		// Keep the headers that were in the longest chain but are not in the new one as forks.
+		const headersRemovedFromLongestChain: RemovedHeader[] = [];
+		{
+			let workTotal = this._tipWorkTotal;
+			for (let height = this._heightToHash.length - 1; height >= newStartingHeight; height--) {
+				const hashHex = this._heightToHash[height];
+				const buffer = Buffer.from(this._getHeaderBufferFromHeight(height)!);
+				const work = getWorkFromBuffer(buffer);
+				headersRemovedFromLongestChain.push({ height, hashHex });
+				this._forkHeaders.set(hashHex, { buffer, height, workTotal });
+				this._hashToHeight.delete(hashHex);
+				workTotal -= work;
+			}
+		}
+		this._heightToHash.length = newStartingHeight;
+		headersRemovedFromLongestChain.reverse();
+
+		// Add the new longest chain headers.
+		const headersAddedToLongestChain: BlockHeaderMutable[] = [];
+		// Drop the work checkpoints at or after the divergence point because their cumulative work changes.
+		this._workCheckpoints.length = Math.min(this._workCheckpoints.length, Math.ceil(newStartingHeight / WORK_CHECKPOINT_INTERVAL));
+		for (let i = 0; i < headersToAddHashes.length; i++) {
+			const hashHex = headersToAddHashes[i];
+			const height = newStartingHeight + i;
+			const forkHeader = this._forkHeaders.get(hashHex)!;
+			this._writeHeaderBufferAtHeight(forkHeader.buffer, height);
+			this._hashToHeight.set(hashHex, height);
+			this._heightToHash[height] = hashHex;
+			if (height % WORK_CHECKPOINT_INTERVAL === 0) {
+				this._workCheckpoints.push(forkHeader.workTotal);
+			}
+			headersAddedToLongestChain.push(batchHeaders.get(hashHex) ?? this._createHeaderFromBuffer(forkHeader.buffer, height, forkHeader.workTotal));
+			this._forkHeaders.delete(hashHex);
+		}
+		this._tipWorkTotal = maxWorkTotal;
+		this._trimChunksToChainLength();
 
 		return {
-			headersRemovedFromLongestChain: headersRemoved,
-			headersAddedToLongestChain: headersToAdd,
+			headersRemovedFromLongestChain,
+			headersAddedToLongestChain,
 			headersInvalidated
 		};
 	}
@@ -344,49 +482,32 @@ export class BlockHeadersDatabase {
 	}
 
 	/**
-	 * Prunes branches from the headers tree that are not part of the longest chain.
+	 * Prunes branches that are not part of the longest chain.
 	 * This method is intended to be called when no nodes are syncing because it depends
 	 * on preserving branches that could extend and cause the longest chain to change.
 	 * @returns The number of branches pruned.
 	 */
 	pruneBranches = (): number => {
 		const numBranchesBefore = this._headersTreeLeafHashes.size;
-		// Key is a stale branch divergence point (not part of longest chain), value is the earliest header in its chain that is still part of the main chain.
-		const staleHeaderDivergenceParentHashes = new Map<string, string>();
-		const staleHeaderHashes = new Set(this._headersTreeLeafHashes);
-		staleHeaderHashes.delete(this._sortedHeaders.at(-1)!.hashHex);
-		Array.from(staleHeaderHashes).forEach(leafHashHex => {
-			// Iterate backwards from leaf headers until reaching the divergence point with the longest chain.
+		const mainChainTipHash = this._heightToHash[this._heightToHash.length - 1];
+		const staleHeaderHashes = new Set<string>();
+		Array.from(this._headersTreeLeafHashes).forEach(leafHashHex => {
+			// Iterate backwards from leaf headers until reaching the longest chain.
 			let currentHashHex = leafHashHex;
-			let prevHashHex = leafHashHex;
-			while (!this._sortedHeadersIndex.has(prevHashHex)) {
-				staleHeaderHashes.add(prevHashHex);
-				currentHashHex = prevHashHex;
-				prevHashHex = this._allHeaders.get(prevHashHex)!.prevHashHex
+			while (!this._hashToHeight.has(currentHashHex) && !staleHeaderHashes.has(currentHashHex)) {
+				staleHeaderHashes.add(currentHashHex);
+				currentHashHex = getPrevHashHexFromBuffer(this._forkHeaders.get(currentHashHex)!.buffer);
 			}
-			staleHeaderDivergenceParentHashes.set(currentHashHex, prevHashHex);
 		});
-
-
-		// Selectively update the children of staleHeaderDivergenceParentHashes values. 1 of the children
-		// is part of the longest chain, the rest are stale.
-		for (const [divergenceHeaderHash, divergenceParentHeaderHash] of staleHeaderDivergenceParentHashes) {
-			assert(!this._sortedHeadersIndex.has(divergenceHeaderHash));
-			assert(this._sortedHeadersIndex.has(divergenceParentHeaderHash));
-			const children = this._headersTree.get(divergenceParentHeaderHash);
-			// At a divergence parent there must be at least the one stale child being removed; the
-			// main-chain child remains. Asserting the parent is currently non-leaf (not undefined/null).
-			assert(children !== undefined);
-			assert(children !== null);
-			this._treeRemoveChild(divergenceParentHeaderHash, divergenceHeaderHash);
-		}
 		staleHeaderHashes.forEach(hashHex => {
-			this._allHeaders.delete(hashHex);
-			this._headersTree.delete(hashHex);
+			this._forkHeaders.delete(hashHex);
 			this._headersTreeLeafHashes.delete(hashHex);
-			assert(!this._sortedHeadersIndex.has(hashHex));
 		});
-		assert(this._headersTreeLeafHashes.has(this._sortedHeaders.at(-1)!.hashHex));
+		// Every branch that is not the longest chain is gone after the deletions above, so the
+		// main chain tip is the only header left without children. It can be missing from the
+		// leaf set when a child branch that ties the tip's work displaced it instead of taking
+		// over the chain, so it is restored here to keep pruning from failing.
+		this._headersTreeLeafHashes.add(mainChainTipHash);
 		assert(this._headersTreeLeafHashes.size === 1);
 		return numBranchesBefore - this._headersTreeLeafHashes.size;
 	}
@@ -405,12 +526,12 @@ export class BlockHeadersDatabase {
 
 	/**
 	 * Gets the total number of headers stored across all branches (including the longest chain and competing forks).
-	 * @returns The number of headers in `_allHeaders`.
+	 * @returns The number of headers in the database.
 	 */
-	getNumAllHeaders = (): number => this._allHeaders.size;
+	getNumAllHeaders = (): number => this._heightToHash.length + this._forkHeaders.size;
 
 	/**
-	 * Gets the number of competing chain tips (leaf hashes in the headers tree).
+	 * Gets the number of competing chain tips (leaf headers without children).
 	 * A value greater than 1 indicates a live reorg with multiple branches held in memory.
 	 * @returns The number of header-tree leaves.
 	 */
@@ -419,9 +540,9 @@ export class BlockHeadersDatabase {
 	/**
 	 * Gets the number of headers in the longest chain (the main chain).
 	 * Equal to the chain tip height plus one (for the genesis header).
-	 * @returns The number of headers in `_sortedHeaders`.
+	 * @returns The number of headers in the longest chain.
 	 */
-	getNumLongestChainHeaders = (): number => this._sortedHeaders.length;
+	getNumLongestChainHeaders = (): number => this._heightToHash.length;
 
 	/**
 	 * Gets the block locator hash buffers.
@@ -432,40 +553,54 @@ export class BlockHeadersDatabase {
 		const hashes: Buffer[] = [];
 		let step = 1;
 		// Start at the top of the chain and work backwards.
-		for (let i = this._sortedHeaders.length - 1; i > 0; i -= step) {
+		for (let i = this._heightToHash.length - 1; i > 0; i -= step) {
 			// Push top 10 indexes first, then back off exponentially.
 			if (hashes.length >= 10) {
 				step *= 2;
 			}
-			hashes.push(this._sortedHeaders[i].hashBuffer);
+			hashes.push(Buffer.from(this._heightToHash[i], 'hex'));
 		}
-		hashes.push(this._sortedHeaders[0].hashBuffer);
+		hashes.push(Buffer.from(this._heightToHash[0], 'hex'));
 		return hashes;
 	}
 
 	/**
 	 * Gets a header from a given height.
+	 * Each call returns a new copy; mutating the returned header does not affect the database.
 	 * @param height - The height of the header.
 	 * @returns The block header, or undefined if not found.
 	 */
 	getHeaderFromHeight = (height: number): BlockHeaderMutable | undefined => {
-		return this._sortedHeaders[height];
+		if (!Number.isInteger(height) || height < 0 || height >= this._heightToHash.length) {
+			return undefined;
+		}
+		return this._createHeaderFromBuffer(this._getHeaderBufferFromHeight(height)!, height, this._getWorkTotalFromHeight(height));
 	}
 
 	/**
 	 * Gets a header from a given hash.
+	 * Each call returns a new copy; mutating the returned header does not affect the database.
 	 * @param hashHex - The hash of the header.
 	 * @returns The block header, or undefined if not found.
 	 */
 	getHeaderFromHashHex = (hashHex: string): BlockHeaderMutable | undefined => {
-		return this._allHeaders.get(hashHex);
+		const height = this._hashToHeight.get(hashHex);
+		if (height !== undefined) {
+			return this._createHeaderFromBuffer(this._getHeaderBufferFromHeight(height)!, height, this._getWorkTotalFromHeight(height));
+		}
+		const forkHeader = this._forkHeaders.get(hashHex);
+		if (!forkHeader) {
+			return undefined;
+		}
+		return this._createHeaderFromBuffer(forkHeader.buffer, forkHeader.height, forkHeader.workTotal);
 	}
 
 	/**
 	 * Gets the header at the tip of the longest chain.
+	 * Each call returns a new copy; mutating the returned header does not affect the database.
 	 * @returns The block header at the tip.
 	 */
 	getHeaderTip = (): BlockHeaderMutable => {
-		return this._sortedHeaders.at(-1)!;
+		return this.getHeaderFromHeight(this._heightToHash.length - 1)!;
 	}
 }

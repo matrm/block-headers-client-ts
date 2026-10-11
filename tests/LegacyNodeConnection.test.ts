@@ -4,6 +4,7 @@ import { mkdir } from 'node:fs/promises';
 import { expect, test, describe, beforeEach, afterEach, vi } from 'vitest';
 import { removeDirectoryWithRetries, createDbWithRetries } from './testUtils';
 
+import { BlockHeaderMutable } from '../src/BlockHeader.js';
 import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase.js';
 import { ConnectionMonitor } from '../src/ConnectionMonitor.js';
 import { LegacyNodeConnection } from '../src/LegacyNodeConnection.js';
@@ -682,6 +683,87 @@ describe('LegacyNodeConnection', () => {
 			expect((conn as any).ping).toHaveBeenCalledTimes(2);
 
 			teardownConn(conn);
+		});
+	});
+
+	describe('_syncHeaders with a losing fork taller than the longest chain', () => {
+		let db: BlockHeadersDatabase;
+		let databasePath: string;
+		let connMonitor: ConnectionMonitor;
+
+		beforeEach(async () => {
+			databasePath = `tests/db/node-connection-fork-${getRandomHexString(16)}`;
+			await mkdir(databasePath, { recursive: true });
+			db = await createDbWithRetries(() => BlockHeadersDatabase.fromGenesis({
+				databasePath,
+				invalidBlocks: Array.from(getInvalidBlocks(chain))
+			}));
+			connMonitor = new ConnectionMonitor({ intervalMs: 20000, timeoutMs: 10000 });
+		});
+
+		afterEach(async () => {
+			if (db) await db.close();
+			await removeDirectoryWithRetries(databasePath);
+		});
+
+		// Low difficulty bits so test headers can be mined without a network connection. The
+		// values are approximately 8 work and 2 work per header respectively.
+		const HARDEST_BITS_HEX = 'ffff1f20';
+		const EASY_BITS_HEX = 'ffff7f20';
+
+		function createValidHeader(prevHashHex: string, nonce: number, bitsHex: string): BlockHeaderMutable {
+			for (let attempt = 0; ; attempt++) {
+				const buffer = Buffer.alloc(80);
+				buffer.writeUInt32LE(1, 0);
+				Buffer.from(prevHashHex, 'hex').reverse().copy(buffer, 4);
+				buffer.writeUInt32LE(nonce + attempt, 68);
+				Buffer.from(bitsHex, 'hex').copy(buffer, 72);
+				buffer.writeUInt32LE(nonce + attempt, 76);
+				try {
+					return BlockHeaderMutable.fromBuffer(buffer);
+				} catch { /* Invalid proof of work: try the next nonce. */ }
+			}
+		}
+
+		test('does not throw when the downloaded tip is a losing fork taller than the longest chain', async () => {
+			const mainChain: BlockHeaderMutable[] = [];
+			let prevHashHex = db.getHeaderTip().hashHex;
+			for (let i = 0; i < 4; i++) {
+				const header = createValidHeader(prevHashHex, 100000 + i * 13, HARDEST_BITS_HEX);
+				mainChain.push(header);
+				prevHashHex = header.hashHex;
+			}
+			db.addHeaders(mainChain);
+			expect(db.getHeaderTip().height).toBe(4);
+
+			// This fork is taller (11 headers) but has less total work (11 * 2 < 4 * 8), so it
+			// never becomes the longest chain and its tip is taller than the chain tip.
+			const fork: BlockHeaderMutable[] = [];
+			prevHashHex = mainChain[0].hashHex;
+			for (let i = 0; i < 11; i++) {
+				const header = createValidHeader(prevHashHex, 200000 + i * 13, EASY_BITS_HEX);
+				fork.push(header);
+				prevHashHex = header.hashHex;
+			}
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.18',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+			(conn as any).connected = () => true;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				return getHeadersCallCount === 1 ? fork : [];
+			};
+
+			await expect((conn as any)._syncHeaders()).resolves.toBeUndefined();
+			expect(db.getHeaderTip().hashHex).toBe(mainChain.at(-1)!.hashHex);
+			expect(db.getHeaderFromHashHex(fork.at(-1)!.hashHex)?.height).toBe(12);
+			conn[Symbol.dispose]();
 		});
 	});
 });
