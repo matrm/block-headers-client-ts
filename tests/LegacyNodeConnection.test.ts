@@ -1,4 +1,5 @@
 /// <reference types="node" />
+import * as net from 'node:net';
 import { mkdir } from 'node:fs/promises';
 
 import { expect, test, describe, beforeEach, afterEach, vi } from 'vitest';
@@ -8,7 +9,8 @@ import { BlockHeaderMutable } from '../src/BlockHeader.js';
 import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase.js';
 import { ConnectionMonitor } from '../src/ConnectionMonitor.js';
 import { LegacyNodeConnection } from '../src/LegacyNodeConnection.js';
-import { Chain, getInvalidBlocks } from '../src/chainProtocol.js';
+import { Chain, getInvalidBlocks, getMagic } from '../src/chainProtocol.js';
+import { buildMessage, parseMessages } from '../src/p2p/messages.js';
 import { getRandomHexString } from '../src/utils/util.js';
 
 const chain: Chain = 'bsv';
@@ -764,6 +766,245 @@ describe('LegacyNodeConnection', () => {
 			expect(db.getHeaderTip().hashHex).toBe(mainChain.at(-1)!.hashHex);
 			expect(db.getHeaderFromHashHex(fork.at(-1)!.hashHex)?.height).toBe(12);
 			conn[Symbol.dispose]();
+		});
+	});
+
+	describe('message handling safety', () => {
+		let db: BlockHeadersDatabase;
+		let databasePath: string;
+		let connMonitor: ConnectionMonitor;
+
+		beforeEach(async () => {
+			databasePath = `tests/db/node-connection-safety-${getRandomHexString(16)}`;
+			await mkdir(databasePath, { recursive: true });
+			db = await createDbWithRetries(() => BlockHeadersDatabase.fromGenesis({
+				databasePath,
+				invalidBlocks: Array.from(getInvalidBlocks(chain))
+			}));
+			connMonitor = new ConnectionMonitor({ intervalMs: 20000, timeoutMs: 10000 });
+		});
+
+		afterEach(async () => {
+			if (db) await db.close();
+			await removeDirectoryWithRetries(databasePath);
+		});
+
+		// Starts a fake node that completes the handshake, replies to pings, and then stays connected.
+		async function startHandshakeServer(): Promise<{ server: net.Server; port: number }> {
+			const magic = getMagic(chain);
+			const server = net.createServer((socket) => {
+				let buffer: Buffer = Buffer.alloc(0);
+				let sentVersion = false;
+				socket.on('data', (data) => {
+					buffer = Buffer.concat([buffer, typeof data === 'string' ? Buffer.from(data) : data]);
+					const parsed = parseMessages(buffer, magic);
+					buffer = parsed.remaining;
+					for (const message of parsed.messages) {
+						if (message.command === 'version' && !sentVersion) {
+							sentVersion = true;
+							socket.write(buildMessage(magic, 'version', Buffer.alloc(0)));
+						} else if (message.command === 'verack') {
+							socket.write(buildMessage(magic, 'verack', Buffer.alloc(0)));
+						} else if (message.command === 'ping') {
+							socket.write(buildMessage(magic, 'pong', message.payload));
+						}
+					}
+				});
+			});
+			await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+			return { server, port: (server.address() as net.AddressInfo).port };
+		}
+
+		test('replying to a ping while a connect is pending does not throw', () => {
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.19',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+
+			const writes: Buffer[] = [];
+			(conn as any)._socket = {
+				write: (buffer: Buffer) => { writes.push(buffer); return true; },
+				removeAllListeners: () => { },
+				destroy: () => { },
+			};
+			(conn as any)._pendingConnect = {
+				promise: Promise.resolve(),
+				resolve: () => { },
+				reject: () => { },
+				timeout: setTimeout(() => { }, 10000),
+			};
+
+			const payload = Buffer.from('0011223344556677', 'hex');
+			expect(() => (conn as any)._handleMessage({ command: 'ping', payload })).not.toThrow();
+			expect(writes).toHaveLength(1);
+
+			const { messages } = parseMessages(writes[0], getMagic(chain));
+			expect(messages).toHaveLength(1);
+			expect(messages[0].command).toBe('pong');
+			expect(messages[0].payload.equals(payload)).toBe(true);
+
+			conn[Symbol.dispose]();
+		});
+
+		test('a peer sending version then ping without verack cannot crash the client', async () => {
+			const magic = getMagic(chain);
+			const server = net.createServer((socket) => {
+				socket.once('data', () => {
+					const versionMessage = buildMessage(magic, 'version', Buffer.alloc(0));
+					const pingMessage = buildMessage(magic, 'ping', Buffer.from('0011223344556677', 'hex'));
+					socket.write(Buffer.concat([versionMessage, pingMessage]));
+				});
+			});
+			await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+			const port = (server.address() as net.AddressInfo).port;
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.1',
+				port,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+
+			const disconnects: string[] = [];
+			conn.on('disconnect_unintentional_before_connect', () => disconnects.push('before'));
+			conn.on('disconnect_unintentional_after_connect', () => disconnects.push('after'));
+
+			// The peer never sends verack, so connect() must time out cleanly. Before the
+			// fix the ping reply threw and escaped the socket data handler as an uncaught
+			// exception, crashing the process.
+			await expect(conn.connect({ timeoutMs: 1000 })).rejects.toThrow('Connection timed out');
+			expect(disconnects).toEqual(['before']);
+
+			conn[Symbol.dispose]();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		});
+
+		test('a message handler error disconnects only that peer instead of propagating', async () => {
+			const { server, port } = await startHandshakeServer();
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.1',
+				port,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			let afterConnectDisconnects = 0;
+			conn.on('disconnect_unintentional_after_connect', () => afterConnectDisconnects++);
+			conn.on('connect', () => { throw new Error('Simulated listener failure'); });
+
+			// The verack handling emitted 'connect', whose listener threw. The guard must
+			// disconnect the peer instead of letting the error escape as an uncaught
+			// exception, and connect() must still resolve instead of hanging.
+			await conn.connect({ timeoutMs: 3000 });
+			await vi.waitFor(() => expect(afterConnectDisconnects).toBe(1));
+			expect(conn.connected()).toBe(false);
+
+			errorSpy.mockRestore();
+			conn[Symbol.dispose]();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		});
+
+		test('connect() resolves before a throwing connect listener can hang it and listeners still run first', async () => {
+			const { server, port } = await startHandshakeServer();
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.1',
+				port,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			const order: string[] = [];
+			conn.on('connect', () => {
+				order.push('listener');
+				throw new Error('Simulated listener failure');
+			});
+
+			await conn.connect({ timeoutMs: 3000 });
+			order.push('await');
+
+			// resolve() runs before emit('connect'), so the throwing listener cannot leave
+			// the promise pending. Promise continuations are microtasks, so the listener
+			// still observes the event before the awaiting caller resumes.
+			expect(order).toEqual(['listener', 'await']);
+
+			errorSpy.mockRestore();
+			conn[Symbol.dispose]();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		});
+
+		test('a throwing pong listener cannot strand the ping promise and only disconnects that peer', async () => {
+			const { server, port } = await startHandshakeServer();
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.1',
+				port,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			let afterConnectDisconnects = 0;
+			conn.on('disconnect_unintentional_after_connect', () => afterConnectDisconnects++);
+			await conn.connect({ timeoutMs: 3000 });
+			conn.on('pong', () => { throw new Error('Simulated pong listener failure'); });
+
+			// The pong handling resolves the ping promise before emitting, so the throwing
+			// listener disconnects the peer instead of stranding the ping forever after
+			// its timeout was cleared and its pending entry was deleted.
+			const durationMs = await conn.ping({ timeoutMs: 3000 });
+			expect(typeof durationMs).toBe('number');
+			await vi.waitFor(() => expect(afterConnectDisconnects).toBe(1));
+			expect(conn.connected()).toBe(false);
+
+			errorSpy.mockRestore();
+			conn[Symbol.dispose]();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		});
+
+		test('a listener that disconnects and then throws does not report an unintentional disconnect', async () => {
+			const { server, port } = await startHandshakeServer();
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.1',
+				port,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			let disconnects = 0;
+			let unintentionalDisconnects = 0;
+			conn.on('disconnect', () => disconnects++);
+			conn.on('disconnect_unintentional_before_connect', () => unintentionalDisconnects++);
+			conn.on('disconnect_unintentional_after_connect', () => unintentionalDisconnects++);
+			conn.on('connect', () => {
+				conn.disconnect();
+				throw new Error('Simulated listener failure');
+			});
+
+			await conn.connect({ timeoutMs: 3000 });
+			await vi.waitFor(() => expect(disconnects).toBe(1));
+
+			// disconnect() already reported the intentional close, so the message-handler
+			// guard must not emit a spurious unintentional disconnect event.
+			expect(unintentionalDisconnects).toBe(0);
+			expect(conn.connected()).toBe(false);
+
+			errorSpy.mockRestore();
+			conn[Symbol.dispose]();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
 		});
 	});
 });
