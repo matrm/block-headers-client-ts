@@ -298,7 +298,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 					// Reject before emitting so a throwing disconnect listener cannot
 					// leave the connect() promise pending forever.
 					rejectFunc!(new Error('Connection timed out'));
-					this.emit('disconnect_unintentional_before_connect');
+					this._emitDisconnect('disconnect_unintentional_before_connect');
 				}
 			}, timeoutMs);
 			this._pendingConnect = { promise, resolve: resolveFunc!, reject: rejectFunc!, timeout };
@@ -372,20 +372,17 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 				// socket data handler as an uncaught exception. Disconnect only this peer.
 				console.error('Error handling message from', this.getIpPortString(), ':', error);
 
-				if (!this._socket && !this._pendingConnect) {
+				if (this._socket !== currentSocket) {
 					// A listener already disconnected this peer before throwing (for example,
-					// through disconnect() or dispose), so the intentional disconnect was
-					// already reported and no unintentional disconnect event should be emitted.
+					// through disconnect() or dispose), or replaced it with a new connection.
+					// Either way the disconnect was already reported and the current state
+					// must not be touched or reported as an unintentional disconnect.
 					return;
 				}
 
 				const wasConnected = this._wasConnected;// Reset to false in _disconnectNoEmit().
 				this._disconnectNoEmit();
-				if (wasConnected) {
-					this.emit('disconnect_unintentional_after_connect');
-				} else {
-					this.emit('disconnect_unintentional_before_connect');
-				}
+				this._emitDisconnect(wasConnected ? 'disconnect_unintentional_after_connect' : 'disconnect_unintentional_before_connect');
 				return;
 			}
 
@@ -402,11 +399,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 
 			const wasConnected = this._wasConnected;// Reset to false in _disconnectNoEmit().
 			this._disconnectNoEmit();
-			if (wasConnected) {
-				this.emit('disconnect_unintentional_after_connect');
-			} else {
-				this.emit('disconnect_unintentional_before_connect');
-			}
+			this._emitDisconnect(wasConnected ? 'disconnect_unintentional_after_connect' : 'disconnect_unintentional_before_connect');
 		});
 
 		currentSocket.on('close', () => {
@@ -417,11 +410,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 
 			const wasConnected = this._wasConnected;// Reset to false in _disconnectNoEmit().
 			this._disconnectNoEmit();
-			if (wasConnected) {
-				this.emit('disconnect_unintentional_after_connect');
-			} else {
-				this.emit('disconnect_unintentional_before_connect');
-			}
+			this._emitDisconnect(wasConnected ? 'disconnect_unintentional_after_connect' : 'disconnect_unintentional_before_connect');
 		});
 
 		if (signal) {
@@ -457,7 +446,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 				// Reject before emitting so a throwing disconnect listener cannot
 				// leave the ping promise pending forever.
 				reject(new Error('Ping timed out'));
-				this.emit('disconnect_unintentional_after_connect');
+				this._emitDisconnect('disconnect_unintentional_after_connect');
 			}, timeoutMs);
 			this._pendingPongs.set(nonceHex, { resolve, reject, timeout, startTimeMs });
 			try {
@@ -516,7 +505,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 				// Reject before emitting so a throwing disconnect listener cannot
 				// leave the getHeaders promise pending forever.
 				reject(new Error('getHeaders timed out'));
-				this.emit('disconnect_unintentional_after_connect');
+				this._emitDisconnect('disconnect_unintentional_after_connect');
 			}, timeoutMs);
 			this._pendingGetHeaders = { resolve, reject, timeout };
 			try {
@@ -571,7 +560,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 					// Reject before emitting so a throwing disconnect listener cannot
 					// leave the getAddr promise pending forever.
 					rejectFunc!(new Error('getAddr timed out'));
-					this.emit('disconnect_unintentional_after_connect');
+					this._emitDisconnect('disconnect_unintentional_after_connect');
 				}
 			}, timeoutMs);
 			this._pendingGetAddr = { promise, resolve: resolveFunc!, reject: rejectFunc!, timeout };
@@ -650,9 +639,20 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 		}
 	};
 
+	// Emits a disconnect event without letting a throwing listener escape as an
+	// uncaught exception from a socket, timer, or abort callback. The error is
+	// treated as a local listener bug, so it is logged and swallowed.
+	private _emitDisconnect = (event: 'disconnect' | 'disconnect_unintentional_before_connect' | 'disconnect_unintentional_after_connect'): void => {
+		try {
+			this.emit(event);
+		} catch (error) {
+			console.error(`Error in '${event}' listener for`, this.getIpPortString(), ':', error);
+		}
+	}
+
 	disconnect = (): void => {
 		this._disconnectNoEmit();
-		this.emit('disconnect');
+		this._emitDisconnect('disconnect');
 	}
 
 	connected = (): boolean => {

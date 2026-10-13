@@ -1006,5 +1006,94 @@ describe('LegacyNodeConnection', () => {
 			conn[Symbol.dispose]();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		});
+
+		test('a throwing unintentional disconnect listener cannot escape the connect timeout', async () => {
+			// Accepts the TCP connection but never completes the handshake. Draining the
+			// socket lets it close when the client times out and destroys its side.
+			const server = net.createServer((socket) => { socket.resume(); });
+			await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+			const port = (server.address() as net.AddressInfo).port;
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.1',
+				port,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			conn.on('disconnect_unintentional_before_connect', () => { throw new Error('Simulated disconnect listener failure'); });
+
+			// The disconnect event is emitted from a timer callback, so a throwing listener
+			// must be swallowed there instead of escaping as an uncaught exception.
+			await expect(conn.connect({ timeoutMs: 1000 })).rejects.toThrow('Connection timed out');
+			expect(errorSpy).toHaveBeenCalled();
+
+			errorSpy.mockRestore();
+			conn[Symbol.dispose]();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		});
+
+		test('a listener that disconnects and reconnects before throwing leaves the new connection alone', async () => {
+			const { server, port } = await startHandshakeServer();
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.1',
+				port,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			let unintentionalDisconnects = 0;
+			conn.on('disconnect_unintentional_before_connect', () => unintentionalDisconnects++);
+			conn.on('disconnect_unintentional_after_connect', () => unintentionalDisconnects++);
+
+			await conn.connect({ timeoutMs: 3000 });
+
+			let reconnectPromise: Promise<void> | undefined;
+			conn.on('pong', () => {
+				conn.disconnect();
+				reconnectPromise = conn.connect({ timeoutMs: 3000 });
+				throw new Error('Simulated listener failure');
+			});
+
+			await conn.ping({ timeoutMs: 3000 });
+			expect(reconnectPromise).toBeDefined();
+			await reconnectPromise;
+
+			// The message-handler guard must leave a connection that replaced the failing
+			// socket untouched instead of tearing it down with a spurious involuntary
+			// disconnect event.
+			expect(conn.connected()).toBe(true);
+			expect(unintentionalDisconnects).toBe(0);
+
+			errorSpy.mockRestore();
+			conn[Symbol.dispose]();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		});
+
+		test('a throwing disconnect listener cannot escape a manual disconnect', () => {
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.19',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			conn.on('disconnect', () => { throw new Error('Simulated disconnect listener failure'); });
+
+			// disconnect() is called by the connect-abort path, where a throwing listener
+			// would otherwise escape the abort callback as an uncaught exception.
+			expect(() => conn.disconnect()).not.toThrow();
+			expect(errorSpy).toHaveBeenCalled();
+
+			errorSpy.mockRestore();
+			conn[Symbol.dispose]();
+		});
 	});
 });

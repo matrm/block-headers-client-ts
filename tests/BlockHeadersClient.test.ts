@@ -1017,6 +1017,49 @@ describe('BlockHeadersClient queue recovery', () => {
 				vi.useRealTimers();
 			}
 		});
+
+		test('a throwing internal listener is logged and cannot disconnect or penalize the peer', async () => {
+			const clientAny = client as any;
+			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
+			const pingTimeSpy = vi.spyOn(nodesDb, 'addPingTimeMs').mockImplementation(() => { throw new Error('Simulated listener failure'); });
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+
+			const ipPort = { ip: '10.0.2.1', port: 8333 };
+			const conn = await registerDisconnectTestNode(clientAny, ipPort, { connected: true });
+
+			expect(() => conn.emit('pong', 1, '0011223344556677')).not.toThrow();
+			await flushMicrotasks();
+
+			// A listener error is a local bug: it is logged and swallowed instead of being
+			// treated as a peer fault that disconnects, penalizes, or blacklists the node.
+			expect(errorSpy).toHaveBeenCalled();
+			expect(penaltySpy).not.toHaveBeenCalled();
+			expect(clientAny._nodeConnections.has(ipPortToString(ipPort))).toBe(true);
+			expect(clientAny._nodeConnectionsConnected.has(ipPortToString(ipPort))).toBe(true);
+
+			errorSpy.mockRestore();
+			pingTimeSpy.mockRestore();
+			penaltySpy.mockRestore();
+		});
+
+		test('a rejected async listener promise is logged instead of escaping as an unhandled rejection', async () => {
+			const clientAny = client as any;
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			const headersSpy = vi.spyOn(headersDb, 'getHeaderFromHashHex').mockImplementation(() => { throw new Error('Simulated listener failure'); });
+
+			const ipPort = { ip: '10.0.2.2', port: 8333 };
+			const conn = await registerDisconnectTestNode(clientAny, ipPort);
+
+			// The async block_hashes listener rejects after its synchronous part throws,
+			// which would otherwise be an unhandled rejection.
+			expect(() => conn.emit('block_hashes', [Buffer.alloc(32)])).not.toThrow();
+			await flushMicrotasks();
+
+			expect(errorSpy).toHaveBeenCalled();
+
+			errorSpy.mockRestore();
+			headersSpy.mockRestore();
+		});
 	});
 
 	// Helper that creates a mock NodeConnection whose _tipHashHex is updated

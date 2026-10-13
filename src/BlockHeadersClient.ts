@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { BlockHeader } from './BlockHeader.js';
 import { LegacyNodeConnection } from './LegacyNodeConnection.js';
 import { NodeConnection } from './NodeConnection.js';
+import type { NodeConnectionEvents } from './NodeConnection.js';
 import { NodesDatabase } from './NodesDatabase.js';
 import type { NodeConnectionMetrics } from './NodesDatabase.js';
 import { BlockHeadersDatabase } from './BlockHeadersDatabase.js';
@@ -822,12 +823,33 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		const ipPort = nodeConnection.getIpPort();
 		const ipPortString = nodeConnection.getIpPortString();
 
+		// Registers a listener that cannot escape the connection's socket or timer callbacks,
+		// where an internal listener error would be misattributed to the peer (disconnect
+		// event, rating penalty, blacklisting) or crash the process. Errors are logged and
+		// swallowed because they are local bugs, not peer misbehavior. Note that swallowing
+		// skips the rest of a throwing listener, so this is a crash and penalty guard, not a
+		// cleanup mechanism.
+		const onNodeConnection = <E extends keyof NodeConnectionEvents>(event: E, listener: (...args: NodeConnectionEvents[E]) => unknown): void => {
+			nodeConnection.on(event, (...args: any[]): void => {
+				try {
+					const result = listener(...(args as NodeConnectionEvents[E]));
+					if (result instanceof Promise) {
+						result.catch((error: unknown) => {
+							console.error(`Error in node connection '${event}' listener for`, ipPort, ':', error);
+						});
+					}
+				} catch (error) {
+					console.error(`Error in node connection '${event}' listener for`, ipPort, ':', error);
+				}
+			});
+		};
+
 		// Note: Only nodes that pass the tests in in this._connectNode() are added to this map.
 		// nodeConnection.on('connect', () => {
 		// 	this._nodeConnectionsConnected.set(ipPortString, nodeConnection);
 		// });
 
-		nodeConnection.on('disconnect', () => {
+		onNodeConnection('disconnect', () => {
 			this._enableConsoleDebugLog && console.log('Node disconnected:', ipPort);
 
 			if (clientStopSignal.aborted) {
@@ -837,7 +859,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			this._destroyNodeConnection(nodeConnection);
 		});
 
-		nodeConnection.on('data', () => {
+		onNodeConnection('data', () => {
 			const timeMs = Date.now();
 			// peer_data_received emit commented out: it spams the WS channel.
 			// this._dashboardEmitter.emit('peer_data_received', ipPort, timeMs);
@@ -846,7 +868,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			});
 		});
 
-		nodeConnection.on('addr', (ipPorts: IpPort[]) => {
+		onNodeConnection('addr', (ipPorts: IpPort[]) => {
 			// if (this._enableConsoleDebugLog) {
 			// 	console.log(ipPort, 'Received new peers:');
 			// 	ipPorts.forEach((ipPort) => console.log(`  ${ipPort.ip}:${ipPort.port}`));
@@ -864,7 +886,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			this._dashboardEmitter.emit('peer_addr_discovered', ipPort, ipPorts.length);
 		});
 
-		nodeConnection.on('block_hashes', async (hashes: Buffer[]) => {
+		onNodeConnection('block_hashes', async (hashes: Buffer[]) => {
 			if (this._enableConsoleDebugLog) {
 				if (hashes.length > 1) {
 					console.log(ipPort, 'Received new block hashes:');
@@ -902,7 +924,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			}
 		});
 
-		nodeConnection.on('new_chain_tip', (height: number, hashHex: string) => {
+		onNodeConnection('new_chain_tip', (height: number, hashHex: string) => {
 			// if (this._enableConsoleDebugLog) {
 			// 	console.log(ipPort, `Received new chain tip ${height}:`, hashHex);
 			// }
@@ -914,7 +936,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			this.emit('new_chain_tip', height, hashHex);
 		});
 
-		nodeConnection.on('out_of_sync', () => {
+		onNodeConnection('out_of_sync', () => {
 			this._enableConsoleDebugLog && console.log('Node out of sync:', ipPort);
 
 			if (clientStopSignal.aborted) {
@@ -938,7 +960,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			this._start();
 		});
 
-		nodeConnection.on('invalid_blocks', (invalidHeaders: BlockHeader[]) => {
+		onNodeConnection('invalid_blocks', (invalidHeaders: BlockHeader[]) => {
 			if (this._enableConsoleDebugLog) {
 				console.log('Node downloaded invalid headers:', ipPort);
 				console.log(`  First: ${invalidHeaders[0].hashHex}`);
@@ -966,7 +988,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			this._start();
 		});
 
-		nodeConnection.on('pong', (durationMs: number, nonceHex: string) => {
+		onNodeConnection('pong', (durationMs: number, nonceHex: string) => {
 			// if (this._enableConsoleDebugLog) {
 			// 	console.log(ipPort, `Received pong in ${Math.floor(durationMs)}ms at`, unixTime3Decimal());
 			// }
@@ -988,7 +1010,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			this._enableConsoleDebugLog && !blacklistedBeforeAndDebugLogging && this._nodesDatabase.isBlacklisted(ipPort, timeMs) && console.log('Blacklisted node:', ipPort, `after a ${durationMs}ms ping.`, 'rating before:', ratingBefore, 'rating after:', ratingAfter);
 		});
 
-		nodeConnection.on('disconnect_unintentional_before_connect', async () => {
+		onNodeConnection('disconnect_unintentional_before_connect', async () => {
 			this._enableConsoleDebugLog && console.log('Node unintentionally disconnected before connecting:', ipPort);
 
 			if (clientStopSignal.aborted) {
@@ -1033,7 +1055,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			this._destroyNodeConnection(nodeConnection);
 		});
 
-		nodeConnection.on('disconnect_unintentional_after_connect', async () => {
+		onNodeConnection('disconnect_unintentional_after_connect', async () => {
 			this._enableConsoleDebugLog && console.log('Node unintentionally disconnected after connecting:', ipPort, 'at', unixTime3Decimal());
 
 			if (clientStopSignal.aborted) {
