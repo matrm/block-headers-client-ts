@@ -883,6 +883,45 @@ describe('LegacyNodeConnection', () => {
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		});
 
+		test('a peer declaring an oversized message length before the handshake cannot crash the client', async () => {
+			const magic = getMagic(chain);
+			const server = net.createServer((socket) => {
+				socket.once('data', () => {
+					// 24-byte message header that lies about its payload size without
+					// sending any payload. Before the fix the client kept buffering the
+					// rest of the connection's data until it ran out of memory.
+					const message = buildMessage(magic, 'inv', Buffer.alloc(0));
+					message.writeUInt32LE(0xffffffff, 16);
+					socket.write(message);
+				});
+			});
+			await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+			const port = (server.address() as net.AddressInfo).port;
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.1',
+				port,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+			});
+
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			const disconnects: string[] = [];
+			conn.on('disconnect_unintentional_before_connect', () => disconnects.push('before'));
+			conn.on('disconnect_unintentional_after_connect', () => disconnects.push('after'));
+
+			// The oversized message is a protocol violation, so the peer must be
+			// disconnected instead of the client buffering the declared payload.
+			await expect(conn.connect({ timeoutMs: 3000 })).rejects.toThrow('closed during a pending connect');
+			expect(disconnects).toEqual(['before']);
+			expect(conn.connected()).toBe(false);
+
+			errorSpy.mockRestore();
+			conn[Symbol.dispose]();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		});
+
 		test('a message handler error disconnects only that peer instead of propagating', async () => {
 			const { server, port } = await startHandshakeServer();
 

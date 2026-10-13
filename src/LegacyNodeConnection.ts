@@ -320,56 +320,61 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 			this._connectionMonitor.updateLastKnownConnectionTime();
 
 			this._buffer = Buffer.concat([this._buffer, typeof data === 'string' ? Buffer.from(data) : data]);
-			const { messages, remaining, errors } = parseMessages(this._buffer, this._magic);
-			this._buffer = remaining;
 
-			// Handle parseMessages errors.
-			for (const error of errors) {
-				if (this._pendingConnect && (error.command === 'version' || error.command === 'verack')) {
-					const { reject } = this._pendingConnect;
-					clearTimeout(this._pendingConnect.timeout);
-					this._pendingConnect = null;
-					reject(new Error(error.message));
-				} else if (this._pendingPongs.size > 0 && error.command === 'pong') {
-					// Let the ping that has an error timeout. Alternative strategies below:
-
-					// Clear oldest ping (may get the wrong one if pings are out of order).
-					// const nonceHex = this._pendingPongs.keys().next().value;
-					// const pending = this._pendingPongs.get(nonceHex!);
-					// if (pending) {
-					// 	clearTimeout(pending.timeout);
-					// 	this._pendingPongs.delete(nonceHex!);
-					// 	pending.reject(new Error(error.message));
-					// }
-
-					// Clear all pings for safety (will cause unrelated pings to get an error too).
-					// for (const pendingPong of this._pendingPongs.values()) {
-					// 	clearTimeout(pendingPong.timeout);
-					// }
-					// const pendingPongsRejects = Array.from(this._pendingPongs.values()).map(({ reject }) => reject);
-					// this._pendingPongs.clear();
-					// pendingPongsRejects.forEach(reject => reject(new Error(error.message)));
-				} else if (this._pendingGetHeaders && error.command === 'headers') {
-					const { reject } = this._pendingGetHeaders;
-					clearTimeout(this._pendingGetHeaders.timeout);
-					this._pendingGetHeaders = null;
-					reject(new Error(error.message));
-				} else if (this._pendingGetAddr && error.command === 'addr') {
-					const { reject } = this._pendingGetAddr;
-					clearTimeout(this._pendingGetAddr.timeout);
-					this._pendingGetAddr = null;
-					reject(new Error(error.message));
-				}
-			}
-
-			// Process only messages that are valid.
+			let numMessages = 0;
 			try {
+				const { messages, remaining, errors } = parseMessages(this._buffer, this._magic);
+				this._buffer = remaining;
+				numMessages = messages.length;
+
+				// Handle parseMessages errors.
+				for (const error of errors) {
+					if (this._pendingConnect && (error.command === 'version' || error.command === 'verack')) {
+						const { reject } = this._pendingConnect;
+						clearTimeout(this._pendingConnect.timeout);
+						this._pendingConnect = null;
+						reject(new Error(error.message));
+					} else if (this._pendingPongs.size > 0 && error.command === 'pong') {
+						// Let the ping that has an error timeout. Alternative strategies below:
+
+						// Clear oldest ping (may get the wrong one if pings are out of order).
+						// const nonceHex = this._pendingPongs.keys().next().value;
+						// const pending = this._pendingPongs.get(nonceHex!);
+						// if (pending) {
+						// 	clearTimeout(pending.timeout);
+						// 	this._pendingPongs.delete(nonceHex!);
+						// 	pending.reject(new Error(error.message));
+						// }
+
+						// Clear all pings for safety (will cause unrelated pings to get an error too).
+						// for (const pendingPong of this._pendingPongs.values()) {
+						// 	clearTimeout(pendingPong.timeout);
+						// }
+						// const pendingPongsRejects = Array.from(this._pendingPongs.values()).map(({ reject }) => reject);
+						// this._pendingPongs.clear();
+						// pendingPongsRejects.forEach(reject => reject(new Error(error.message)));
+					} else if (this._pendingGetHeaders && error.command === 'headers') {
+						const { reject } = this._pendingGetHeaders;
+						clearTimeout(this._pendingGetHeaders.timeout);
+						this._pendingGetHeaders = null;
+						reject(new Error(error.message));
+					} else if (this._pendingGetAddr && error.command === 'addr') {
+						const { reject } = this._pendingGetAddr;
+						clearTimeout(this._pendingGetAddr.timeout);
+						this._pendingGetAddr = null;
+						reject(new Error(error.message));
+					}
+				}
+
+				// Process only messages that are valid.
 				for (const message of messages) {
 					this._handleMessage(message);
 				}
 			} catch (error) {
-				// A message handler error (including a listener error) must not escape the
-				// socket data handler as an uncaught exception. Disconnect only this peer.
+				// A framing parse error or a message handler error (including a listener
+				// error) must not escape the socket data handler as an uncaught exception.
+				// Disconnect only this peer. An oversized or otherwise unparseable message
+				// also lands here because its framing is unrecoverable.
 				console.error('Error handling message from', this.getIpPortString(), ':', error);
 
 				if (this._socket !== currentSocket) {
@@ -386,7 +391,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 				return;
 			}
 
-			if (messages.length) {
+			if (numMessages) {
 				this.emit('data');//, data);
 			}
 		});

@@ -13,6 +13,7 @@ import {
 	readVarInt,
 	parseAddrPayload,
 	ipBufferToString,
+	MAX_MESSAGE_PAYLOAD_LENGTH,
 } from '../../src/p2p/messages.js';
 import { getMagic } from '../../src/chainProtocol.js';
 
@@ -160,6 +161,20 @@ describe('p2p messages', () => {
 			expect(messages[1].command).toBe('test2');
 			expect(remaining).toEqual(garbage);
 			expect(errors.length).toBe(0);
+		});
+
+		test('should throw when a message declares a payload length above the maximum', () => {
+			const message = buildMessage(magic, 'inv', Buffer.alloc(0));
+			message.writeUInt32LE(MAX_MESSAGE_PAYLOAD_LENGTH + 1, 16);
+			expect(() => parseMessages(message, magic)).toThrow(/exceeds the maximum/);
+		});
+
+		test('should tolerate a declared payload length at the maximum without buffering it', () => {
+			const message = buildMessage(magic, 'inv', Buffer.alloc(0));
+			message.writeUInt32LE(MAX_MESSAGE_PAYLOAD_LENGTH, 16);
+			const { messages, remaining } = parseMessages(message, magic);
+			expect(messages.length).toBe(0);
+			expect(remaining.length).toBe(message.length);
 		});
 	});
 

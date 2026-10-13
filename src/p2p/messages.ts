@@ -1,6 +1,21 @@
 import * as crypto from 'crypto';
 import { IpPort } from '../types.js';
 
+// Largest payload this client accepts in a single P2P message.
+//
+// The cap assumes this client never receives block-like payloads. It only handles
+// version, verack, ping, pong, addr, inv, and headers messages (see
+// LegacyNodeConnection's message handler), and a headers response from bitcoin-sv is
+// capped at 2000 headers, so legitimate messages stay far below this limit. BSV blocks
+// can exceed 32 MiB, so if block download (and the getdata requests that would drive
+// it) is ever added, this value must be revisited.
+//
+// The cap is a local memory bound, not a limit mirrored from the node software this
+// client talks to (bitcoin-sv and Teranode's legacy P2P do not negotiate one with it).
+// It stops a peer from forcing the client to buffer an arbitrarily large incomplete
+// message.
+export const MAX_MESSAGE_PAYLOAD_LENGTH = 0x02000000;
+
 export function calculateChecksum(payload: Buffer): Buffer {
 	const hash = crypto.createHash('sha256').update(payload).digest();
 	const doubleHash = crypto.createHash('sha256').update(hash).digest();
@@ -139,6 +154,12 @@ export function parseMessages(buffer: Buffer, magic: Buffer): {
 		}
 		const command = buffer.slice(offset + 4, offset + 16).toString('ascii').replace(/\0+$/, '');
 		const length = buffer.readUInt32LE(offset + 16);
+		if (length > MAX_MESSAGE_PAYLOAD_LENGTH) {
+			// The declared length is either hostile or the framing is already lost, so
+			// parse no further. The caller must drop the connection because there is no
+			// way to find the next message boundary.
+			throw new Error(`Message payload length ${length} exceeds the maximum of ${MAX_MESSAGE_PAYLOAD_LENGTH}`);
+		}
 		if (offset + 24 + length > buffer.length) break;
 		const payload = buffer.slice(offset + 24, offset + 24 + length);
 		const checksum = buffer.slice(offset + 20, offset + 24);
