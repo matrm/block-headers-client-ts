@@ -128,11 +128,14 @@ npm run start-nobuild   # Run server without rebuilding (requires prior build)
 - Avoid using algorithms that have too much time-complexity for the data involved.
 - Avoid hardcoding values as much as reasonably possible.
 - Never reference line numbers, non example dates, issue numbers, or workflow items in commit messages, tests, or code.
+- Commit messages must follow the "Conventional Commits" style (e.g. `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:` followed by a concise description).
+- Never run `git push` (or any other command that pushes commits to a remote).
 - Comments shouldn't reference older versions of the codebase unless the context is backwards compatibility.
+- Comments should avoid holding constants so they don't violate the DRY principle (Don't Repeat Yourself), which prevents having to update the comments as often after changing the code. Explain behavior instead, name a constant only when there is no other way, and exact numbers are fine when the context calls for them.
 - Comment style: Use `/** ... */` JSDoc only for public method documentation describing the API contract (parameters, return values, purpose). All other comments, including internal implementation notes, design decisions, test documentation, benchmark comments, and section headers, must use the `// ` prefix. Inline single-word comments inside code blocks (e.g., `catch (e) { /* expected */ }`) are an exception and may remain `/* */` for readability.
 - Private class members use an underscore prefix (e.g., `_foo`) in addition to TypeScript's `private` keyword (not `#` private fields). Internal code (tests, API server) reaches privates via `as any` casting. Reasons: cleaner code, debuggability and testability via `as any` casting to reach internals, and the ability to add internal-only members (e.g., on `BlockHeadersClient`) that the API server can access without exposing them to library-mode consumers.
 - Do not declare variables with `var`.
-- The em dash character (—) must not be used anywhere in the codebase. Do not simply replace the character with something else. If you feel the need to use it, you must rephrase the text.
+- The em dash character (U+2014) must not be used anywhere in the codebase.
 
 ## Logging Strategy
 
