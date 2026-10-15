@@ -28,6 +28,11 @@ function deferred<T>(): {
 }
 
 describe('LegacyNodeConnection', () => {
+	// Restores spies even when an assertion fails before an inline mockRestore() call.
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
 	describe('syncHeaders queue behavior (limit 2)', () => {
 		let db: BlockHeadersDatabase;
 		let databasePath: string;
@@ -769,6 +774,848 @@ describe('LegacyNodeConnection', () => {
 		});
 	});
 
+	describe('_syncHeaders early stop and out-of-sync behavior', () => {
+		let db: BlockHeadersDatabase;
+		let databasePath: string;
+		let connMonitor: ConnectionMonitor;
+
+		beforeEach(async () => {
+			databasePath = `tests/db/node-connection-duplicate-${getRandomHexString(16)}`;
+			await mkdir(databasePath, { recursive: true });
+			db = await createDbWithRetries(() => BlockHeadersDatabase.fromGenesis({
+				databasePath,
+				invalidBlocks: Array.from(getInvalidBlocks(chain))
+			}));
+			connMonitor = new ConnectionMonitor({ intervalMs: 20000, timeoutMs: 10000 });
+		});
+
+		afterEach(async () => {
+			if (db) await db.close();
+			await removeDirectoryWithRetries(databasePath);
+		});
+
+		const HARDEST_BITS_HEX = 'ffff1f20';
+		const EASY_BITS_HEX = 'ffff7f20';
+
+		function createValidHeader(prevHashHex: string, nonce: number, bitsHex: string = HARDEST_BITS_HEX): BlockHeaderMutable {
+			for (let attempt = 0; ; attempt++) {
+				const buffer = Buffer.alloc(80);
+				buffer.writeUInt32LE(1, 0);
+				Buffer.from(prevHashHex, 'hex').reverse().copy(buffer, 4);
+				buffer.writeUInt32LE(nonce + attempt, 68);
+				Buffer.from(bitsHex, 'hex').copy(buffer, 72);
+				buffer.writeUInt32LE(nonce + attempt, 76);
+				try {
+					return BlockHeaderMutable.fromBuffer(buffer);
+				} catch { /* Invalid proof of work: try the next nonce. */ }
+			}
+		}
+
+		function createChain(length: number): BlockHeaderMutable[] {
+			const headers: BlockHeaderMutable[] = [];
+			let prevHashHex = db.getHeaderTip().hashHex;
+			for (let i = 0; i < length; i++) {
+				const header = createValidHeader(prevHashHex, 100000 + i * 13);
+				headers.push(header);
+				prevHashHex = header.hashHex;
+			}
+			return headers;
+		}
+
+		test('stops when the batch reaches the announced tip even if another connection added the header first', async () => {
+			const chainHeaders = createChain(3);
+			db.addHeaders(chainHeaders.slice(0, 2));
+			const newTipHeader = chainHeaders.at(-1)!;
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.21',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			// The inv handler sets _tipHashHex to the announced header before syncing.
+			(conn as any)._tipHashHex = newTipHeader.hashHex;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				if (getHeadersCallCount > 1) {
+					return [];
+				}
+				// Another connection adds the header while this request is in flight, so this
+				// connection downloads it as a duplicate.
+				db.addHeaders([newTipHeader]);
+				return [newTipHeader];
+			};
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+			let newChainTipCount = 0;
+			conn.on('new_chain_tip', () => newChainTipCount++);
+
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
+			await (conn as any)._syncHeaders();
+			expect(getHeadersCallCount).toBe(1);
+			expect(warnSpy).not.toHaveBeenCalled();
+			expect(outOfSyncCount).toBe(0);
+			expect(newChainTipCount).toBe(0);
+			expect(db.getHeaderTip().hashHex).toBe(newTipHeader.hashHex);
+			conn[Symbol.dispose]();
+		});
+
+		test('stops without an extra request when this connection downloads the announced tip', async () => {
+			const chainHeaders = createChain(3);
+			db.addHeaders(chainHeaders.slice(0, 2));
+			const newTipHeader = chainHeaders.at(-1)!;
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.24',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = newTipHeader.hashHex;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				return [newTipHeader];
+			};
+			let newChainTipCount = 0;
+			conn.on('new_chain_tip', () => newChainTipCount++);
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
+			await (conn as any)._syncHeaders();
+			expect(getHeadersCallCount).toBe(1);
+			expect(newChainTipCount).toBe(1);
+			expect(warnSpy).not.toHaveBeenCalled();
+			expect(outOfSyncCount).toBe(0);
+			expect(db.getHeaderTip().hashHex).toBe(newTipHeader.hashHex);
+			conn[Symbol.dispose]();
+		});
+
+		test('keeps fetching when an inv for the batch tail arrives mid-request and the peer has more headers', async () => {
+			const chainHeaders = createChain(7);
+			db.addHeaders(chainHeaders.slice(0, 1));
+			const announcedTip = chainHeaders[4];
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.41',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				if (getHeadersCallCount === 1) {
+					// The inv for the batch's last header arrives while the request is in flight.
+					(conn as any)._tipHashHex = announcedTip.hashHex;
+					return chainHeaders.slice(1, 5);
+				}
+				if (getHeadersCallCount === 2) {
+					// The peer has more headers after the announced tip.
+					return chainHeaders.slice(5, 7);
+				}
+				return [];
+			};
+			const chainTips: string[] = [];
+			conn.on('new_chain_tip', (_height: number, hashHex: string) => chainTips.push(hashHex));
+
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
+			await (conn as any)._syncHeaders();
+			expect(getHeadersCallCount).toBe(3);
+			expect(chainTips).toEqual([announcedTip.hashHex, chainHeaders[6].hashHex]);
+			expect(warnSpy).not.toHaveBeenCalled();
+			expect(db.getHeaderTip().hashHex).toBe(chainHeaders[6].hashHex);
+			conn[Symbol.dispose]();
+		});
+
+		test('still emits out_of_sync when the early stop happens for a peer far behind on a fork', async () => {
+			const mainChain = createChain(104);
+			db.addHeaders(mainChain);
+			const forkHeader = createValidHeader(mainChain[0].hashHex, 200000, EASY_BITS_HEX);
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.25',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = forkHeader.hashHex;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				return [forkHeader];
+			};
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
+			await (conn as any)._syncHeaders();
+			expect(getHeadersCallCount).toBe(1);
+			expect(outOfSyncCount).toBe(1);
+			expect(warnSpy).not.toHaveBeenCalled();
+			conn[Symbol.dispose]();
+		});
+
+		test('breaks immediately when the peer returns a batch ending at the first requested hash', async () => {
+			const chainHeaders = createChain(3);
+			db.addHeaders(chainHeaders);
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.22',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			// A peer that ignores the "from" position and returns the same batch every time.
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				return chainHeaders;
+			};
+
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
+			await (conn as any)._syncHeaders();
+			expect(getHeadersCallCount).toBe(1);
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+			conn[Symbol.dispose]();
+		});
+
+		test('breaks when a peer that ignores the "from" position repeats a batch that does not end at the first requested hash', async () => {
+			const chainHeaders = createChain(3);
+			db.addHeaders(chainHeaders);
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.23',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			// The first response ends at chainHeaders[0], which is not the hash the first request
+			// was made from, so the guard breaks on the next request that repeats it.
+			(conn as any).getHeaders = async () => [chainHeaders[0]];
+
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
+			await (conn as any)._syncHeaders();
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+			conn[Symbol.dispose]();
+		});
+
+		test('a newer tip announced while the request is in flight is fetched by the follow-up sync', async () => {
+			const chainHeaders = createChain(4);
+			db.addHeaders(chainHeaders.slice(0, 2));
+			const tip1 = chainHeaders[2];
+			const tip2 = chainHeaders[3];
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.26',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = tip1.hashHex;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				if (getHeadersCallCount === 1) {
+					// The inv for the newer tip arrives while this request is in flight.
+					(conn as any)._tipHashHex = tip2.hashHex;
+					return [tip1];
+				}
+				if (getHeadersCallCount === 2) {
+					return [tip2];
+				}
+				return [];
+			};
+			const chainTips: string[] = [];
+			conn.on('new_chain_tip', (_height: number, hashHex: string) => chainTips.push(hashHex));
+
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
+			// The first sync only trusts the tip it knew when it asked.
+			await conn.syncHeaders({});
+			expect(getHeadersCallCount).toBe(1);
+			expect((conn as any)._tipHashHex).toBe(tip1.hashHex);
+			expect(db.getHeaderTip().hashHex).toBe(tip1.hashHex);
+
+			// The inv for the newer tip queued a follow-up sync, which fetches it.
+			await conn.syncHeaders({});
+			expect(getHeadersCallCount).toBe(3);
+			expect(chainTips).toEqual([tip1.hashHex, tip2.hashHex]);
+			expect(warnSpy).not.toHaveBeenCalled();
+			expect(db.getHeaderTip().hashHex).toBe(tip2.hashHex);
+			conn[Symbol.dispose]();
+		});
+
+		test('keeps asking when the response covers a tip announced mid-request', async () => {
+			const chainHeaders = createChain(4);
+			db.addHeaders(chainHeaders.slice(0, 2));
+			const tip1 = chainHeaders[2];
+			const tip2 = chainHeaders[3];
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.27',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = tip1.hashHex;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				if (getHeadersCallCount > 1) {
+					return [];
+				}
+				// The inv for the newer tip arrives while this request is in flight, and the
+				// response already contains both headers.
+				(conn as any)._tipHashHex = tip2.hashHex;
+				return [tip1, tip2];
+			};
+			const chainTips: string[] = [];
+			conn.on('new_chain_tip', (_height: number, hashHex: string) => chainTips.push(hashHex));
+
+			await (conn as any)._syncHeaders();
+			// The response went past the tip known when the request was sent, so the sync asks
+			// once more and stops on the empty response.
+			expect(getHeadersCallCount).toBe(2);
+			expect(chainTips).toEqual([tip2.hashHex]);
+			expect(db.getHeaderTip().hashHex).toBe(tip2.hashHex);
+			conn[Symbol.dispose]();
+		});
+
+		test('keeps syncing across multiple batches until the announced tip is reached', async () => {
+			const chainHeaders = createChain(6);
+			db.addHeaders(chainHeaders.slice(0, 1));
+			const announcedTip = chainHeaders.at(-1)!;
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.28',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = announcedTip.hashHex;
+			const requestedTips: string[] = [];
+			const requestedFroms: string[] = [];
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async ({ from }: { from: Buffer[] }) => {
+				getHeadersCallCount++;
+				requestedTips.push((conn as any)._tipHashHex);
+				requestedFroms.push(from[0].toString('hex'));
+				if (getHeadersCallCount === 1) {
+					return chainHeaders.slice(1, 3);
+				}
+				if (getHeadersCallCount === 2) {
+					return chainHeaders.slice(3, 6);
+				}
+				return [];
+			};
+
+			await (conn as any)._syncHeaders();
+			expect(getHeadersCallCount).toBe(3);
+			expect(requestedTips[0]).toBe(announcedTip.hashHex);
+			// After the first request, _tipHashHex is overwritten by each batch's last header and
+			// `from` starts at that same header, so the reached-tip stop degenerates into the
+			// "from" check and cannot fire mid-sync. The second batch reaches the announced tip
+			// and the sync still ends on the empty response.
+			expect(requestedTips.slice(1)).toEqual(requestedFroms.slice(1));
+			expect(requestedTips[1]).not.toBe(announcedTip.hashHex);
+			expect(db.getHeaderTip().hashHex).toBe(announcedTip.hashHex);
+			conn[Symbol.dispose]();
+		});
+
+		test('stops at a capped first response that ends at the announced tip and continues on the next sync', async () => {
+			const chainHeaders = createChain(2010);
+			db.addHeaders(chainHeaders.slice(0, 1));
+			const announcedTip = chainHeaders[2000];
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.42',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = announcedTip.hashHex;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				if (getHeadersCallCount === 1) {
+					// The peer's response limit is reached exactly at the announced tip even
+					// though it has more headers behind it.
+					return chainHeaders.slice(1, 2001);
+				}
+				if (getHeadersCallCount === 2) {
+					return chainHeaders.slice(2001, 2010);
+				}
+				return [];
+			};
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			await (conn as any)._syncHeaders();
+			// The sync stops at the announced tip. The headers behind the capped response arrive
+			// with the next inv or the health-monitor sync, which is simulated here.
+			expect(getHeadersCallCount).toBe(1);
+			expect(db.getHeaderTip().hashHex).toBe(announcedTip.hashHex);
+			expect(outOfSyncCount).toBe(0);
+
+			await conn.syncHeaders({});
+			expect(getHeadersCallCount).toBe(3);
+			expect(db.getHeaderTip().hashHex).toBe(chainHeaders[2009].hashHex);
+			conn[Symbol.dispose]();
+		});
+
+		test('a follow-up sync starts from the updated tip and fetches the next announced block', async () => {
+			const chainHeaders = createChain(4);
+			db.addHeaders(chainHeaders.slice(0, 2));
+			const tip1 = chainHeaders[2];
+			const tip2 = chainHeaders[3];
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.29',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = tip1.hashHex;
+			const requestedFromTips: string[] = [];
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async ({ from }: { from: Buffer[] }) => {
+				getHeadersCallCount++;
+				requestedFromTips.push(from[0].toString('hex'));
+				if (getHeadersCallCount === 1) {
+					return [tip1];
+				}
+				if (getHeadersCallCount === 2) {
+					return [tip2];
+				}
+				return [];
+			};
+
+			await conn.syncHeaders({});
+			expect(getHeadersCallCount).toBe(1);
+			expect(db.getHeaderTip().hashHex).toBe(tip1.hashHex);
+
+			// The inv for the next tip arrives after the first sync stopped.
+			(conn as any)._tipHashHex = tip2.hashHex;
+			await conn.syncHeaders({});
+
+			expect(getHeadersCallCount).toBe(2);
+			expect(requestedFromTips).toEqual([chainHeaders[1].hashHex, tip1.hashHex]);
+			expect(db.getHeaderTip().hashHex).toBe(tip2.hashHex);
+			conn[Symbol.dispose]();
+		});
+
+		test('still emits out_of_sync from an empty response when the connection tip is far behind', async () => {
+			const mainChain = createChain(104);
+			db.addHeaders(mainChain);
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.30',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = mainChain[0].hashHex;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				return [];
+			};
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			await (conn as any)._syncHeaders();
+			expect(getHeadersCallCount).toBe(1);
+			expect(outOfSyncCount).toBe(1);
+			conn[Symbol.dispose]();
+		});
+
+		test('does not emit out_of_sync when the tip last seen was announced but not downloaded yet', async () => {
+			const mainChain = createChain(104);
+			db.addHeaders(mainChain);
+			// A header that is not in the database, like a peer's new tip announced while a
+			// getheaders request is in flight.
+			const announcedHeader = createValidHeader(mainChain.at(-1)!.hashHex, 600000);
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.40',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any).getHeaders = async () => {
+				// The inv for the peer's new tip is processed before the awaited continuation
+				// resumes, so _tipHashHex points at a header that is not in the database.
+				(conn as any)._tipHashHex = announcedHeader.hashHex;
+				return [];
+			};
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			await (conn as any)._syncHeaders();
+			expect(outOfSyncCount).toBe(0);
+			conn[Symbol.dispose]();
+		});
+
+		test('does not emit out_of_sync when the connection tip is exactly the allowed distance behind', async () => {
+			const mainChain = createChain(104);
+			db.addHeaders(mainChain);
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.31',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			// mainChain[3] is at height 4, exactly 100 behind the chain tip at height 104.
+			(conn as any)._tipHashHex = mainChain[3].hashHex;
+			(conn as any).getHeaders = async () => [];
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			await (conn as any)._syncHeaders();
+			expect(outOfSyncCount).toBe(0);
+			conn[Symbol.dispose]();
+		});
+
+		test('does not emit out_of_sync when the connection tip is its starting tip', async () => {
+			const mainChain = createChain(104);
+			db.addHeaders(mainChain);
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.32',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			// _tipHashHex defaults to the starting tip, which is excluded from the check.
+			(conn as any).getHeaders = async () => [];
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			await (conn as any)._syncHeaders();
+			expect(outOfSyncCount).toBe(0);
+			conn[Symbol.dispose]();
+		});
+
+		test('waits for the chain tip to stop being extended before resetting the locator when far behind', async () => {
+			const mainChain = createChain(104);
+			db.addHeaders(mainChain);
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.33',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = mainChain[0].hashHex;
+			const tipsAtRequest: string[] = [];
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				tipsAtRequest.push((conn as any)._tipHashHex);
+				if (getHeadersCallCount === 1) {
+					// A batch that ends far behind the chain tip.
+					return mainChain.slice(40, 45);
+				}
+				return [];
+			};
+			// The first read is recent, the read after the sleep is old enough.
+			const timeSpy = vi.spyOn(db, 'getTimeSinceLastChainTipExtensionThisSessionMs')
+				.mockReturnValueOnce(0)
+				.mockReturnValue(6000);
+
+			vi.useFakeTimers();
+			try {
+				const syncPromise = (conn as any)._syncHeaders();
+				await vi.advanceTimersByTimeAsync(0);
+				await vi.advanceTimersByTimeAsync(500);
+				await syncPromise;
+			} finally {
+				vi.useRealTimers();
+			}
+
+			expect(timeSpy).toHaveBeenCalledTimes(2);
+			expect(getHeadersCallCount).toBe(2);
+			expect(tipsAtRequest).toEqual([mainChain[0].hashHex, (conn as any)._startingTipHashHex]);
+			conn[Symbol.dispose]();
+		});
+
+		test('throws when the downloaded batch ends at a header that was not added to the database', async () => {
+			const chainHeaders = createChain(2);
+			db.addHeaders(chainHeaders);
+			// An orphan header whose parent is not in the database.
+			const orphanHeader = createValidHeader('11'.repeat(32), 300000);
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.34',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = orphanHeader.hashHex;
+			(conn as any).getHeaders = async () => [orphanHeader];
+
+			await expect(conn.syncHeaders({})).rejects.toThrow('Downloading headers out of order');
+			expect((conn as any)._tipHashHex).toBe((conn as any)._startingTipHashHex);
+			conn[Symbol.dispose]();
+		});
+
+		test('stops after one batch when the announced tip wins a reorg', async () => {
+			const mainChain = createChain(2);
+			db.addHeaders(mainChain);
+			// A longer fork from mainChain[0] has more work, so it becomes the longest chain.
+			const fork: BlockHeaderMutable[] = [];
+			let prevHashHex = mainChain[0].hashHex;
+			for (let i = 0; i < 3; i++) {
+				const header = createValidHeader(prevHashHex, 400000 + i * 13);
+				fork.push(header);
+				prevHashHex = header.hashHex;
+			}
+			const forkTip = fork.at(-1)!;
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.35',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = forkTip.hashHex;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				return fork;
+			};
+			let newChainTipCount = 0;
+			conn.on('new_chain_tip', () => newChainTipCount++);
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
+			await (conn as any)._syncHeaders();
+			expect(getHeadersCallCount).toBe(1);
+			expect(newChainTipCount).toBe(1);
+			expect(warnSpy).not.toHaveBeenCalled();
+			expect(outOfSyncCount).toBe(0);
+			expect(db.getHeaderTip().hashHex).toBe(forkTip.hashHex);
+			conn[Symbol.dispose]();
+		});
+
+		test('emits out_of_sync when a peer that ignores the "from" position is far behind', async () => {
+			const mainChain = createChain(104);
+			db.addHeaders(mainChain);
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.36',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			let getHeadersCallCount = 0;
+			// Every response ends at the header at height 3, more than 100 blocks behind the chain tip.
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				return [mainChain[2]];
+			};
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			// The undefined wait check makes the loop continue without sleeping after the first
+			// batch, so the second request repeats the batch and the "from" guard breaks.
+			const timeSpy = vi.spyOn(db, 'getTimeSinceLastChainTipExtensionThisSessionMs').mockReturnValue(undefined);
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
+			await (conn as any)._syncHeaders();
+			expect(getHeadersCallCount).toBe(2);
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+			expect(outOfSyncCount).toBe(1);
+			expect(timeSpy).toHaveBeenCalledTimes(1);
+			conn[Symbol.dispose]();
+		});
+
+		test('does not emit out_of_sync when the early stop tip is exactly the allowed distance behind', async () => {
+			const mainChain = createChain(104);
+			db.addHeaders(mainChain);
+			// A fork from mainChain[0] with easier bits stays off the longest chain and its tip
+			// at height 4 is exactly 100 blocks behind the chain tip at height 104.
+			const fork: BlockHeaderMutable[] = [];
+			let prevHashHex = mainChain[0].hashHex;
+			for (let i = 0; i < 3; i++) {
+				const header = createValidHeader(prevHashHex, 500000 + i * 13, EASY_BITS_HEX);
+				fork.push(header);
+				prevHashHex = header.hashHex;
+			}
+			const forkTip = fork.at(-1)!;
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.37',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = forkTip.hashHex;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				return fork;
+			};
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
+			await (conn as any)._syncHeaders();
+			expect(getHeadersCallCount).toBe(1);
+			expect(warnSpy).not.toHaveBeenCalled();
+			expect(outOfSyncCount).toBe(0);
+			expect(db.getHeaderFromHashHex(forkTip.hashHex)?.height).toBe(4);
+			expect(db.getHeaderTip().hashHex).toBe(mainChain.at(-1)!.hashHex);
+			conn[Symbol.dispose]();
+		});
+
+		test('emits out_of_sync when a later sync early-stops on a stale announced tip', async () => {
+			const mainChain = createChain(104);
+			db.addHeaders(mainChain);
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.38',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = mainChain.at(-1)!.hashHex;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				if (getHeadersCallCount === 1) {
+					return [];
+				}
+				return [mainChain.at(-1)!];
+			};
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			await conn.syncHeaders({});
+			expect(getHeadersCallCount).toBe(1);
+			expect(outOfSyncCount).toBe(0);
+
+			// The chain advances through other connections while this connection stays quiet.
+			db.addHeaders(createChain(101));
+
+			// The stale announced tip is now more than 100 blocks behind the chain tip.
+			await conn.syncHeaders({});
+			expect(getHeadersCallCount).toBe(2);
+			expect(outOfSyncCount).toBe(1);
+			expect(db.getHeaderTip().height).toBe(205);
+			conn[Symbol.dispose]();
+		});
+
+		test('keeps syncing to the real tip when an older inv arrives while the request is in flight', async () => {
+			const chainHeaders = createChain(4);
+			db.addHeaders(chainHeaders.slice(0, 2));
+			const announcedTip = chainHeaders[3];
+			const olderHeader = chainHeaders[1];
+
+			const conn = new LegacyNodeConnection({
+				ip: '127.0.0.39',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: db,
+				connectionMonitor: connMonitor,
+				enableConsoleDebugLog: true,
+			});
+			(conn as any).connected = () => true;
+			(conn as any)._tipHashHex = announcedTip.hashHex;
+			let getHeadersCallCount = 0;
+			(conn as any).getHeaders = async () => {
+				getHeadersCallCount++;
+				if (getHeadersCallCount === 1) {
+					// An inv for an older block arrives while this request is in flight.
+					(conn as any)._tipHashHex = olderHeader.hashHex;
+					return [chainHeaders[2], announcedTip];
+				}
+				return [];
+			};
+			const chainTips: string[] = [];
+			conn.on('new_chain_tip', (_height: number, hashHex: string) => chainTips.push(hashHex));
+			let outOfSyncCount = 0;
+			conn.on('out_of_sync', () => outOfSyncCount++);
+
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
+			await (conn as any)._syncHeaders();
+			// The older inv must not extend the sync: the response already reached the tip
+			// known when the request was sent.
+			expect(getHeadersCallCount).toBe(1);
+			expect(chainTips).toEqual([announcedTip.hashHex]);
+			expect(warnSpy).not.toHaveBeenCalled();
+			expect(outOfSyncCount).toBe(0);
+			expect(db.getHeaderTip().hashHex).toBe(announcedTip.hashHex);
+			conn[Symbol.dispose]();
+		});
+	});
+
 	describe('message handling safety', () => {
 		let db: BlockHeadersDatabase;
 		let databasePath: string;
@@ -906,7 +1753,7 @@ describe('LegacyNodeConnection', () => {
 				connectionMonitor: connMonitor,
 			});
 
-			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			vi.spyOn(console, 'error').mockImplementation(() => { });
 			const disconnects: string[] = [];
 			conn.on('disconnect_unintentional_before_connect', () => disconnects.push('before'));
 			conn.on('disconnect_unintentional_after_connect', () => disconnects.push('after'));
@@ -917,7 +1764,6 @@ describe('LegacyNodeConnection', () => {
 			expect(disconnects).toEqual(['before']);
 			expect(conn.connected()).toBe(false);
 
-			errorSpy.mockRestore();
 			conn[Symbol.dispose]();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		});
@@ -933,7 +1779,7 @@ describe('LegacyNodeConnection', () => {
 				connectionMonitor: connMonitor,
 			});
 
-			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			vi.spyOn(console, 'error').mockImplementation(() => { });
 			let afterConnectDisconnects = 0;
 			conn.on('disconnect_unintentional_after_connect', () => afterConnectDisconnects++);
 			conn.on('connect', () => { throw new Error('Simulated listener failure'); });
@@ -945,7 +1791,6 @@ describe('LegacyNodeConnection', () => {
 			await vi.waitFor(() => expect(afterConnectDisconnects).toBe(1));
 			expect(conn.connected()).toBe(false);
 
-			errorSpy.mockRestore();
 			conn[Symbol.dispose]();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		});
@@ -961,7 +1806,7 @@ describe('LegacyNodeConnection', () => {
 				connectionMonitor: connMonitor,
 			});
 
-			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			vi.spyOn(console, 'error').mockImplementation(() => { });
 			const order: string[] = [];
 			conn.on('connect', () => {
 				order.push('listener');
@@ -976,7 +1821,6 @@ describe('LegacyNodeConnection', () => {
 			// still observes the event before the awaiting caller resumes.
 			expect(order).toEqual(['listener', 'await']);
 
-			errorSpy.mockRestore();
 			conn[Symbol.dispose]();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		});
@@ -992,7 +1836,7 @@ describe('LegacyNodeConnection', () => {
 				connectionMonitor: connMonitor,
 			});
 
-			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			vi.spyOn(console, 'error').mockImplementation(() => { });
 			let afterConnectDisconnects = 0;
 			conn.on('disconnect_unintentional_after_connect', () => afterConnectDisconnects++);
 			await conn.connect({ timeoutMs: 3000 });
@@ -1006,7 +1850,6 @@ describe('LegacyNodeConnection', () => {
 			await vi.waitFor(() => expect(afterConnectDisconnects).toBe(1));
 			expect(conn.connected()).toBe(false);
 
-			errorSpy.mockRestore();
 			conn[Symbol.dispose]();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		});
@@ -1022,7 +1865,7 @@ describe('LegacyNodeConnection', () => {
 				connectionMonitor: connMonitor,
 			});
 
-			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			vi.spyOn(console, 'error').mockImplementation(() => { });
 			let disconnects = 0;
 			let unintentionalDisconnects = 0;
 			conn.on('disconnect', () => disconnects++);
@@ -1041,7 +1884,6 @@ describe('LegacyNodeConnection', () => {
 			expect(unintentionalDisconnects).toBe(0);
 			expect(conn.connected()).toBe(false);
 
-			errorSpy.mockRestore();
 			conn[Symbol.dispose]();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		});
@@ -1069,7 +1911,6 @@ describe('LegacyNodeConnection', () => {
 			await expect(conn.connect({ timeoutMs: 1000 })).rejects.toThrow('Connection timed out');
 			expect(errorSpy).toHaveBeenCalled();
 
-			errorSpy.mockRestore();
 			conn[Symbol.dispose]();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		});
@@ -1085,7 +1926,7 @@ describe('LegacyNodeConnection', () => {
 				connectionMonitor: connMonitor,
 			});
 
-			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+			vi.spyOn(console, 'error').mockImplementation(() => { });
 			let unintentionalDisconnects = 0;
 			conn.on('disconnect_unintentional_before_connect', () => unintentionalDisconnects++);
 			conn.on('disconnect_unintentional_after_connect', () => unintentionalDisconnects++);
@@ -1109,7 +1950,6 @@ describe('LegacyNodeConnection', () => {
 			expect(conn.connected()).toBe(true);
 			expect(unintentionalDisconnects).toBe(0);
 
-			errorSpy.mockRestore();
 			conn[Symbol.dispose]();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		});
@@ -1131,7 +1971,6 @@ describe('LegacyNodeConnection', () => {
 			expect(() => conn.disconnect()).not.toThrow();
 			expect(errorSpy).toHaveBeenCalled();
 
-			errorSpy.mockRestore();
 			conn[Symbol.dispose]();
 		});
 	});

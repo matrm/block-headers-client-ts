@@ -8,7 +8,8 @@ import { removeDirectoryWithRetries, createDbWithRetries } from './testUtils';
 import { BlockHeaderMutable } from '../src/BlockHeader.js';
 import { BlockHeadersClient } from '../src/BlockHeadersClient.js';
 import { BlockHeadersDatabase } from '../src/BlockHeadersDatabase.js';
-import { DEFAULT_peersReachableGraceMs, DEFAULT_unreachableDataWaitMs } from '../src/ConnectionMonitor.js';
+import { ConnectionMonitor, DEFAULT_peersReachableGraceMs, DEFAULT_unreachableDataWaitMs } from '../src/ConnectionMonitor.js';
+import { LegacyNodeConnection } from '../src/LegacyNodeConnection.js';
 import { NodesDatabase } from '../src/NodesDatabase.js';
 import { Chain, getInvalidBlocks } from '../src/chainProtocol.js';
 import { getRandomHexString, ipPortToString } from '../src/utils/util.js';
@@ -45,11 +46,15 @@ describe('BlockHeadersClient queue recovery', () => {
 	});
 
 	afterEach(async () => {
-		if (client) await client.stop().catch(() => { });
-		if (nodesDb) await nodesDb.close().catch(() => { });
-		if (headersDb) await headersDb.close().catch(() => { });
-		await removeDirectoryWithRetries(nodesPath);
-		await removeDirectoryWithRetries(headersPath);
+		try {
+			if (client) await client.stop().catch(() => { });
+			if (nodesDb) await nodesDb.close().catch(() => { });
+			if (headersDb) await headersDb.close().catch(() => { });
+			await removeDirectoryWithRetries(nodesPath);
+			await removeDirectoryWithRetries(headersPath);
+		} finally {
+			vi.restoreAllMocks();// Restores spies even if the test or cleanup failed.
+		}
 	});
 
 	describe('_startQueue', () => {
@@ -1021,7 +1026,7 @@ describe('BlockHeadersClient queue recovery', () => {
 		test('a throwing internal listener is logged and cannot disconnect or penalize the peer', async () => {
 			const clientAny = client as any;
 			const penaltySpy = vi.spyOn(nodesDb, 'addRecentUnintentionalDisconnectTimesMs');
-			const pingTimeSpy = vi.spyOn(nodesDb, 'addPingTimeMs').mockImplementation(() => { throw new Error('Simulated listener failure'); });
+			vi.spyOn(nodesDb, 'addPingTimeMs').mockImplementation(() => { throw new Error('Simulated listener failure'); });
 			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
 
 			const ipPort = { ip: '10.0.2.1', port: 8333 };
@@ -1036,16 +1041,12 @@ describe('BlockHeadersClient queue recovery', () => {
 			expect(penaltySpy).not.toHaveBeenCalled();
 			expect(clientAny._nodeConnections.has(ipPortToString(ipPort))).toBe(true);
 			expect(clientAny._nodeConnectionsConnected.has(ipPortToString(ipPort))).toBe(true);
-
-			errorSpy.mockRestore();
-			pingTimeSpy.mockRestore();
-			penaltySpy.mockRestore();
 		});
 
 		test('a rejected async listener promise is logged instead of escaping as an unhandled rejection', async () => {
 			const clientAny = client as any;
 			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
-			const headersSpy = vi.spyOn(headersDb, 'getHeaderFromHashHex').mockImplementation(() => { throw new Error('Simulated listener failure'); });
+			vi.spyOn(headersDb, 'getHeaderFromHashHex').mockImplementation(() => { throw new Error('Simulated listener failure'); });
 
 			const ipPort = { ip: '10.0.2.2', port: 8333 };
 			const conn = await registerDisconnectTestNode(clientAny, ipPort);
@@ -1056,9 +1057,71 @@ describe('BlockHeadersClient queue recovery', () => {
 			await flushMicrotasks();
 
 			expect(errorSpy).toHaveBeenCalled();
+		});
 
-			errorSpy.mockRestore();
-			headersSpy.mockRestore();
+		test('an out_of_sync node is penalized, reported to the dashboard, and replaced', async () => {
+			const clientAny = client as any;
+			const penaltySpy = vi.spyOn(nodesDb, 'addLastOutOfSyncTimeMs');
+			clientAny._start = vi.fn().mockResolvedValue(undefined);
+			const outOfSyncEvents: IpPort[] = [];
+			clientAny._dashboardEmitter.on('peer_out_of_sync', (ipPort: IpPort) => outOfSyncEvents.push(ipPort));
+
+			const ipPort = { ip: '10.0.0.9', port: 8333 };
+			const conn = await registerDisconnectTestNode(clientAny, ipPort);
+			conn.emit('out_of_sync');
+			await flushMicrotasks();
+
+			expect(penaltySpy).toHaveBeenCalledTimes(1);
+			expect(penaltySpy).toHaveBeenCalledWith(ipPort, expect.any(Number));
+			expect(outOfSyncEvents).toEqual([ipPort]);
+			expect(clientAny._nodeConnections.has(ipPortToString(ipPort))).toBe(false);
+			expect(conn[Symbol.dispose]).toHaveBeenCalledTimes(1);
+			expect(clientAny._start).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe('sync bookkeeping and branch pruning', () => {
+		const flushMicrotasks = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+		test('does not prune branches while a queued sync is still running on the same connection', async () => {
+			const clientAny = client as any;
+			const conn = new LegacyNodeConnection({
+				ip: '10.0.0.10',
+				port: 8333,
+				chain,
+				blockHeadersDatabase: headersDb,
+				connectionMonitor: new ConnectionMonitor({ intervalMs: 20000, timeoutMs: 10000 }),
+			});
+			(conn as any).connected = () => true;
+			const pendingResolvers: Array<(headers: BlockHeaderMutable[]) => void> = [];
+			(conn as any).getHeaders = () => new Promise<BlockHeaderMutable[]>((resolve) => pendingResolvers.push(resolve));
+			clientAny._setupNodeConnectionCallbacks(conn, new AbortController().signal);
+			const pruneSpy = vi.spyOn(headersDb, 'pruneBranches');
+
+			conn.emit('block_hashes', [Buffer.alloc(32, 1)]);
+			await flushMicrotasks();
+			expect(pendingResolvers.length).toBe(1);
+
+			// The second announcement queues a sync behind the running one.
+			conn.emit('block_hashes', [Buffer.alloc(32, 2)]);
+			expect((conn as any)._numSyncHeadersQueued).toBe(2);
+
+			// Finishing the first sync starts the queued one.
+			pendingResolvers[0]([]);
+			await flushMicrotasks();
+			expect(pendingResolvers.length).toBe(2);
+			expect((conn as any)._syncingHeaders).toBe(true);
+
+			// The connection is still syncing, so branches must not be pruned.
+			expect(clientAny._nodesSyncingHeaders.size).toBe(1);
+			expect(pruneSpy).not.toHaveBeenCalled();
+
+			pendingResolvers[1]([]);
+			await flushMicrotasks();
+			expect((conn as any)._syncingHeaders).toBe(false);
+			expect(clientAny._nodesSyncingHeaders.size).toBe(0);
+			expect(pruneSpy).toHaveBeenCalledTimes(1);
+			conn[Symbol.dispose]();
 		});
 	});
 

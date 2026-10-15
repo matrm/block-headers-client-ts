@@ -101,7 +101,10 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	private readonly _connectionMonitor: ConnectionMonitor;
 	private _addedSeedNodesFromExternalAPI: boolean = false;
 	private _addedSeedNodesFromEnvAndHardcoded: boolean = false;
-	private _nodesSyncingHeaders: Set<string> = new Set();
+	// Nodes with at least one in-flight syncHeaders call, mapped to the number of overlapping
+	// calls. A count is needed because a connection can have one running sync plus queued ones
+	// from overlapping announcements, and branches must not be pruned until the last finishes.
+	private _nodesSyncingHeaders: Map<string, number> = new Map();
 	// Timestamp (performance.now()) of the most recent sign of progress.
 	// Reset on successful connection, getAddr start, stuck-detection purge,
 	// internet-down detection, and whenever workers begin connecting to nodes.
@@ -509,7 +512,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		if (signal.aborted) throw new Error('Aborted after onValidChain');
 
 		this._enableConsoleDebugLog && console.log(`Worker ${workerId} - About to sync headers from node:`, nodeConnection.getIpPort(), numAttempts, 'attempts.');
-		this._nodesSyncingHeaders.add(nodeConnection.getIpPortString());
+		this._addNodeSyncingHeaders(nodeConnection.getIpPortString());
 		await nodeConnection.syncHeaders({ signal })
 			.then(() => {
 				this._enableConsoleDebugLog && console.log(`Worker ${workerId} - Finished syncing headers from node:`, nodeConnection.getIpPort(), numAttempts, 'attempts.');
@@ -519,7 +522,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				throw error;
 			})
 			.finally(() => {
-				this._nodesSyncingHeaders.delete(nodeConnection.getIpPortString());
+				this._removeNodeSyncingHeaders(nodeConnection.getIpPortString());
 			});
 		if (signal.aborted) throw new Error('Aborted after syncHeaders');
 
@@ -817,6 +820,22 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		}
 	}
 
+	private _addNodeSyncingHeaders = (ipPortString: string): void => {
+		this._nodesSyncingHeaders.set(ipPortString, (this._nodesSyncingHeaders.get(ipPortString) ?? 0) + 1);
+	}
+
+	private _removeNodeSyncingHeaders = (ipPortString: string): void => {
+		const count = this._nodesSyncingHeaders.get(ipPortString);
+		if (count === undefined) {
+			return;
+		}
+		if (count <= 1) {
+			this._nodesSyncingHeaders.delete(ipPortString);
+		} else {
+			this._nodesSyncingHeaders.set(ipPortString, count - 1);
+		}
+	}
+
 	private _setupNodeConnectionCallbacks = (nodeConnection: NodeConnection, clientStopSignal: AbortSignal): void => {
 		nodeConnection.removeAllListeners();
 
@@ -905,17 +924,18 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			this._dashboardEmitter.emit('peer_block_hashes_received', ipPort, lastHashHex);
 
 			if (this._blockHeadersDatabase.getHeaderFromHashHex(lastHashHex)?.hashHex === lastHashHex) {
-				// Another node has already downloaded this header and added it to the database.
-				//this._enableConsoleDebugLog && console.log(ipPort, 'Skipping syncing headers for', lastHashHex, 'because another node already downloaded.');
+				// The database already has this header (on the longest chain or as a stored fork),
+				// so this announcement adds nothing to download.
+				//this._enableConsoleDebugLog && console.log(ipPort, 'Skipping syncing headers for', lastHashHex, 'because the header is already in the database.');
 				return;
 			}
-			this._nodesSyncingHeaders.add(nodeConnection.getIpPortString());
+			this._addNodeSyncingHeaders(nodeConnection.getIpPortString());
 			await nodeConnection.syncHeaders({ signal: clientStopSignal })
 				.catch((error) => {
 					this._enableConsoleDebugLog && console.log('Failed to sync headers for', ipPort, 'on new block hashes:', error);
 				})
 				.finally(() => {
-					this._nodesSyncingHeaders.delete(nodeConnection.getIpPortString());
+					this._removeNodeSyncingHeaders(nodeConnection.getIpPortString());
 				});
 			// Not needed but saves resources.
 			if (!this._nodesSyncingHeaders.size) {
@@ -1218,11 +1238,11 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 					await nodeConnection.connect({ signal: clientStopSignal });
 					if (this._blockHeadersDatabase.getHeaderTip().height) {
 						// Sync headers in case a block is missed during multiple disconnects.
-						this._nodesSyncingHeaders.add(ipPortString);
+						this._addNodeSyncingHeaders(ipPortString);
 						try {
 							await nodeConnection.syncHeaders({ signal: clientStopSignal });
 						} finally {
-							this._nodesSyncingHeaders.delete(ipPortString);
+							this._removeNodeSyncingHeaders(ipPortString);
 						}
 					}
 					this._nodeConnectionsConnected.set(ipPortString, nodeConnection);
@@ -1325,12 +1345,12 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				// Check if any nodes are out of sync.
 				this._enableConsoleDebugLog && console.log('Node connections health monitor: Checking if any nodes are out of sync...');
 				await Promise.all(Array.from(this._nodeConnectionsConnected.values()).map(nodeConnection => {
-					this._nodesSyncingHeaders.add(nodeConnection.getIpPortString());
+					this._addNodeSyncingHeaders(nodeConnection.getIpPortString());
 					return nodeConnection.syncHeaders({ signal: clientStopSignal })
 						.catch((error) => {
 							this._enableConsoleDebugLog && console.log('Node connections health monitor: Failed to sync headers for', nodeConnection.getIpPort(), ':', error.message);
 						}).finally(() => {
-							this._nodesSyncingHeaders.delete(nodeConnection.getIpPortString());
+							this._removeNodeSyncingHeaders(nodeConnection.getIpPortString());
 						});
 				}));
 				// Prune header branches in the block headers database. Not needed but saves resources.

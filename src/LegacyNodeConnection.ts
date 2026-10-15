@@ -696,6 +696,27 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 		//return invalidBlocksUsed;
 	}
 
+	// Emits out_of_sync when the tip this connection last saw is too far behind the longest
+	// known chain.
+	private _checkNodeOutOfSync = (): void => {
+		if (this._tipHashHex === this._blockHeadersDatabase.getHeaderTip().hashHex ||
+			this._tipHashHex === this._startingTipHashHex) {
+			return;
+		}
+		const nodeTip = this._blockHeadersDatabase.getHeaderFromHashHex(this._tipHashHex);
+		if (!nodeTip) {
+			// The tip this connection last saw was announced but has not been downloaded yet.
+			// It has no height to compare and is normally ahead of this chain, so it is not
+			// treated as out of sync.
+			return;
+		}
+		const chainTipHeight = this._blockHeadersDatabase.getHeaderTip().height;
+		if (nodeTip.height + 100 < chainTipHeight) {
+			this._enableConsoleDebugLog && console.log(`Node is ${chainTipHeight - nodeTip.height} blocks behind the longest known chain:`, this.getIpPort());
+			this.emit('out_of_sync');
+		}
+	}
+
 	private _syncHeaders = async (signal?: AbortSignal): Promise<void> => {
 		if (!this.connected()) {
 			throw new Error('Not connected');
@@ -705,25 +726,22 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 		let waitedForOtherNodeToSync = false;
 		let from = this._blockHeadersDatabase.getBlockLocatorHashBuffers();
 		while (true) {
+			// Captured before the request because `from` is reassigned below. A response whose
+			// last header is this hash means the peer ignored the "from" position.
+			const requestedFromHashHex = from[0].toString('hex');
+			// The tip this connection knew when the request was sent. An inv that arrives while
+			// the request is in flight must not make the response look like it reached that
+			// newer tip, because the response started after the old tip.
+			const requestedTipHashHex = this._tipHashHex;
 			const headers = await this.getHeaders({ from, signal });
 			if (signal?.aborted) throw new Error('Aborted');
 
 			if (headers.length === 0) {
 				//this._enableConsoleDebugLog && console.log('No headers downloaded by', this.getIpPort());
-				if (this._tipHashHex !== this._blockHeadersDatabase.getHeaderTip().hashHex &&
-					this._tipHashHex !== this._startingTipHashHex) {
-					const chainTipHeight = this._blockHeadersDatabase.getHeaderTip().height;
-					const nodeTipHeight = this._blockHeadersDatabase.getHeaderFromHashHex(this._tipHashHex)?.height || 0;
-					// This node is allowed to be 100 blocks behind the longest known chain before being considered out of sync.
-					if (nodeTipHeight + 100 < chainTipHeight) {
-						this._enableConsoleDebugLog && console.log(`Node is ${chainTipHeight - nodeTipHeight} blocks behind the longest known chain:`, this.getIpPort());
-						this.emit('out_of_sync');
-					}
-				}
+				this._checkNodeOutOfSync();
 				break;
 			}
-			from = [headers[headers.length - 1].hashBuffer];
-			const lastTipHashHex = this._tipHashHex;
+			from = [headers.at(-1)!.hashBuffer];
 			this._tipHashHex = headers.at(-1)!.hashHex;
 
 			const result = this._blockHeadersDatabase.addHeaders(headers);
@@ -739,7 +757,7 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 
 			if (!this._blockHeadersDatabase.getHeaderFromHashHex(this._tipHashHex)) {
 				// Downloading headers out of order.
-				this._enableConsoleDebugLog && console.log(this.getIpPort(), 'Downloading headers out of order:', 'lastTipHashHex:', lastTipHashHex, 'this._tipHashHex:', this._tipHashHex);
+				this._enableConsoleDebugLog && console.log(this.getIpPort(), 'Downloading headers out of order:', 'requestedTipHashHex:', requestedTipHashHex, 'this._tipHashHex:', this._tipHashHex);
 				throw new Error('Downloading headers out of order');
 			}
 
@@ -754,20 +772,29 @@ export class LegacyNodeConnection extends EventEmitter<NodeConnectionEvents> imp
 				dl: headers.length,
 				add: nAdded,
 				rem: nRemoved,
-				//lastTip: lastTipHashHex.slice(-4),
+				//requestedTip: requestedTipHashHex.slice(-4),
 				//tip: this._tipHashHex.slice(-4)
 			}, `${this._ip}`);
 
 			if (nAdded > 0) {
-				this.emit('new_chain_tip', heightDownloaded as number, headers[headers.length - 1].hashHex);
+				this.emit('new_chain_tip', heightDownloaded as number, headers.at(-1)!.hashHex);
 			}
 
-			// This hasn't happened yet and shouldn't be needed. If a node is configured to return the
-			// last 2000 headers this will prevent an infinite loop. The if statement below that assigns
-			// from = this._blockHeadersDatabase.getBlockLocatorHashBuffers() can trigger this if it
-			// doesn't check from.length === 1.
-			if (nAdded === 0 && lastTipHashHex === this._tipHashHex && from.length === 1) {
-				this._enableConsoleDebugLog && console.warn(`${headers.length} duplicate headers downloaded.`);
+			// A peer that keeps returning headers ending at the hash the request was made from
+			// ignores the "from" position and would otherwise be asked for the same headers
+			// forever.
+			if (nAdded === 0 && headers.at(-1)!.hashHex === requestedFromHashHex) {
+				this._enableConsoleDebugLog && console.warn(`${headers.length} headers downloaded ending at the requested hash.`);
+				this._checkNodeOutOfSync();
+				break;
+			}
+
+			// The batch reached the tip this connection knew when it asked, which is usually
+			// the tip the peer announced. A tip announced while the request was in flight does
+			// not stop the sync, so the extra headers it implies are fetched by the follow-up
+			// sync that same announcement already queued.
+			if (headers.at(-1)!.hashHex === requestedTipHashHex) {
+				this._checkNodeOutOfSync();
 				break;
 			}
 
