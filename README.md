@@ -12,7 +12,7 @@ A typescript bitcoin sv block headers client.
 
 ## System Requirements
 
-- 350MB of RAM per 1 million block headers.
+- 500MB of RAM per 1 million block headers.
 
 ## Library / Client Mode
 
