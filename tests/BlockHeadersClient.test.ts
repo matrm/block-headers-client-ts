@@ -1435,4 +1435,145 @@ describe('BlockHeadersClient queue recovery', () => {
 			expect(dashboardPeers.map(peer => peer.ip)).toEqual(['3.3.3.3', '2.2.2.2', '1.1.1.1']);
 		});
 	});
+
+	describe('_connectAndTestNode', () => {
+		// Creates a connection that emits the given event during a test step and then
+		// resolves, mirroring LegacyNodeConnection._syncHeaders, which emits out_of_sync
+		// (or invalid_blocks) and then breaks out of its loop and resolves normally.
+		const createTestConnection = (ipPort: IpPort, { emitDuringConnect, emitDuringSync }: { emitDuringConnect?: 'disconnect'; emitDuringSync?: 'out_of_sync' | 'invalid_blocks' } = {}) => {
+			const conn = new EventEmitter() as any;
+			conn.getIpPort = () => ipPort;
+			conn.getIpPortString = () => ipPortToString(ipPort);
+			conn.getTipHashHex = () => 'deadbeef';
+			conn.connect = vi.fn().mockImplementation(async () => {
+				if (emitDuringConnect) {
+					conn.emit(emitDuringConnect);
+				}
+			});
+			conn.ping = vi.fn().mockResolvedValue(1);
+			conn.onValidChain = vi.fn().mockResolvedValue(true);
+			conn.syncHeaders = vi.fn().mockImplementation(async () => {
+				if (emitDuringSync) {
+					conn.emit(emitDuringSync, emitDuringSync === 'invalid_blocks' ? [] : undefined);
+				}
+			});
+			conn.getAddr = vi.fn().mockResolvedValue([]);
+			conn[Symbol.dispose] = vi.fn();
+			return conn;
+		};
+
+		const registerTestConnection = (clientAny: any, conn: any, ipPort: IpPort) => {
+			clientAny._nodeConnections.set(ipPortToString(ipPort), conn);
+			clientAny._setupNodeConnectionCallbacks(conn, new AbortController().signal);
+		};
+
+		test('a peer destroyed during the connect test is not published as connected', async () => {
+			const clientAny = client as any;
+			clientAny._start = vi.fn().mockResolvedValue(undefined);
+
+			const ipPort = { ip: '10.0.0.20', port: 8333 };
+			await nodesDb.addSeen(ipPort, Date.now());
+
+			const conn = createTestConnection(ipPort, { emitDuringSync: 'out_of_sync' });
+			registerTestConnection(clientAny, conn, ipPort);
+
+			const dashboardEvents: string[] = [];
+			clientAny._dashboardEmitter.on('peer_connected', () => dashboardEvents.push('peer_connected'));
+			clientAny._dashboardEmitter.on('peer_disconnected', () => dashboardEvents.push('peer_disconnected'));
+
+			await clientAny._connectAndTestNode({
+				nodeConnection: conn,
+				alwaysGetAddr: false,
+				workerId: 'connect-and-test-test',
+				numAttempts: 1,
+				signal: new AbortController().signal,
+			});
+
+			// The out_of_sync handler destroyed the peer during the test.
+			expect(conn[Symbol.dispose]).toHaveBeenCalledTimes(1);
+			expect(clientAny._nodeConnections.has(ipPortToString(ipPort))).toBe(false);
+
+			// A destroyed peer must not be published as a connected peer.
+			expect(clientAny._nodeConnectionsConnected.has(ipPortToString(ipPort))).toBe(false);
+			expect(client.getPeersInfoConnected()).toEqual([]);
+
+			// The dashboard must not be told about a peer that is already gone, and that
+			// peer can never be reported as disconnected either.
+			expect(dashboardEvents).toEqual([]);
+		});
+
+		test('a peer that served invalid blocks during the connect test is not published as connected', async () => {
+			const clientAny = client as any;
+			clientAny._start = vi.fn().mockResolvedValue(undefined);
+
+			const ipPort = { ip: '10.0.0.21', port: 8333 };
+			await nodesDb.addSeen(ipPort, Date.now());
+
+			const conn = createTestConnection(ipPort, { emitDuringSync: 'invalid_blocks' });
+			registerTestConnection(clientAny, conn, ipPort);
+
+			await clientAny._connectAndTestNode({
+				nodeConnection: conn,
+				alwaysGetAddr: false,
+				workerId: 'connect-and-test-test',
+				numAttempts: 1,
+				signal: new AbortController().signal,
+			});
+
+			expect(conn[Symbol.dispose]).toHaveBeenCalledTimes(1);
+			expect(clientAny._nodeConnectionsConnected.has(ipPortToString(ipPort))).toBe(false);
+			expect(client.getPeersInfoConnected()).toEqual([]);
+		});
+
+		test('a peer that disconnects during the connect test is not published as connected', async () => {
+			const clientAny = client as any;
+			clientAny._start = vi.fn().mockResolvedValue(undefined);
+
+			const ipPort = { ip: '10.0.0.22', port: 8333 };
+			await nodesDb.addSeen(ipPort, Date.now());
+
+			const conn = createTestConnection(ipPort, { emitDuringConnect: 'disconnect' });
+			registerTestConnection(clientAny, conn, ipPort);
+
+			await clientAny._connectAndTestNode({
+				nodeConnection: conn,
+				alwaysGetAddr: false,
+				workerId: 'connect-and-test-test',
+				numAttempts: 1,
+				signal: new AbortController().signal,
+			});
+
+			expect(conn[Symbol.dispose]).toHaveBeenCalledTimes(1);
+			expect(clientAny._nodeConnectionsConnected.has(ipPortToString(ipPort))).toBe(false);
+			expect(client.getPeersInfoConnected()).toEqual([]);
+		});
+
+		test('a peer that passes the connect test is published as connected', async () => {
+			const clientAny = client as any;
+			clientAny._start = vi.fn().mockResolvedValue(undefined);
+
+			const ipPort = { ip: '10.0.0.23', port: 8333 };
+			await nodesDb.addSeen(ipPort, Date.now());
+
+			const conn = createTestConnection(ipPort);
+			registerTestConnection(clientAny, conn, ipPort);
+
+			const dashboardEvents: string[] = [];
+			clientAny._dashboardEmitter.on('peer_connected', () => dashboardEvents.push('peer_connected'));
+			clientAny._dashboardEmitter.on('peer_disconnected', () => dashboardEvents.push('peer_disconnected'));
+
+			await clientAny._connectAndTestNode({
+				nodeConnection: conn,
+				alwaysGetAddr: false,
+				workerId: 'connect-and-test-test',
+				numAttempts: 1,
+				signal: new AbortController().signal,
+			});
+
+			expect(conn[Symbol.dispose]).not.toHaveBeenCalled();
+			expect(clientAny._nodeConnectionsConnected.has(ipPortToString(ipPort))).toBe(true);
+			expect(client.getPeersInfoConnected().map(peer => peer.ip)).toEqual([ipPort.ip]);
+			expect(dashboardEvents).toEqual(['peer_connected']);
+		});
+	});
 });

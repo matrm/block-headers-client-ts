@@ -486,6 +486,18 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	}): Promise<void> => {
 		assert(this._nodeConnections.has(nodeConnection.getIpPortString()));
 
+		// The connection can be destroyed while the tests are running, e.g. by the
+		// out_of_sync or invalid_blocks handlers, which destroy it and then let the
+		// ongoing test continue. A destroyed connection must not be published as a
+		// connected peer, and the remaining tests must not run against it.
+		const nodeWasDestroyed = (): boolean => {
+			if (this._nodeConnections.get(nodeConnection.getIpPortString()) === nodeConnection) {
+				return false;
+			}
+			this._enableConsoleDebugLog && console.log(`Worker ${workerId} - Node was destroyed during the connect test:`, nodeConnection.getIpPort(), numAttempts, 'attempts.');
+			return true;
+		};
+
 		if (signal.aborted) {
 			this._enableConsoleDebugLog && console.log(`Worker ${workerId} - Aborted before connecting to node:`, nodeConnection.getIpPort());
 			throw new Error('Connection attempt aborted');
@@ -494,6 +506,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		this._enableConsoleDebugLog && console.log(`Worker ${workerId} - Connecting to node:`, nodeConnection.getIpPort(), numAttempts, 'attempts.');
 		await nodeConnection.connect({ signal });
 		if (signal.aborted) throw new Error('Aborted after connect');
+		if (nodeWasDestroyed()) return;
 
 		this._nodesDatabase.addLastConnectTimeMs(nodeConnection.getIpPort(), Date.now()).catch((error: Error) => {
 			console.error('Nodes database error when addLastConnectTimeMs', nodeConnection.getIpPort(), ':', error);
@@ -503,6 +516,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 		const pingDurationMs = await nodeConnection.ping({ signal });
 		this._enableConsoleDebugLog && console.log(`Worker ${workerId} - Got a ping response from`, nodeConnection.getIpPort(), `in ${pingDurationMs}ms.`, numAttempts, 'attempts.');
 		if (signal.aborted) throw new Error('Aborted after ping');
+		if (nodeWasDestroyed()) return;
 
 		const onValidChain = await nodeConnection.onValidChain({ signal });
 		if (!onValidChain) {
@@ -510,6 +524,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			throw new Error('Node is on invalid chain');
 		}
 		if (signal.aborted) throw new Error('Aborted after onValidChain');
+		if (nodeWasDestroyed()) return;
 
 		this._enableConsoleDebugLog && console.log(`Worker ${workerId} - About to sync headers from node:`, nodeConnection.getIpPort(), numAttempts, 'attempts.');
 		this._addNodeSyncingHeaders(nodeConnection.getIpPortString());
@@ -525,6 +540,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				this._removeNodeSyncingHeaders(nodeConnection.getIpPortString());
 			});
 		if (signal.aborted) throw new Error('Aborted after syncHeaders');
+		if (nodeWasDestroyed()) return;
 
 		this._nodesDatabase.addLastConnectAndTestTimeMs(nodeConnection.getIpPort(), Date.now()).catch((error: Error) => {
 			console.error('Nodes database error when addLastConnectAndTestTimeMs', nodeConnection.getIpPort(), ':', error);
@@ -546,6 +562,7 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 				this._nodesCurrentlyRunningGetAddr--;
 			}
 			if (signal.aborted) throw new Error('Aborted after getAddr');
+			if (nodeWasDestroyed()) return;
 		}
 
 		// Note: The nodeConnection 'connected' callback is not used because that will cause nodes to be added to
