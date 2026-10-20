@@ -1372,4 +1372,67 @@ describe('BlockHeadersClient queue recovery', () => {
 			expect(events).toEqual(['online_to_online', 'online_to_offline', 'online_to_online', 'online_to_offline', 'offline_to_online', 'offline_to_offline']);
 		});
 	});
+
+	describe('getPeersInfoConnected', () => {
+		const createConnectedNodeMock = (ipPort: IpPort) => ({
+			getIpPort: () => ipPort,
+			getTipHashHex: () => 'deadbeef',
+		});
+
+		test('keeps every connected peer when several peers share the same rating', async () => {
+			const clientAny = client as any;
+			const timeMs = Date.now();
+			const ipPorts: IpPort[] = [
+				{ ip: '1.1.1.1', port: 8333 },
+				{ ip: '2.2.2.2', port: 8333 },
+				{ ip: '3.3.3.3', port: 8333 },
+			];
+
+			// Identical metrics for all three nodes give them identical ratings.
+			await nodesDb.addSeenBatch(ipPorts, timeMs);
+			const ratings = ipPorts.map(ipPort => nodesDb.getNodeRating(ipPort, timeMs)!);
+			expect(new Set(ratings).size).toBe(1);
+
+			for (const ipPort of ipPorts) {
+				clientAny._nodeConnectionsConnected.set(ipPortToString(ipPort), createConnectedNodeMock(ipPort));
+			}
+
+			const peers = client.getPeersInfoConnected();
+			expect(peers.length).toBe(3);
+			expect(peers.map(peer => peer.ip)).toEqual(['1.1.1.1', '2.2.2.2', '3.3.3.3']);
+			expect(peers.every(peer => peer.rating === ratings[0])).toBe(true);
+
+			const dashboardPeers = clientAny._getPeersInfoConnectedForDashboard();
+			expect(dashboardPeers.length).toBe(3);
+			expect(dashboardPeers.map(peer => peer.ip)).toEqual(['1.1.1.1', '2.2.2.2', '3.3.3.3']);
+		});
+
+		test('sorts the connected peers by rating in descending order', async () => {
+			const clientAny = client as any;
+			const timeMs = Date.now();
+			const ipPorts: IpPort[] = [
+				{ ip: '1.1.1.1', port: 8333 },
+				{ ip: '2.2.2.2', port: 8333 },
+				{ ip: '3.3.3.3', port: 8333 },
+			];
+
+			await nodesDb.addSeenBatch(ipPorts, timeMs);
+			// A more recent connection gives a higher rating.
+			await nodesDb.addLastConnectTimeMs(ipPorts[0], timeMs - 3 * 24 * 60 * 60 * 1000);
+			await nodesDb.addLastConnectTimeMs(ipPorts[1], timeMs - 2 * 24 * 60 * 60 * 1000);
+			await nodesDb.addLastConnectTimeMs(ipPorts[2], timeMs - 1 * 24 * 60 * 60 * 1000);
+
+			for (const ipPort of ipPorts) {
+				clientAny._nodeConnectionsConnected.set(ipPortToString(ipPort), createConnectedNodeMock(ipPort));
+			}
+
+			const peers = client.getPeersInfoConnected();
+			expect(peers.map(peer => peer.ip)).toEqual(['3.3.3.3', '2.2.2.2', '1.1.1.1']);
+			const ratings = peers.map(peer => peer.rating);
+			expect(ratings).toEqual([...ratings].sort((a, b) => b - a));
+
+			const dashboardPeers = clientAny._getPeersInfoConnectedForDashboard();
+			expect(dashboardPeers.map(peer => peer.ip)).toEqual(['3.3.3.3', '2.2.2.2', '1.1.1.1']);
+		});
+	});
 });

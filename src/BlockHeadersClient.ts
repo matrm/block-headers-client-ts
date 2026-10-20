@@ -1600,18 +1600,42 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 	}
 
 	/**
+	 * Collects the connected peers grouped by their node rating.
+	 * Peers that share a rating are kept in the same group, so that peers with equal ratings
+	 * are not dropped from the result.
+	 * @param timeMs - The current time in milliseconds.
+	 * @returns A map of node rating to the connected peers with that rating.
+	 */
+	private _getConnectedPeersByRating = (timeMs: number): RedBlackMap<number, IpPort[]> => {
+		const ratingToIpPorts = new RedBlackMap<number, IpPort[]>(CompareNumbers);
+		this._nodeConnectionsConnected.forEach((nodeConnection) => {
+			const ipPort = nodeConnection.getIpPort();
+			const rating = this._nodesDatabase.getNodeRating(ipPort, timeMs)!;
+			const ipPorts = ratingToIpPorts.get(rating);
+			if (ipPorts) {
+				ipPorts.push(ipPort);
+			} else {
+				ratingToIpPorts.set(rating, [ipPort]);
+			}
+		});
+		return ratingToIpPorts;
+	}
+
+	/**
 	 * Gets an array of connected node's IP, port, and rating, sorted by rating in descending order.
 	 * @returns An array of connected node's IP, port, and rating.
 	 */
 	getPeersInfoConnected = (): { ip: string, port: number, rating: number }[] => {
-		const ratingToNode = new RedBlackMap<number, IpPort>(CompareNumbers);
 		const timeMs = Date.now();
-		this._nodeConnectionsConnected.forEach((nodeConnection) => {
-			const ipPort = nodeConnection.getIpPort();
-			ratingToNode.set(this._nodesDatabase.getNodeRating(ipPort, timeMs)!, ipPort);
-		});
-		const ipPorts = Array.from(ratingToNode.valuesReversed());
-		return ipPorts.map(ipPort => ({ ...ipPort, rating: this._nodesDatabase.getNodeRating(ipPort, timeMs)! }));
+		const ratingToIpPorts = this._getConnectedPeersByRating(timeMs);
+		const peers: { ip: string, port: number, rating: number }[] = [];
+		// Iterate the ratings from the highest to the lowest.
+		for (const [rating, ipPorts] of ratingToIpPorts.entriesReversed()) {
+			for (const ipPort of ipPorts) {
+				peers.push({ ...ipPort, rating });
+			}
+		}
+		return peers;
 	}
 
 	/**
@@ -1630,24 +1654,32 @@ export class BlockHeadersClient extends EventEmitter<BlockHeadersClientEvents> {
 			tipHashHex: string;
 		};
 	}[] => {
-		const ratingToNode = new RedBlackMap<number, IpPort>(CompareNumbers);
 		const timeMs = Date.now();
-		this._nodeConnectionsConnected.forEach((nodeConnection) => {
-			const ipPort = nodeConnection.getIpPort();
-			ratingToNode.set(this._nodesDatabase.getNodeRating(ipPort, timeMs)!, ipPort);
-		});
-		const ipPorts = Array.from(ratingToNode.valuesReversed());
-		return ipPorts.map(ipPort => {
-			const nodeConnection = this._nodeConnectionsConnected.get(ipPortToString(ipPort))!;
-			return {
-				...ipPort,
-				rating: this._nodesDatabase.getNodeRating(ipPort, timeMs)!,
-				metrics: this._nodesDatabase.getNodeConnectionMetricsCopy(ipPort)!,
-				liveState: {
-					tipHashHex: nodeConnection.getTipHashHex(),
-				},
+		const ratingToIpPorts = this._getConnectedPeersByRating(timeMs);
+		const peers: {
+			ip: string;
+			port: number;
+			rating: number;
+			metrics: NodeConnectionMetrics;
+			liveState: {
+				tipHashHex: string;
 			};
-		});
+		}[] = [];
+		// Iterate the ratings from the highest to the lowest.
+		for (const [rating, ipPorts] of ratingToIpPorts.entriesReversed()) {
+			for (const ipPort of ipPorts) {
+				const nodeConnection = this._nodeConnectionsConnected.get(ipPortToString(ipPort))!;
+				peers.push({
+					...ipPort,
+					rating,
+					metrics: this._nodesDatabase.getNodeConnectionMetricsCopy(ipPort)!,
+					liveState: {
+						tipHashHex: nodeConnection.getTipHashHex(),
+					},
+				});
+			}
+		}
+		return peers;
 	}
 
 	/**
