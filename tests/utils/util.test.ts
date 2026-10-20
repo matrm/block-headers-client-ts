@@ -1,5 +1,6 @@
 /// <reference types="node" />
 import { expect, test, describe, vi, beforeEach, afterAll, afterEach } from 'vitest';
+import { getEventListeners } from 'node:events';
 import {
 	assert,
 	ipPortToString,
@@ -115,6 +116,53 @@ describe('util', () => {
 			const promise = abortableSleepMsThrow(5000, ac.signal);
 			ac.abort(reason);
 			await expect(promise).rejects.toBe(reason);
+		});
+
+		test('abortableSleepMsNoThrow should not leave an abort listener behind when the sleep completes', async () => {
+			const ac = new AbortController();
+			const promise = abortableSleepMsNoThrow(1000, ac.signal);
+			expect(getEventListeners(ac.signal, 'abort').length).toBe(1);
+			vi.advanceTimersByTime(1000);
+			await expect(promise).resolves.toBeUndefined();
+			expect(getEventListeners(ac.signal, 'abort').length).toBe(0);
+		});
+
+		test('abortableSleepMsThrow should not leave an abort listener behind when the sleep completes', async () => {
+			const ac = new AbortController();
+			const promise = abortableSleepMsThrow(1000, ac.signal);
+			expect(getEventListeners(ac.signal, 'abort').length).toBe(1);
+			vi.advanceTimersByTime(1000);
+			await expect(promise).resolves.toBeUndefined();
+			expect(getEventListeners(ac.signal, 'abort').length).toBe(0);
+		});
+
+		test('abortableSleepMsNoThrow should not leave an abort listener behind when the sleep is aborted', async () => {
+			const ac = new AbortController();
+			const promise = abortableSleepMsNoThrow(5000, ac.signal);
+			ac.abort();
+			await expect(promise).resolves.toBeUndefined();
+			expect(getEventListeners(ac.signal, 'abort').length).toBe(0);
+		});
+
+		test('abortableSleepMsThrow should not leave an abort listener behind when the sleep is aborted', async () => {
+			const ac = new AbortController();
+			const promise = abortableSleepMsThrow(5000, ac.signal);
+			ac.abort(new Error('aborted'));
+			await expect(promise).rejects.toThrow('aborted');
+			expect(getEventListeners(ac.signal, 'abort').length).toBe(0);
+		});
+
+		test('repeated sleeps on a long-lived signal should not accumulate abort listeners', async () => {
+			const ac = new AbortController();
+			for (let i = 0; i < 25; i++) {
+				const noThrowPromise = abortableSleepMsNoThrow(1000, ac.signal);
+				vi.advanceTimersByTime(1000);
+				await noThrowPromise;
+				const throwPromise = abortableSleepMsThrow(1000, ac.signal);
+				vi.advanceTimersByTime(1000);
+				await throwPromise;
+			}
+			expect(getEventListeners(ac.signal, 'abort').length).toBe(0);
 		});
 	});
 });

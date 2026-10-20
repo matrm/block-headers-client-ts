@@ -93,21 +93,30 @@ export const abortableSleepMsNoThrow = (
 	signal?: AbortSignal
 ): Promise<void> => {
 	return new Promise((resolve) => {
-		if (signal?.aborted) {
+		if (!signal) {
+			setTimeout(resolve, delayMs);// No signal to abort on, so just wait for the delay.
+			return;
+		}
+		if (signal.aborted) {
 			resolve();// Resolve immediately if already aborted.
 			return;
 		}
 
-		const timeout = setTimeout(resolve, delayMs);
+		let timeout: ReturnType<typeof setTimeout>;
+		// The abort listener is removed on whichever path settles the promise first, so a
+		// long-lived signal (e.g. a client stop signal) does not accumulate one listener
+		// per completed sleep.
+		const onAbort = () => {
+			clearTimeout(timeout);// Prevent resolve after abort.
+			signal.removeEventListener('abort', onAbort);
+			resolve();// Resolve on abort.
+		};
+		timeout = setTimeout(() => {
+			signal.removeEventListener('abort', onAbort);
+			resolve();// Resolve when the delay elapses.
+		}, delayMs);
 
-		signal?.addEventListener(
-			'abort',
-			() => {
-				clearTimeout(timeout);// Prevent resolve after abort.
-				resolve();// Resolve on abort.
-			},
-			{ once: true }
-		);
+		signal.addEventListener('abort', onAbort, { once: true });
 	});
 };
 
@@ -116,21 +125,30 @@ export const abortableSleepMsThrow = (
 	signal?: AbortSignal
 ): Promise<void> => {
 	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
+		if (!signal) {
+			setTimeout(resolve, delayMs);// No signal to abort on, so just wait for the delay.
+			return;
+		}
+		if (signal.aborted) {
 			reject(signal.reason);// Reject immediately if already aborted.
 			return;
 		}
 
-		const timeout = setTimeout(resolve, delayMs);
+		let timeout: ReturnType<typeof setTimeout>;
+		// The abort listener is removed on whichever path settles the promise first, so a
+		// long-lived signal (e.g. a client stop signal) does not accumulate one listener
+		// per completed sleep.
+		const onAbort = () => {
+			clearTimeout(timeout);// Prevent resolve after abort.
+			signal.removeEventListener('abort', onAbort);
+			reject(signal.reason);// Reject with the abort reason.
+		};
+		timeout = setTimeout(() => {
+			signal.removeEventListener('abort', onAbort);
+			resolve();// Resolve when the delay elapses.
+		}, delayMs);
 
-		signal?.addEventListener(
-			'abort',
-			() => {
-				clearTimeout(timeout);// Prevent resolve after abort.
-				reject(signal.reason);// Reject with the abort reason.
-			},
-			{ once: true }
-		);
+		signal.addEventListener('abort', onAbort, { once: true });
 	});
 };
 
