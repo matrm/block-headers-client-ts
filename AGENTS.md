@@ -140,8 +140,9 @@ npm run start-nobuild   # Run server without rebuilding (requires prior build)
 ## Logging Strategy
 
 - **Informational / debug output** (`console.log`): Must be guarded by the `enableConsoleDebugLog` flag using the `this._enableConsoleDebugLog && console.log(...)` pattern. This includes progress messages, sync status, and other routine operational logging.
-- **Errors and noteworthy failures** (`console.error`): Must be logged unconditionally (without the `enableConsoleDebugLog` guard). This includes LevelDB/database save failures, network errors, and unexpected exceptions. These are always important for operational awareness regardless of debug mode.
-- The `enableConsoleDebugLog` flag is passed through constructors from `BlockHeadersClient.create()` down to child modules (`NodesDatabase`, `BlockHeadersDatabase`, `LegacyNodeConnection`, etc.).
+- **Errors and noteworthy failures** (`console.error`): Must be logged unconditionally (without the `enableConsoleDebugLog` guard) when the failure originates in our own code or server state. This includes LevelDB/database save failures and unexpected exceptions in our own code. These are always important for operational awareness regardless of debug mode.
+- **Failures caused by user clients or their connections**: Must be guarded by the `enableConsoleDebugLog` flag even though they are errors. They are outside our control and can be frequent (for example, a WebSocket client that stops answering pings, or a send failing because the client connection broke), so they must not pollute the server console when debug logging is disabled. When the flag is enabled, they may still use `console.error` so the severity is preserved.
+- The `enableConsoleDebugLog` flag is passed through constructors from `BlockHeadersClient.create()` down to child modules (`NodesDatabase`, `BlockHeadersDatabase`, `LegacyNodeConnection`, etc.). In the API server (`src/api/`), the equivalent flag is `config.CONSOLE_DEBUG_LOG`, read from the `CONSOLE_DEBUG_LOG` environment variable.
 - Unconditional `console.log` (without the guard) is also acceptable in:
   - The entry point (`src/api/index.ts`) for startup/shutdown messages and uncaught exception reporting
   - Assertion failures in `src/utils/util.ts`

@@ -71,6 +71,17 @@ describe('websockets', () => {
 		});
 	}
 
+	// autoPong disabled: the client never answers protocol pings, which is how a
+	// page that the browser has throttled or frozen behaves.
+	function openWsWithoutPong(query?: string): Promise<WebSocket> {
+		return new Promise<WebSocket>((resolve, reject) => {
+			const url = `ws://localhost:${port}` + (query ? `?${query}` : '');
+			const ws = new WebSocket(url, { autoPong: false });
+			ws.on('open', () => resolve(ws));
+			ws.on('error', reject);
+		});
+	}
+
 	function sendAndWait(ws: WebSocket, msg: object): Promise<void> {
 		return new Promise<void>(resolve => {
 			ws.send(JSON.stringify(msg), () => resolve());
@@ -533,6 +544,143 @@ describe('websockets', () => {
 		expect(receivedEventNames).toContain('client_stop');
 
 		ws.close();
+	});
+
+	// The heartbeat pings every client and terminates any client whose previous
+	// ping was not answered. The first tick after a connection marks it as not
+	// alive and pings it; the following tick terminates it if no pong arrived.
+	// The termination is a client-side failure, so it is only logged in debug mode.
+	test('should terminate and log a client that does not answer pings when console debug logging is enabled', async () => {
+		const previousDebugLog = mockConfig.CONSOLE_DEBUG_LOG;
+		mockConfig.CONSOLE_DEBUG_LOG = true;
+		const ws = await openWsWithoutPong('dashboard=true');
+		const serverWs = Array.from(wss.clients)[0] as any;
+		const terminateSpy = vi.spyOn(serverWs, 'terminate');
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => { });
+
+		try {
+			await vi.advanceTimersByTimeAsync(30000);
+			expect(terminateSpy).not.toHaveBeenCalled();
+			expect(logSpy).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(30000);
+			expect(terminateSpy).toHaveBeenCalledTimes(1);
+
+			const logged = logSpy.mock.calls.map(call => String(call[1])).join('\n');
+			expect(logged).toContain('WebSocket client terminated for not answering ping');
+			expect(logged).toContain('(dashboard=true)');
+		} finally {
+			logSpy.mockRestore();
+			mockConfig.CONSOLE_DEBUG_LOG = previousDebugLog;
+			ws.terminate();
+		}
+	});
+
+	test('should terminate a client that does not answer pings without logging when console debug logging is disabled', async () => {
+		const previousDebugLog = mockConfig.CONSOLE_DEBUG_LOG;
+		mockConfig.CONSOLE_DEBUG_LOG = false;
+		const ws = await openWsWithoutPong('dashboard=true');
+		const serverWs = Array.from(wss.clients)[0] as any;
+		const terminateSpy = vi.spyOn(serverWs, 'terminate');
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => { });
+
+		try {
+			await vi.advanceTimersByTimeAsync(60000);
+			expect(terminateSpy).toHaveBeenCalledTimes(1);
+			expect(logSpy).not.toHaveBeenCalled();
+		} finally {
+			logSpy.mockRestore();
+			mockConfig.CONSOLE_DEBUG_LOG = previousDebugLog;
+			ws.terminate();
+		}
+	});
+
+	test('should keep and not log a client that answers pings', async () => {
+		const previousDebugLog = mockConfig.CONSOLE_DEBUG_LOG;
+		mockConfig.CONSOLE_DEBUG_LOG = true;
+		const ws = await openWs('dashboard=true');
+		const serverWs = Array.from(wss.clients)[0] as any;
+		const terminateSpy = vi.spyOn(serverWs, 'terminate');
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => { });
+
+		try {
+			await vi.advanceTimersByTimeAsync(30000);
+			// Simulate the pong deterministically instead of waiting for the real
+			// one, so the heartbeat state does not depend on socket I/O ordering.
+			serverWs.emit('pong');
+
+			await vi.advanceTimersByTimeAsync(30000);
+			expect(terminateSpy).not.toHaveBeenCalled();
+			expect(logSpy).not.toHaveBeenCalled();
+		} finally {
+			logSpy.mockRestore();
+			mockConfig.CONSOLE_DEBUG_LOG = previousDebugLog;
+			ws.terminate();
+		}
+	});
+
+	// Send failures are caused by the client connection, not by our code, so they
+	// are only logged in debug mode. Patch the server-side socket so every send
+	// callback fails, then trigger both a chain-tip broadcast and a dashboard event.
+	test('should not log WebSocket send errors when console debug logging is disabled', async () => {
+		const previousDebugLog = mockConfig.CONSOLE_DEBUG_LOG;
+		mockConfig.CONSOLE_DEBUG_LOG = false;
+		const ws = await openWs('dashboard=true');
+		await sendAndWaitAck(ws, { type: 'subscribe', channel: 'new_chain_tip', requestId: 'nct' }, 'nct');
+		await sendAndWaitAck(ws, { type: 'subscribe', channel: 'dashboard', requestId: 'dash' }, 'dash');
+
+		const serverWs = Array.from(wss.clients)[0] as any;
+		const originalSend = serverWs.send.bind(serverWs);
+		serverWs.send = (_data: any, cb?: any) => { if (cb) cb(new Error('send failed')); };
+		const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+
+		try {
+			mockClient.getHeaderTip.mockReturnValue({
+				height: 100, hashHex: 'abc', prevHashHex: '00', merkleRootHex: '01',
+				timestamp: 1234, bitsHex: '02', nonce: 789, workHex: '03', workTotalHex: '04'
+			});
+			mockClient.emit('new_chain_tip', 100, 'abc');
+			mockClient._dashboardEmitter.emit('client_start');
+			await vi.advanceTimersByTimeAsync(300);
+
+			expect(errorSpy).not.toHaveBeenCalled();
+		} finally {
+			errorSpy.mockRestore();
+			serverWs.send = originalSend;
+			mockConfig.CONSOLE_DEBUG_LOG = previousDebugLog;
+			ws.terminate();
+		}
+	});
+
+	test('should log WebSocket send errors when console debug logging is enabled', async () => {
+		const previousDebugLog = mockConfig.CONSOLE_DEBUG_LOG;
+		const ws = await openWs('dashboard=true');
+		await sendAndWaitAck(ws, { type: 'subscribe', channel: 'new_chain_tip', requestId: 'nct' }, 'nct');
+		await sendAndWaitAck(ws, { type: 'subscribe', channel: 'dashboard', requestId: 'dash' }, 'dash');
+
+		const serverWs = Array.from(wss.clients)[0] as any;
+		const originalSend = serverWs.send.bind(serverWs);
+		serverWs.send = (_data: any, cb?: any) => { if (cb) cb(new Error('send failed')); };
+		mockConfig.CONSOLE_DEBUG_LOG = true;
+		const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+
+		try {
+			mockClient.getHeaderTip.mockReturnValue({
+				height: 100, hashHex: 'abc', prevHashHex: '00', merkleRootHex: '01',
+				timestamp: 1234, bitsHex: '02', nonce: 789, workHex: '03', workTotalHex: '04'
+			});
+			mockClient.emit('new_chain_tip', 100, 'abc');
+			mockClient._dashboardEmitter.emit('client_start');
+			await vi.advanceTimersByTimeAsync(300);
+
+			const logged = errorSpy.mock.calls.map(call => String(call[0])).join('\n');
+			expect(logged).toContain('WebSocket send error:');
+		} finally {
+			errorSpy.mockRestore();
+			serverWs.send = originalSend;
+			mockConfig.CONSOLE_DEBUG_LOG = previousDebugLog;
+			ws.terminate();
+		}
 	});
 
 	// End of websockets describe block -- the closing brace follows below.

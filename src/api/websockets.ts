@@ -12,6 +12,7 @@ interface ExtendedWebSocket extends WebSocket {
 	subscriptions: Set<string>;
 	isDashboard: boolean;
 	isAdmin: boolean;
+	remoteAddress: string;
 }
 
 const createNewChainTipMessage = (header: BlockHeaderPresented): string => {
@@ -149,10 +150,12 @@ export const createWebSocketServer = (server: http.Server, client: BlockHeadersC
 			const nonAdminMsg = nonAdminEvents.length ? JSON.stringify({ type: 'dashboard:event', events: nonAdminEvents }) : null;
 			for (const ws of dashboardSubscribers) {
 				if (ws.readyState !== WebSocket.OPEN) continue;
+				// Send failures are caused by the client connection breaking, not by
+				// our code, so they are only logged in debug mode.
 				if (ws.isAdmin) {
-					ws.send(adminMsg, (err) => { if (err) console.error('WebSocket send error:', err); });
+					ws.send(adminMsg, (err) => { if (err && config.CONSOLE_DEBUG_LOG) console.error('WebSocket send error:', err); });
 				} else {
-					if (nonAdminMsg) ws.send(nonAdminMsg, (err) => { if (err) console.error('WebSocket send error:', err); });
+					if (nonAdminMsg) ws.send(nonAdminMsg, (err) => { if (err && config.CONSOLE_DEBUG_LOG) console.error('WebSocket send error:', err); });
 				}
 			}
 		},
@@ -305,7 +308,8 @@ export const createWebSocketServer = (server: http.Server, client: BlockHeadersC
 			const extWs = ws as ExtendedWebSocket;
 			if (extWs.readyState === WebSocket.OPEN && extWs.subscriptions.has('new_chain_tip')) {
 				extWs.send(message, (err) => {
-					if (err) {
+					// Client-side failure, so debug-only like the dashboard broadcast.
+					if (err && config.CONSOLE_DEBUG_LOG) {
 						console.error('WebSocket send error:', err);
 					}
 				});
@@ -329,12 +333,14 @@ export const createWebSocketServer = (server: http.Server, client: BlockHeadersC
 		// Initialize custom properties.
 		ws.isAlive = true;
 		ws.subscriptions = new Set();
+		const forwardedFor = req.headers['x-forwarded-for'];
+		const ip = req.socket.remoteAddress || (Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor) || 'unknown';
+		ws.remoteAddress = ip;
 		const auth = parseConnectionAuth(req);
 		ws.isDashboard = auth.isDashboard;
 		ws.isAdmin = auth.isAdmin;
 
 		if (config.CONSOLE_DEBUG_LOG) {
-			const ip = req.socket.remoteAddress || req.headers['x-forwarded-for'] || 'unknown';
 			console.log(unixTime3Decimal(), `- WebSocket connection established from ${ip} (dashboard=${ws.isDashboard}, admin=${ws.isAdmin}).`);
 		}
 
@@ -353,6 +359,13 @@ export const createWebSocketServer = (server: http.Server, client: BlockHeadersC
 		wss.clients.forEach((ws) => {
 			const extWs = ws as ExtendedWebSocket;
 			if (!extWs.isAlive) {
+				// The client did not answer the previous ping, so the connection is
+				// treated as dead. A page that was throttled or frozen while in the
+				// background typically stops answering pings and ends up here. This
+				// is a client-side failure, so it is only logged in debug mode.
+				if (config.CONSOLE_DEBUG_LOG) {
+					console.log(unixTime3Decimal(), `- WebSocket client terminated for not answering ping from ${extWs.remoteAddress} (dashboard=${extWs.isDashboard}).`);
+				}
 				return extWs.terminate();
 			}
 			extWs.isAlive = false;
